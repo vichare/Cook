@@ -12,6 +12,8 @@ Recipe descriptions and instructions remain Markdown source. The web editor prov
 
 Public recipes use immutable random author handles and optional public nicknames without exposing authentication identities or internal account IDs. Users can privately favorite authors, and recommendations deterministically combine owned recipes, saved recipes, favorite authors' current public recipes, and other public recipes with structured explanations and a bounded 0–999 score.
 
+Recommendation responses are bounded to 50 by default (hard maximum 100) while still scanning every eligible candidate with constant query count and a top-N heap. Browser and AI recipe/image edits share optimistic versions, so a stale tab receives a conflict instead of overwriting newer work.
+
 ## Stack
 
 - React 19, TypeScript strict, Vite, TanStack Router and Query

@@ -7,7 +7,8 @@ describe('recipe cover API', () => {
   it('sends local bytes and metadata as multipart without trusting a client content-type header', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      status: 204,
+      status: 200,
+      json: () => Promise.resolve({ version: 2 }),
     })
     vi.stubGlobal('fetch', fetchMock)
     const file = new File(['image-bytes'], 'untrusted-name.png', { type: 'image/png' })
@@ -17,10 +18,10 @@ describe('recipe cover API', () => {
       sourceUrl: 'https://example.test/owned-image',
       sourceLicense: 'CC BY 4.0',
       sourceAttribution: 'Example Cook',
-    })
+    }, 1)
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(init.headers).toBeUndefined()
+    expect(init.headers).toEqual({ 'if-match': '"recipe-v1"' })
     expect(init.body).toBeInstanceOf(FormData)
     const body = init.body as FormData
     expect(body.get('image')).toBe(file)

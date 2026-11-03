@@ -17,7 +17,7 @@ use rust_web_auth_passkey::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
@@ -38,7 +38,7 @@ use crate::{
         email_address, map_email_error, map_passkey_error, normalize_email, purpose,
         PasskeySummary, EMAIL_LINK_PURPOSE, EMAIL_SIGN_IN_PURPOSE,
     },
-    recommendation::{recommend, Recommendation},
+    recommendation::{recommend_limited, Recommendation},
     shopping, AppState,
 };
 
@@ -1196,9 +1196,11 @@ async fn create_recipe(
 async fn update_recipe(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(mut input): Json<RecipeInput>,
 ) -> AppResult<Json<Recipe>> {
+    let expected_version = expected_recipe_version(&headers)?;
     input.ingredients = expand_ingredient_inputs(input.ingredients);
     validate_recipe(&input)?;
     let mut transaction = state.pool.begin().await?;
@@ -1213,7 +1215,7 @@ async fn update_recipe(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?, visibility = ?,
          difficulty = ?, estimated_calories = ?, version = version + 1,
          updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND owner_id = ?",
+         WHERE id = ? AND owner_id = ? AND version = ?",
     )
     .bind(input.title.trim())
     .bind(input.description.trim())
@@ -1223,10 +1225,14 @@ async fn update_recipe(
     .bind(input.estimated_calories)
     .bind(&id)
     .bind(&user.id)
+    .bind(expected_version)
     .execute(&mut *transaction)
     .await?;
     if result.rows_affected() == 0 {
-        return Err(AppError::NotFound);
+        return Err(AppError::Conflict(
+            "recipe changed since it was opened; reload the latest version and compare your edits"
+                .into(),
+        ));
     }
     replace_ingredients(&mut transaction, &id, &user.id, &input.ingredients).await?;
     if previous_visibility == "public" && input.visibility == "private" {
@@ -1247,6 +1253,19 @@ async fn update_recipe(
         .next()
         .ok_or(AppError::NotFound)?;
     Ok(Json(recipe))
+}
+
+pub(crate) fn expected_recipe_version(headers: &HeaderMap) -> AppResult<i64> {
+    headers
+        .get("if-match")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("\"recipe-v"))
+        .and_then(|value| value.strip_suffix('"'))
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            AppError::Validation("If-Match must use the form \"recipe-v<version>\"".into())
+        })
 }
 
 async fn delete_recipe(
@@ -1521,8 +1540,26 @@ async fn update_settings(
 async fn get_recommendations(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Query(query): Query<RecommendationQuery>,
     Json(mut request): Json<RecommendationRequest>,
 ) -> AppResult<Json<Vec<Recommendation>>> {
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::Validation(
+            "recommendation limit must be between 1 and 100".into(),
+        ));
+    }
+    enforce_public_api_rate_limit(
+        &state.pool,
+        &format!(
+            "recommendations:{}:{}",
+            user.id,
+            rate_limit_key(&headers, &state.config.oauth_state_digest_key)
+        ),
+        60,
+    )
+    .await?;
     let recommendation_time = if let Some(today) = request.today.as_deref() {
         parse_date_only(today, "today")?
             .and_hms_opt(12, 0, 0)
@@ -1550,13 +1587,21 @@ async fn get_recommendations(
     let settings = load_settings(&state.pool, &user.id).await?;
     let candidates = load_candidate_recipes(&state.pool, &user.id, &settings).await?;
     let pantry = load_pantry(&state.pool, &user.id).await?;
-    Ok(Json(recommend(
+    let mut recommendations = recommend_limited(
         candidates,
         &pantry,
         &request,
         &settings,
         recommendation_time,
-    )))
+        limit,
+    );
+    hydrate_recommendation_recipes(&state.pool, &mut recommendations).await?;
+    Ok(Json(recommendations))
+}
+
+#[derive(Debug, Deserialize)]
+struct RecommendationQuery {
+    limit: Option<usize>,
 }
 
 fn seconds_until(expires_at: chrono::DateTime<Utc>) -> u64 {
@@ -2197,18 +2242,178 @@ async fn load_candidate_recipes(
     user_id: &str,
     settings: &RecommendationSettings,
 ) -> AppResult<Vec<Recipe>> {
-    let all = load_visible_recipes(pool, user_id, None).await?;
-    Ok(all
+    let rows = sqlx::query(
+        "SELECT r.id, r.owner_id, r.title, r.visibility, r.difficulty,
+                r.estimated_calories, r.version, u.public_handle, u.public_nickname,
+                EXISTS(SELECT 1 FROM favorites f
+                       WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite,
+                EXISTS(SELECT 1 FROM favorite_accounts fa
+                       WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id) AS is_favorite_author
+         FROM recipes r
+         JOIN users u ON u.id = r.owner_id
+         WHERE (? AND r.owner_id = ?)
+            OR (? AND EXISTS(SELECT 1 FROM favorites f
+                             WHERE f.user_id = ? AND f.recipe_id = r.id)
+                    AND (r.owner_id = ? OR r.visibility = 'public'))
+            OR (? AND r.visibility = 'public'
+                    AND EXISTS(SELECT 1 FROM favorite_accounts fa
+                               WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id))
+            OR (? AND r.owner_id <> ? AND r.visibility = 'public')",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(settings.include_own)
+    .bind(user_id)
+    .bind(settings.include_favorite_recipes)
+    .bind(user_id)
+    .bind(user_id)
+    .bind(settings.include_favorite_accounts)
+    .bind(user_id)
+    .bind(settings.include_other_public)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let ingredient_rows = sqlx::query(
+        "WITH candidates AS (
+           SELECT r.id
+           FROM recipes r
+           WHERE (? AND r.owner_id = ?)
+              OR (? AND EXISTS(SELECT 1 FROM favorites f
+                               WHERE f.user_id = ? AND f.recipe_id = r.id)
+                      AND (r.owner_id = ? OR r.visibility = 'public'))
+              OR (? AND r.visibility = 'public'
+                      AND EXISTS(SELECT 1 FROM favorite_accounts fa
+                                 WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id))
+              OR (? AND r.owner_id <> ? AND r.visibility = 'public')
+         )
+         SELECT ri.recipe_id, ri.name, ri.quantity_note, ri.canonical_ingredient_id
+         FROM recipe_ingredients ri
+         JOIN candidates c ON c.id = ri.recipe_id
+         ORDER BY ri.recipe_id, ri.sort_order",
+    )
+    .bind(settings.include_own)
+    .bind(user_id)
+    .bind(settings.include_favorite_recipes)
+    .bind(user_id)
+    .bind(user_id)
+    .bind(settings.include_favorite_accounts)
+    .bind(user_id)
+    .bind(settings.include_other_public)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let mut ingredients = std::collections::HashMap::<String, Vec<IngredientInput>>::new();
+    for row in ingredient_rows {
+        ingredients
+            .entry(row.get("recipe_id"))
+            .or_default()
+            .push(IngredientInput {
+                name: row.get("name"),
+                quantity_note: row.get("quantity_note"),
+                canonical_ingredient_id: row.get("canonical_ingredient_id"),
+            });
+    }
+    Ok(rows
         .into_iter()
-        .filter(|recipe| {
-            (settings.include_own && recipe.owner_id == user_id)
-                || (settings.include_favorite_recipes && recipe.is_favorite)
-                || (settings.include_favorite_accounts && recipe.is_favorite_author)
-                || (settings.include_other_public
-                    && recipe.owner_id != user_id
-                    && recipe.visibility == "public")
+        .map(|row| {
+            let id: String = row.get("id");
+            let owner_id: String = row.get("owner_id");
+            Recipe {
+                ingredients: ingredients.remove(&id).unwrap_or_default(),
+                id,
+                is_owner: owner_id == user_id,
+                owner_id,
+                author_handle: row.get("public_handle"),
+                author_nickname: row.get("public_nickname"),
+                title: row.get("title"),
+                description: String::new(),
+                instructions: String::new(),
+                visibility: row.get("visibility"),
+                difficulty: row.get("difficulty"),
+                estimated_calories: row.get("estimated_calories"),
+                version: row.get("version"),
+                is_favorite: row.get::<i64, _>("is_favorite") != 0,
+                is_favorite_author: row.get::<i64, _>("is_favorite_author") != 0,
+                source: None,
+                cover_image: None,
+            }
         })
         .collect())
+}
+
+async fn hydrate_recommendation_recipes(
+    pool: &SqlitePool,
+    recommendations: &mut [Recommendation],
+) -> AppResult<()> {
+    if recommendations.is_empty() {
+        return Ok(());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT r.id, r.description, r.instructions, r.source_url, r.source_title,
+                r.source_author, r.source_warnings, r.source_confidence,
+                img.id AS image_id, img.width, img.height, img.alt_text,
+                img.source_url AS image_source_url, img.source_license,
+                img.source_attribution, img.version AS image_version
+         FROM recipes r
+         LEFT JOIN recipe_images img ON img.recipe_id = r.id
+         WHERE r.id IN (",
+    );
+    {
+        let mut separated = query.separated(", ");
+        for recommendation in recommendations.iter() {
+            separated.push_bind(&recommendation.recipe.id);
+        }
+    }
+    query.push(")");
+    let rows = query.build().fetch_all(pool).await?;
+    let mut by_id = rows
+        .into_iter()
+        .map(|row| {
+            let id: String = row.get("id");
+            (id, row)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for recommendation in recommendations {
+        let row = by_id
+            .remove(&recommendation.recipe.id)
+            .ok_or_else(|| AppError::Data("ranked recipe disappeared during hydration".into()))?;
+        recommendation.recipe.description = row.get("description");
+        recommendation.recipe.instructions = row.get("instructions");
+        let source_url: Option<String> = row.get("source_url");
+        recommendation.recipe.source = if let Some(url) = source_url {
+            let warnings = row
+                .get::<Option<String>, _>("source_warnings")
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|error| {
+                    AppError::Data(format!("invalid stored recipe source warnings: {error}"))
+                })?
+                .unwrap_or_default();
+            Some(RecipeSource {
+                url,
+                title: row.get("source_title"),
+                author: row.get("source_author"),
+                warnings,
+                confidence: row.get("source_confidence"),
+            })
+        } else {
+            None
+        };
+        recommendation.recipe.cover_image =
+            row.get::<Option<String>, _>("image_id")
+                .map(|id| RecipeImage {
+                    url: format!("/api/recipe-images/{id}"),
+                    id,
+                    width: row.get("width"),
+                    height: row.get("height"),
+                    alt_text: row.get("alt_text"),
+                    source_url: row.get("image_source_url"),
+                    source_license: row.get("source_license"),
+                    source_attribution: row.get("source_attribution"),
+                    version: row.get("image_version"),
+                });
+    }
+    Ok(())
 }
 
 pub(crate) async fn load_ingredients(
@@ -2322,7 +2527,7 @@ async fn load_settings(pool: &SqlitePool, user_id: &str) -> AppResult<Recommenda
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, sync::Arc};
+    use std::{io::Cursor, sync::Arc, time::Instant};
 
     use axum::{
         body::{to_bytes, Body},
@@ -2767,6 +2972,81 @@ mod tests {
         .await;
         assert_eq!(recommendations.as_array().unwrap().len(), 1);
         assert_eq!(recommendations[0]["recipe"]["id"], first["id"]);
+    }
+
+    #[tokio::test]
+    async fn recommendation_scale_response_is_bounded_for_ten_thousand_candidates() {
+        let (app, _, pool) = app_with_runtime().await;
+        let viewer_cookie = login(&app, "Scale viewer").await;
+        let viewer_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE display_name = 'Scale viewer'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query(
+            "WITH RECURSIVE seq(x) AS (
+               SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 500
+             )
+             INSERT INTO users (id, email, display_name)
+             SELECT printf('scale-author-%04d', x),
+                    printf('scale-author-%04d@example.test', x),
+                    'Scale author'
+             FROM seq",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO favorite_accounts (viewer_id, author_id, created_at)
+             SELECT ?, id, 0 FROM users WHERE id LIKE 'scale-author-%'",
+        )
+        .bind(&viewer_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE seq(x) AS (
+               SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 10000
+             )
+             INSERT INTO recipes
+               (id, owner_id, title, description, instructions, visibility, created_at, updated_at)
+             SELECT printf('scale-recipe-%05d', x),
+                    printf('scale-author-%04d', ((x - 1) % 500) + 1),
+                    printf('Scale recipe %05d', x), '', '', 'public',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+             FROM seq",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO recipe_ingredients
+               (id, recipe_id, name, normalized_name, quantity_note, sort_order)
+             SELECT 'ingredient-' || id, id, 'water', 'water', '', 0
+             FROM recipes WHERE id LIKE 'scale-recipe-%'",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let started = Instant::now();
+        let response = app
+            .oneshot(
+                Request::post("/api/recommendations?limit=37")
+                    .header("content-type", "application/json")
+                    .header("cookie", viewer_cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        let recommendations = response_json(response).await;
+        assert_eq!(recommendations.as_array().unwrap().len(), 37);
+        eprintln!("10k candidate recommendation duration: {elapsed:?}");
     }
 
     #[tokio::test]
@@ -3901,6 +4181,7 @@ mod tests {
                 Request::put(format!("/api/recipes/{recipe_id}/cover"))
                     .header("content-type", "application/json")
                     .header("cookie", &owner_cookie)
+                    .header("if-match", "\"recipe-v2\"")
                     .body(Body::from(
                         json!({
                             "altText": "Updated blue soup",
@@ -3914,7 +4195,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(metadata_update.status(), StatusCode::NO_CONTENT);
+        assert_eq!(metadata_update.status(), StatusCode::OK);
+        assert_eq!(response_json(metadata_update).await["version"], 3);
         let metadata_recipe = app
             .clone()
             .oneshot(
@@ -3964,6 +4246,7 @@ mod tests {
                 Request::put(format!("/api/recipes/{recipe_id}"))
                     .header("content-type", "application/json")
                     .header("cookie", &owner_cookie)
+                    .header("if-match", "\"recipe-v3\"")
                     .body(Body::from(
                         json!({
                             "title": "Test soup",
@@ -3993,14 +4276,16 @@ mod tests {
         assert_eq!(public_read.status(), StatusCode::OK);
         assert_eq!(
             public_read.headers()["cache-control"],
-            "public, max-age=31536000, immutable"
+            "public, max-age=0, must-revalidate"
         );
+        let public_etag = public_read.headers()["etag"].clone();
         let make_private = app
             .clone()
             .oneshot(
                 Request::put(format!("/api/recipes/{recipe_id}"))
                     .header("content-type", "application/json")
                     .header("cookie", &owner_cookie)
+                    .header("if-match", "\"recipe-v4\"")
                     .body(Body::from(
                         json!({
                             "title": "Test soup",
@@ -4022,7 +4307,12 @@ mod tests {
         assert_ne!(private_url, image_url);
         let retired_public_url = app
             .clone()
-            .oneshot(Request::get(&image_url).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get(&image_url)
+                    .header("if-none-match", public_etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(retired_public_url.status(), StatusCode::NOT_FOUND);
@@ -4038,6 +4328,7 @@ mod tests {
                 Request::put(format!("/api/recipes/{recipe_id}"))
                     .header("content-type", "application/json")
                     .header("cookie", &owner_cookie)
+                    .header("if-match", "\"recipe-v5\"")
                     .body(Body::from(
                         json!({
                             "title": "Test soup",
@@ -4312,6 +4603,7 @@ mod tests {
                 Request::put(&path)
                     .header("content-type", "application/json")
                     .header("cookie", &other_cookie)
+                    .header("if-match", "\"recipe-v1\"")
                     .body(Body::from(
                         json!({
                             "title": "Hijacked",
@@ -4410,6 +4702,7 @@ mod tests {
                 Request::put(format!("/api/recipes/{recipe_id}"))
                     .header("content-type", "application/json")
                     .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v1\"")
                     .body(Body::from(
                         json!({
                             "title": "Metadata soup",
@@ -4451,6 +4744,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn interactive_recipe_and_image_mutations_reject_stale_versions() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let created = create_recipe(&app, &cookie, "private").await;
+        let recipe_id = created["id"].as_str().unwrap();
+        let browser_update = json!({
+            "title": "Browser edit",
+            "description": "",
+            "instructions": "Stir.",
+            "visibility": "private",
+            "ingredients": [{"name": "water", "quantityNote": ""}]
+        });
+        let first = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .body(Body::from(browser_update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(response_json(first).await["version"], 2);
+        let stale_tab = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .body(Body::from(browser_update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_tab.status(), StatusCode::CONFLICT);
+
+        let token = create_manage_token(&app, &cookie).await;
+        let ai_update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/ai/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", token["secret"].as_str().unwrap()),
+                    )
+                    .body(Body::from(
+                        json!({
+                            "title": "AI edit",
+                            "description": "",
+                            "instructions": "Stir twice.",
+                            "ingredients": [{"name": "water", "quantityNote": ""}],
+                            "expectedVersion": 2
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ai_update.status(), StatusCode::OK);
+        assert_eq!(response_json(ai_update).await["recipe"]["version"], 3);
+        let stale_browser = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v2\"")
+                    .body(Body::from(browser_update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_browser.status(), StatusCode::CONFLICT);
+
+        let (content_type, body) = multipart_image(&test_png());
+        let upload = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", content_type)
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v3\"")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::OK);
+        assert_eq!(response_json(upload).await["version"], 4);
+        let stale_content_after_image = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v3\"")
+                    .body(Body::from(browser_update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_content_after_image.status(), StatusCode::CONFLICT);
+
+        let metadata = json!({
+            "altText": "Updated cover",
+            "sourceUrl": "",
+            "sourceLicense": "",
+            "sourceAttribution": ""
+        });
+        let metadata_update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v4\"")
+                    .body(Body::from(metadata.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata_update.status(), StatusCode::OK);
+        assert_eq!(response_json(metadata_update).await["version"], 5);
+        let stale_metadata = app
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .header("if-match", "\"recipe-v4\"")
+                    .body(Body::from(metadata.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_metadata.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

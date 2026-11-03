@@ -134,10 +134,14 @@ export const api = {
       | 'ingredients'
     >,
     id?: string,
+    expectedVersion?: number,
   ) =>
     request<Recipe>(id ? `/api/recipes/${id}` : '/api/recipes', {
       method: id ? 'PUT' : 'POST',
       body: JSON.stringify(value),
+      headers: id && expectedVersion
+        ? { 'if-match': `"recipe-v${expectedVersion}"` }
+        : undefined,
     }),
   uploadRecipeCover: async (
     id: string,
@@ -148,6 +152,7 @@ export const api = {
       sourceLicense: string
       sourceAttribution: string
     },
+    expectedVersion: number,
   ) => {
     const body = new FormData()
     body.set('image', image)
@@ -158,6 +163,7 @@ export const api = {
     const response = await fetch(`/api/recipes/${id}/cover`, {
       method: 'POST',
       credentials: 'same-origin',
+      headers: { 'if-match': `"recipe-v${expectedVersion}"` },
       body,
     })
     if (!response.ok) {
@@ -168,9 +174,13 @@ export const api = {
         error?.error ?? 'unknown_error',
       )
     }
+    return response.json() as Promise<{ version: number }>
   },
-  deleteRecipeCover: (id: string) =>
-    request<void>(`/api/recipes/${id}/cover`, { method: 'DELETE' }),
+  deleteRecipeCover: (id: string, expectedVersion: number) =>
+    request<{ version: number }>(`/api/recipes/${id}/cover`, {
+      method: 'DELETE',
+      headers: { 'if-match': `"recipe-v${expectedVersion}"` },
+    }),
   updateRecipeCoverMetadata: (
     id: string,
     metadata: {
@@ -179,10 +189,12 @@ export const api = {
       sourceLicense: string
       sourceAttribution: string
     },
+    expectedVersion: number,
   ) =>
-    request<void>(`/api/recipes/${id}/cover`, {
+    request<{ version: number }>(`/api/recipes/${id}/cover`, {
       method: 'PUT',
       body: JSON.stringify(metadata),
+      headers: { 'if-match': `"recipe-v${expectedVersion}"` },
     }),
   recipeRevisions: (recipeId: string) =>
     request<RecipeRevision[]>(`/api/recipe-revisions?recipeId=${encodeURIComponent(recipeId)}`),

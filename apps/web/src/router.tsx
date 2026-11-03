@@ -1161,9 +1161,24 @@ export function RecipeMetadataFields({ form }: { form: UseFormReturn<RecipeForm>
   )
 }
 
-function RecipeEditor({ recipe }: { recipe?: Recipe }) {
-  const { t } = useI18n()
+export function RecipeEditor({ recipe }: { recipe?: Recipe }) {
   const navigate = useNavigate()
+  return (
+    <RecipeEditorForm
+      recipe={recipe}
+      onSaved={(id) => navigate({ to: '/recipes/$recipeId', params: { recipeId: id } })}
+    />
+  )
+}
+
+export function RecipeEditorForm({
+  recipe,
+  onSaved,
+}: {
+  recipe?: Recipe
+  onSaved: (id: string) => Promise<unknown> | unknown
+}) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const errorSummaryRef = useRef<HTMLDivElement>(null)
   const [coverFile, setCoverFile] = useState<File | null>(null)
@@ -1196,11 +1211,13 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
   const fields = useFieldArray({ control: form.control, name: 'ingredients' })
   const save = useMutation({
     mutationFn: async (value: RecipeForm) => {
-      const saved = await api.saveRecipe(value, recipe?.id)
+      let saved = await api.saveRecipe(value, recipe?.id, recipe?.version)
       if (coverFile) {
-        await api.uploadRecipeCover(saved.id, coverFile, coverMetadata)
+        const result = await api.uploadRecipeCover(saved.id, coverFile, coverMetadata, saved.version)
+        saved = { ...saved, version: result.version }
       } else if (removeCover && recipe?.coverImage) {
-        await api.deleteRecipeCover(saved.id)
+        const result = await api.deleteRecipeCover(saved.id, saved.version)
+        saved = { ...saved, version: result.version, coverImage: null }
       } else if (
         recipe?.coverImage &&
         (
@@ -1210,7 +1227,8 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
           coverMetadata.sourceAttribution !== (recipe.coverImage.sourceAttribution ?? '')
         )
       ) {
-        await api.updateRecipeCoverMetadata(saved.id, coverMetadata)
+        const result = await api.updateRecipeCoverMetadata(saved.id, coverMetadata, saved.version)
+        saved = { ...saved, version: result.version }
       }
       return saved
     },
@@ -1219,7 +1237,7 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
         queryClient.invalidateQueries({ queryKey: ['recipes'] }),
         queryClient.invalidateQueries({ queryKey: ['recipe', saved.id] }),
       ])
-      await navigate({ to: '/recipes/$recipeId', params: { recipeId: saved.id } })
+      await onSaved(saved.id)
     },
   })
   const ingredientErrors = Array.isArray(form.formState.errors.ingredients)
@@ -1351,7 +1369,32 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
         {save.isPending ? t('recipe.saving') : t('recipe.saveRecipe')}
       </button>
       {save.error && <ErrorText error={save.error} />}
+      {recipe && <RecipeConflictNotice error={save.error} recipeId={recipe.id} />}
     </form>
+  )
+}
+
+export function RecipeConflictNotice({
+  error,
+  recipeId,
+}: {
+  error: unknown
+  recipeId: string
+}) {
+  const { t } = useI18n()
+  if (!(error instanceof ApiError) || error.code !== 'conflict') return null
+  return (
+    <div className="notice" role="alert">
+      <p>{t('recipe.staleConflict')}</p>
+      <a
+        className="button secondary"
+        href={`/recipes/${encodeURIComponent(recipeId)}`}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {t('recipe.openLatest')}
+      </a>
+    </div>
   )
 }
 

@@ -310,11 +310,14 @@ paths:
               schema: { $ref: "#/components/schemas/Recipe" }
         "404": { description: Missing or not visible }
     put:
-      description: Owner only
+      description: Owner-only optimistic update. The current recipe version is required so browser and AI edits cannot silently overwrite one another.
+      parameters:
+        - $ref: "#/components/parameters/RecipeIfMatch"
       requestBody:
         $ref: "#/components/requestBodies/RecipeInput"
       responses:
         "200": { description: Recipe updated }
+        "409": { description: Recipe version changed; reload and compare before retrying }
         "404": { description: Missing or not owned }
     delete:
       description: Owner only
@@ -517,6 +520,11 @@ paths:
         "200": { description: Settings saved }
   /api/recommendations:
     post:
+      parameters:
+        - in: query
+          name: limit
+          description: Maximum ranked recipes returned. Candidate scanning remains complete so the highest-scoring results are not missed.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
       requestBody:
         required: true
         content:
@@ -524,12 +532,14 @@ paths:
             schema: { $ref: "#/components/schemas/RecommendationRequest" }
       responses:
         "200":
-          description: Deterministic recommendations with ingredient explanations
+          description: Bounded deterministic top-N recommendations with ingredient explanations
           content:
             application/json:
               schema:
                 type: array
+                maxItems: 100
                 items: { $ref: "#/components/schemas/Recommendation" }
+        "429": { description: Per-account/IP recommendation request limit exceeded }
   /api/settings/import-tokens:
     get:
       description: Lists non-secret metadata and scopes for the authenticated user's AI tokens. Token secrets are never returned.
@@ -548,6 +558,8 @@ paths:
       description: Creates either the minimal recipes:import token or a private-recipe management token. The secret is returned exactly once.
       security:
         - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RecipeIfMatch"
       requestBody:
         required: true
         content:
@@ -586,36 +598,55 @@ paths:
           multipart/form-data:
             schema: { $ref: "#/components/schemas/RecipeImageUpload" }
       responses:
-        "204": { description: Cover image replaced }
+        "200":
+          description: Cover image replaced and recipe version incremented
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecipeVersion" }
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe missing or not owned }
+        "409": { description: Recipe version changed }
         "413": { description: Upload, decoded pixels, decoder allocation, or normalized bytes exceed the documented limit }
     put:
       description: Updates alt text and optional source/license/attribution for the authenticated owner's existing cover.
       security:
         - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RecipeIfMatch"
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: "#/components/schemas/RecipeImageMetadata" }
       responses:
-        "204": { description: Cover metadata updated }
+        "200":
+          description: Cover metadata updated and recipe version incremented
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecipeVersion" }
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe or cover missing or not owned }
+        "409": { description: Recipe version changed }
     delete:
       description: Removes the authenticated owner's cover image without deleting the recipe.
       security:
         - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RecipeIfMatch"
       responses:
-        "204": { description: Cover image removed }
+        "200":
+          description: Cover image removed and recipe version incremented
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecipeVersion" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe missing or not owned }
+        "409": { description: Recipe version changed }
   /api/recipe-images/{id}:
     get:
-      description: Returns a normalized JPEG by random image ID. Public recipe images are anonymous and immutable-cacheable; private images require the owner session or an owner token with recipes:read and use private, no-store caching.
+      description: Returns a normalized JPEG by random image ID. Public recipe images require cache revalidation on reuse so unpublish/delete can return 404; private images require the owner session or an owner token with recipes:read and use private, no-store caching.
       parameters:
         - name: id
           in: path
@@ -931,6 +962,14 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    RecipeIfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: Strong recipe version validator in the form `"recipe-v<version>"`.
+      schema:
+        type: string
+        pattern: '^"recipe-v[1-9][0-9]*"$'
     ImportTokenId:
       name: id
       in: path
@@ -1128,6 +1167,11 @@ components:
               oneOf:
                 - $ref: "#/components/schemas/RecipeImage"
                 - type: "null"
+    RecipeVersion:
+      type: object
+      required: [version]
+      properties:
+        version: { type: integer, minimum: 2 }
     RecipeImage:
       type: object
       required: [id, url, width, height, altText, sourceUrl, sourceLicense, sourceAttribution, version]

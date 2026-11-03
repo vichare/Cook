@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet},
+};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
@@ -120,6 +123,28 @@ pub fn recommend(
     settings: &RecommendationSettings,
     now: DateTime<Utc>,
 ) -> Vec<Recommendation> {
+    recommend_inner(recipes, pantry, request, settings, now, None)
+}
+
+pub fn recommend_limited(
+    recipes: Vec<Recipe>,
+    pantry: &[PantryItem],
+    request: &RecommendationRequest,
+    settings: &RecommendationSettings,
+    now: DateTime<Utc>,
+    limit: usize,
+) -> Vec<Recommendation> {
+    recommend_inner(recipes, pantry, request, settings, now, Some(limit))
+}
+
+fn recommend_inner(
+    recipes: Vec<Recipe>,
+    pantry: &[PantryItem],
+    request: &RecommendationRequest,
+    settings: &RecommendationSettings,
+    now: DateTime<Utc>,
+    limit: Option<usize>,
+) -> Vec<Recommendation> {
     let pantry: HashMap<_, _> = pantry
         .iter()
         .map(|item| {
@@ -134,217 +159,251 @@ pub fn recommend(
     let preferred = normalized_set(&request.preferred);
     let stale_before = now - Duration::days(settings.verification_days);
 
-    let mut results: Vec<_> = recipes
-        .into_iter()
-        .filter_map(|recipe| {
-            let ingredients: HashSet<_> = recipe
-                .ingredients
-                .iter()
-                .map(|ingredient| {
-                    ingredient_key(
-                        ingredient.canonical_ingredient_id.as_deref(),
-                        &ingredient.name,
-                    )
-                })
-                .collect();
-            if !excluded.is_disjoint(&ingredients) || !required.is_subset(&ingredients) {
-                return None;
-            }
-            let matched_sources = matched_sources(&recipe, settings);
-            let primary_source = *matched_sources.first()?;
-
-            let mut available = Vec::new();
-            let mut verify = Vec::new();
-            let mut missing = Vec::new();
-            let mut ingredient_reasons = Vec::new();
-            for ingredient in &recipe.ingredients {
-                let normalized = ingredient_key(
+    let results = recipes.into_iter().filter_map(|recipe| {
+        let ingredients: HashSet<_> = recipe
+            .ingredients
+            .iter()
+            .map(|ingredient| {
+                ingredient_key(
                     ingredient.canonical_ingredient_id.as_deref(),
                     &ingredient.name,
-                );
-                let (code, expires_on) = match pantry.get(&normalized) {
-                    None => {
-                        missing.push(ingredient.name.clone());
-                        (IngredientReasonCode::Missing, None)
-                    }
-                    Some(item) if item.status == PantryStatus::Out => {
-                        missing.push(ingredient.name.clone());
-                        (IngredientReasonCode::Out, item.expires_on.clone())
-                    }
-                    Some(item) if item.status == PantryStatus::Unknown => {
+                )
+            })
+            .collect();
+        if !excluded.is_disjoint(&ingredients) || !required.is_subset(&ingredients) {
+            return None;
+        }
+        let matched_sources = matched_sources(&recipe, settings);
+        let primary_source = *matched_sources.first()?;
+
+        let mut available = Vec::new();
+        let mut verify = Vec::new();
+        let mut missing = Vec::new();
+        let mut ingredient_reasons = Vec::new();
+        for ingredient in &recipe.ingredients {
+            let normalized = ingredient_key(
+                ingredient.canonical_ingredient_id.as_deref(),
+                &ingredient.name,
+            );
+            let (code, expires_on) = match pantry.get(&normalized) {
+                None => {
+                    missing.push(ingredient.name.clone());
+                    (IngredientReasonCode::Missing, None)
+                }
+                Some(item) if item.status == PantryStatus::Out => {
+                    missing.push(ingredient.name.clone());
+                    (IngredientReasonCode::Out, item.expires_on.clone())
+                }
+                Some(item) if item.status == PantryStatus::Unknown => {
+                    verify.push(ingredient.name.clone());
+                    (IngredientReasonCode::Unknown, item.expires_on.clone())
+                }
+                Some(item) => {
+                    let expiry = item.expires_on.as_deref().and_then(parse_date);
+                    if expiry.is_some_and(|date| date < now.date_naive()) {
                         verify.push(ingredient.name.clone());
-                        (IngredientReasonCode::Unknown, item.expires_on.clone())
+                        (IngredientReasonCode::Expired, item.expires_on.clone())
+                    } else if expiry.is_some_and(|date| date == now.date_naive()) {
+                        verify.push(ingredient.name.clone());
+                        (IngredientReasonCode::ExpiresToday, item.expires_on.clone())
+                    } else if !is_fresh(item, stale_before) {
+                        verify.push(ingredient.name.clone());
+                        (IngredientReasonCode::Stale, item.expires_on.clone())
+                    } else {
+                        available.push(ingredient.name.clone());
+                        (IngredientReasonCode::Available, item.expires_on.clone())
                     }
-                    Some(item) => {
-                        let expiry = item.expires_on.as_deref().and_then(parse_date);
-                        if expiry.is_some_and(|date| date < now.date_naive()) {
-                            verify.push(ingredient.name.clone());
-                            (IngredientReasonCode::Expired, item.expires_on.clone())
-                        } else if expiry.is_some_and(|date| date == now.date_naive()) {
-                            verify.push(ingredient.name.clone());
-                            (IngredientReasonCode::ExpiresToday, item.expires_on.clone())
-                        } else if !is_fresh(item, stale_before) {
-                            verify.push(ingredient.name.clone());
-                            (IngredientReasonCode::Stale, item.expires_on.clone())
-                        } else {
-                            available.push(ingredient.name.clone());
-                            (IngredientReasonCode::Available, item.expires_on.clone())
-                        }
-                    }
-                };
-                ingredient_reasons.push(IngredientReason {
-                    ingredient: ingredient.name.clone(),
-                    code,
-                    expires_on,
-                });
-            }
+                }
+            };
+            ingredient_reasons.push(IngredientReason {
+                ingredient: ingredient.name.clone(),
+                code,
+                expires_on,
+            });
+        }
 
-            let blocked = request.pantry_only && (!missing.is_empty() || !verify.is_empty());
-            let status = if blocked {
-                RecommendationStatus::Blocked
-            } else if !missing.is_empty() {
-                RecommendationStatus::Shop
-            } else if !verify.is_empty() {
-                RecommendationStatus::Verify
-            } else {
-                RecommendationStatus::Ready
-            };
-            let desired_matches = recipe
-                .ingredients
-                .iter()
-                .filter(|ingredient| {
-                    preferred.contains(&ingredient_key(
-                        ingredient.canonical_ingredient_id.as_deref(),
-                        &ingredient.name,
-                    ))
-                })
-                .map(|ingredient| ingredient.name.clone())
-                .collect::<Vec<_>>();
-            let preferred_matches = i32::try_from(desired_matches.len()).unwrap_or(i32::MAX);
-            let preferred_count = i32::try_from(preferred.len()).unwrap_or(i32::MAX);
-            let ingredient_count = i32::try_from(recipe.ingredients.len())
-                .unwrap_or(i32::MAX)
-                .max(1);
-            let available_count = i32::try_from(available.len()).unwrap_or(i32::MAX);
-            let missing_count = i32::try_from(missing.len()).unwrap_or(i32::MAX);
-            let breakdown = ScoreBreakdown {
-                status_base: status_base(status),
-                source: source_points(primary_source),
-                availability: (available_count * 80 / ingredient_count).clamp(0, 80),
-                desired: if preferred_count == 0 {
-                    0
-                } else {
-                    (preferred_matches * 40 / preferred_count).clamp(0, 40)
-                },
-                certainty: (available_count * 20 / ingredient_count).clamp(0, 20),
-                simplicity: (9 - missing_count).clamp(0, 9),
-            };
-            let score = breakdown.status_base
-                + breakdown.source
-                + breakdown.availability
-                + breakdown.desired
-                + breakdown.certainty
-                + breakdown.simplicity;
-            debug_assert!((0..=999).contains(&score));
-            let mut reasons = vec![format!(
-                "{} of {} ingredients confirmed",
-                available.len(),
-                recipe.ingredients.len()
-            )];
-            let mut reason_details = vec![RecommendationReason::ConfirmedIngredients {
-                confirmed: available.len(),
-                total: recipe.ingredients.len(),
-            }];
-            if preferred_matches > 0 {
-                reasons.push(format!(
-                    "{preferred_matches} preferred ingredient(s) included"
-                ));
-                reason_details.push(RecommendationReason::PreferredIngredients {
-                    count: preferred_matches as usize,
-                });
-            }
-            for ingredient in &recipe.ingredients {
-                let key = ingredient_key(
+        let blocked = request.pantry_only && (!missing.is_empty() || !verify.is_empty());
+        let status = if blocked {
+            RecommendationStatus::Blocked
+        } else if !missing.is_empty() {
+            RecommendationStatus::Shop
+        } else if !verify.is_empty() {
+            RecommendationStatus::Verify
+        } else {
+            RecommendationStatus::Ready
+        };
+        let desired_matches = recipe
+            .ingredients
+            .iter()
+            .filter(|ingredient| {
+                preferred.contains(&ingredient_key(
                     ingredient.canonical_ingredient_id.as_deref(),
                     &ingredient.name,
-                );
-                if let Some(item) = pantry.get(&key) {
-                    if let Some(expiry_reason) = expiry_reason(item, now.date_naive()) {
-                        reasons.push(format!("{}: {expiry_reason}", ingredient.name));
-                    }
-                    if let Some(expires_on) = item.expires_on.as_deref() {
-                        if let Some(date) = parse_date(expires_on) {
-                            if date < now.date_naive() {
-                                reason_details.push(RecommendationReason::IngredientExpired {
-                                    ingredient: ingredient.name.clone(),
-                                    expires_on: expires_on.to_string(),
-                                });
-                            } else if date == now.date_naive() {
-                                reason_details.push(RecommendationReason::IngredientExpiresToday {
-                                    ingredient: ingredient.name.clone(),
-                                });
-                            }
+                ))
+            })
+            .map(|ingredient| ingredient.name.clone())
+            .collect::<Vec<_>>();
+        let preferred_matches = i32::try_from(desired_matches.len()).unwrap_or(i32::MAX);
+        let preferred_count = i32::try_from(preferred.len()).unwrap_or(i32::MAX);
+        let ingredient_count = i32::try_from(recipe.ingredients.len())
+            .unwrap_or(i32::MAX)
+            .max(1);
+        let available_count = i32::try_from(available.len()).unwrap_or(i32::MAX);
+        let missing_count = i32::try_from(missing.len()).unwrap_or(i32::MAX);
+        let breakdown = ScoreBreakdown {
+            status_base: status_base(status),
+            source: source_points(primary_source),
+            availability: (available_count * 80 / ingredient_count).clamp(0, 80),
+            desired: if preferred_count == 0 {
+                0
+            } else {
+                (preferred_matches * 40 / preferred_count).clamp(0, 40)
+            },
+            certainty: (available_count * 20 / ingredient_count).clamp(0, 20),
+            simplicity: (9 - missing_count).clamp(0, 9),
+        };
+        let score = breakdown.status_base
+            + breakdown.source
+            + breakdown.availability
+            + breakdown.desired
+            + breakdown.certainty
+            + breakdown.simplicity;
+        debug_assert!((0..=999).contains(&score));
+        let mut reasons = vec![format!(
+            "{} of {} ingredients confirmed",
+            available.len(),
+            recipe.ingredients.len()
+        )];
+        let mut reason_details = vec![RecommendationReason::ConfirmedIngredients {
+            confirmed: available.len(),
+            total: recipe.ingredients.len(),
+        }];
+        if preferred_matches > 0 {
+            reasons.push(format!(
+                "{preferred_matches} preferred ingredient(s) included"
+            ));
+            reason_details.push(RecommendationReason::PreferredIngredients {
+                count: preferred_matches as usize,
+            });
+        }
+        for ingredient in &recipe.ingredients {
+            let key = ingredient_key(
+                ingredient.canonical_ingredient_id.as_deref(),
+                &ingredient.name,
+            );
+            if let Some(item) = pantry.get(&key) {
+                if let Some(expiry_reason) = expiry_reason(item, now.date_naive()) {
+                    reasons.push(format!("{}: {expiry_reason}", ingredient.name));
+                }
+                if let Some(expires_on) = item.expires_on.as_deref() {
+                    if let Some(date) = parse_date(expires_on) {
+                        if date < now.date_naive() {
+                            reason_details.push(RecommendationReason::IngredientExpired {
+                                ingredient: ingredient.name.clone(),
+                                expires_on: expires_on.to_string(),
+                            });
+                        } else if date == now.date_naive() {
+                            reason_details.push(RecommendationReason::IngredientExpiresToday {
+                                ingredient: ingredient.name.clone(),
+                            });
                         }
                     }
                 }
             }
-            if blocked {
-                reasons.push(
-                    "Blocked by pantry-only mode because ingredients are not confirmed available"
-                        .into(),
-                );
-                reason_details.push(RecommendationReason::PantryOnlyBlocked);
-            }
-            Some(Recommendation {
-                recipe,
-                status,
-                available,
-                verify,
-                missing,
-                reasons,
-                reason_details,
-                score,
-                score_breakdown: breakdown,
-                primary_source,
-                matched_sources,
-                desired_matches,
-                ingredient_reasons,
-                applied_controls: AppliedControls {
-                    preferred: request
-                        .preferred
-                        .iter()
-                        .map(|value| value.name().to_string())
-                        .collect(),
-                    required: request
-                        .required
-                        .iter()
-                        .map(|value| value.name().to_string())
-                        .collect(),
-                    excluded: request
-                        .excluded
-                        .iter()
-                        .map(|value| value.name().to_string())
-                        .collect(),
-                    pantry_only: request.pantry_only,
-                    include_own: settings.include_own,
-                    include_favorite_recipes: settings.include_favorite_recipes,
-                    include_favorite_accounts: settings.include_favorite_accounts,
-                    include_other_public: settings.include_other_public,
-                },
-            })
+        }
+        if blocked {
+            reasons.push(
+                "Blocked by pantry-only mode because ingredients are not confirmed available"
+                    .into(),
+            );
+            reason_details.push(RecommendationReason::PantryOnlyBlocked);
+        }
+        Some(Recommendation {
+            recipe,
+            status,
+            available,
+            verify,
+            missing,
+            reasons,
+            reason_details,
+            score,
+            score_breakdown: breakdown,
+            primary_source,
+            matched_sources,
+            desired_matches,
+            ingredient_reasons,
+            applied_controls: AppliedControls {
+                preferred: request
+                    .preferred
+                    .iter()
+                    .map(|value| value.name().to_string())
+                    .collect(),
+                required: request
+                    .required
+                    .iter()
+                    .map(|value| value.name().to_string())
+                    .collect(),
+                excluded: request
+                    .excluded
+                    .iter()
+                    .map(|value| value.name().to_string())
+                    .collect(),
+                pantry_only: request.pantry_only,
+                include_own: settings.include_own,
+                include_favorite_recipes: settings.include_favorite_recipes,
+                include_favorite_accounts: settings.include_favorite_accounts,
+                include_other_public: settings.include_other_public,
+            },
         })
-        .collect();
-    results.sort_by(|left, right| {
-        status_rank(right.status)
-            .cmp(&status_rank(left.status))
-            .then_with(|| right.score.cmp(&left.score))
-            .then_with(|| {
-                normalize_ingredient(&left.recipe.title)
-                    .cmp(&normalize_ingredient(&right.recipe.title))
-            })
-            .then_with(|| left.recipe.id.cmp(&right.recipe.id))
     });
-    results
+    if let Some(limit) = limit {
+        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        for result in results {
+            heap.push(WorstFirst(result));
+            if heap.len() > limit {
+                heap.pop();
+            }
+        }
+        let mut results = heap.into_iter().map(|ranked| ranked.0).collect::<Vec<_>>();
+        results.sort_by(compare_recommendations);
+        results
+    } else {
+        let mut results = results.collect::<Vec<_>>();
+        results.sort_by(compare_recommendations);
+        results
+    }
+}
+
+struct WorstFirst(Recommendation);
+
+impl PartialEq for WorstFirst {
+    fn eq(&self, other: &Self) -> bool {
+        compare_recommendations(&self.0, &other.0) == Ordering::Equal
+    }
+}
+
+impl Eq for WorstFirst {}
+
+impl PartialOrd for WorstFirst {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorstFirst {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_recommendations(&self.0, &other.0)
+    }
+}
+
+fn compare_recommendations(left: &Recommendation, right: &Recommendation) -> Ordering {
+    status_rank(right.status)
+        .cmp(&status_rank(left.status))
+        .then_with(|| right.score.cmp(&left.score))
+        .then_with(|| {
+            normalize_ingredient(&left.recipe.title).cmp(&normalize_ingredient(&right.recipe.title))
+        })
+        .then_with(|| left.recipe.id.cmp(&right.recipe.id))
 }
 
 fn matched_sources(
@@ -735,5 +794,51 @@ mod tests {
             .all(|result| (0..=999).contains(&result.score)));
         assert!(results[0].score > results[1].score);
         assert!(results[1].score > results[2].score);
+    }
+
+    #[test]
+    fn bounded_ranking_matches_the_unbounded_prefix() {
+        let recipes = (0..20)
+            .map(|index| {
+                recipe(
+                    &index.to_string(),
+                    &format!("Recipe {index:02}"),
+                    &["bread"],
+                )
+            })
+            .collect::<Vec<_>>();
+        let pantry = [pantry(
+            "bread",
+            PantryStatus::Have,
+            Some("2026-01-19T00:00:00Z"),
+        )];
+        let now = DateTime::parse_from_rfc3339("2026-01-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let all = recommend(
+            recipes.clone(),
+            &pantry,
+            &RecommendationRequest::default(),
+            &settings(),
+            now,
+        );
+        let limited = recommend_limited(
+            recipes,
+            &pantry,
+            &RecommendationRequest::default(),
+            &settings(),
+            now,
+            5,
+        );
+        assert_eq!(
+            limited
+                .iter()
+                .map(|result| &result.recipe.id)
+                .collect::<Vec<_>>(),
+            all.iter()
+                .take(5)
+                .map(|result| &result.recipe.id)
+                .collect::<Vec<_>>()
+        );
     }
 }

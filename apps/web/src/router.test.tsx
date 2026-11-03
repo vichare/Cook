@@ -11,6 +11,7 @@ import {
   PantryConfirmation,
   ProfileSetup,
   RecipeCoverFields,
+  RecipeConflictNotice,
   RecipeMetadataFields,
   ShoppingListPage,
 } from './router'
@@ -33,7 +34,7 @@ function Providers({ children, locale = 'en' }: { children: React.ReactNode; loc
   )
 }
 
-const { shoppingItems, markAutomaticShoppingPurchased, requestEmailLink, requestEmailOtp, saveLocale, saveProfile, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
+const { shoppingItems, markAutomaticShoppingPurchased, requestEmailLink, requestEmailOtp, saveLocale, saveProfile, saveRecipe, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
   saveProfile: vi.fn().mockImplementation((nickname: string | null) =>
     Promise.resolve({
       id: 'user',
@@ -105,6 +106,7 @@ const { shoppingItems, markAutomaticShoppingPurchased, requestEmailLink, request
     },
   ]),
   markAutomaticShoppingPurchased: vi.fn().mockResolvedValue([]),
+  saveRecipe: vi.fn(),
 }))
 
 vi.mock('./api', async () => {
@@ -133,6 +135,7 @@ vi.mock('./api', async () => {
       deleteShoppingItem: vi.fn().mockResolvedValue([]),
       markAutomaticShoppingPurchased,
       saveProfile,
+      saveRecipe,
       saveLocale,
       requestEmailOtp,
       verifyEmailOtp,
@@ -162,6 +165,28 @@ describe('shopping list', () => {
     expect(screen.getByRole('heading', { name: 'Manual and recipe items' })).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Mark Milk purchased' }))
     await waitFor(() => expect(markAutomaticShoppingPurchased).toHaveBeenCalledWith('pantry-1'))
+  })
+
+  describe('recipe concurrency', () => {
+    it('keeps unsaved input and offers comparison guidance after a stale conflict', async () => {
+      const { ApiError } = await import('./api')
+      render(
+          <Providers>
+            <input aria-label="Unsaved title" defaultValue="Unsaved local title" />
+            <RecipeConflictNotice
+              error={new ApiError('stale', 409, 'conflict')}
+              recipeId="recipe-1"
+            />
+          </Providers>,
+      )
+      const title = screen.getByRole('textbox', { name: 'Unsaved title' })
+      expect(screen.getByText(/changed in another tab or AI client/i)).toBeVisible()
+      expect(title).toHaveValue('Unsaved local title')
+      expect(screen.getByRole('link', { name: 'Open latest version in another tab' })).toHaveAttribute(
+        'target',
+        '_blank',
+      )
+    })
   })
 
   function RecipeMetadataHarness() {

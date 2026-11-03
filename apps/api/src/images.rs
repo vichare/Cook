@@ -20,7 +20,7 @@ use image::{
     imageops::FilterType,
     DynamicImage, ImageBuffer, ImageDecoder, ImageFormat, Limits, Rgb, RgbImage,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 use url::Url;
@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     imports::{authenticate_token, record_token_audit, TokenPrincipal, SCOPE_RECIPES_READ},
-    routes::CurrentUser,
+    routes::{expected_recipe_version, CurrentUser},
     AppState,
 };
 
@@ -58,6 +58,12 @@ pub struct ImageMetadataUpdate {
     source_license: String,
     #[serde(default)]
     source_attribution: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeVersion {
+    version: i64,
 }
 
 #[derive(Clone)]
@@ -286,47 +292,45 @@ pub async fn delete_image(
 pub(crate) async fn session_upload_image(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    headers: HeaderMap,
     Path(recipe_id): Path<String>,
     multipart: Multipart,
-) -> AppResult<StatusCode> {
+) -> AppResult<axum::Json<RecipeVersion>> {
+    let expected_version = expected_recipe_version(&headers)?;
     let image = parse_image_multipart(multipart).await?;
     let mut transaction = state.pool.begin().await?;
-    ensure_owned_recipe(&mut transaction, &recipe_id, &user.id).await?;
+    let version =
+        claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
+            .await?;
     upsert_image(&mut transaction, &recipe_id, &image).await?;
-    sqlx::query(
-        "UPDATE recipes SET version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    )
-    .bind(&recipe_id)
-    .execute(&mut *transaction)
-    .await?;
     transaction.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(axum::Json(RecipeVersion { version }))
 }
 
 pub(crate) async fn session_delete_image(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    headers: HeaderMap,
     Path(recipe_id): Path<String>,
-) -> AppResult<StatusCode> {
+) -> AppResult<axum::Json<RecipeVersion>> {
+    let expected_version = expected_recipe_version(&headers)?;
     let mut transaction = state.pool.begin().await?;
-    ensure_owned_recipe(&mut transaction, &recipe_id, &user.id).await?;
+    let version =
+        claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
+            .await?;
     delete_image(&mut transaction, &recipe_id).await?;
-    sqlx::query(
-        "UPDATE recipes SET version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    )
-    .bind(&recipe_id)
-    .execute(&mut *transaction)
-    .await?;
     transaction.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(axum::Json(RecipeVersion { version }))
 }
 
 pub(crate) async fn session_update_image_metadata(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    headers: HeaderMap,
     Path(recipe_id): Path<String>,
     axum::Json(input): axum::Json<ImageMetadataUpdate>,
-) -> AppResult<StatusCode> {
+) -> AppResult<axum::Json<RecipeVersion>> {
+    let expected_version = expected_recipe_version(&headers)?;
     let metadata = validate_metadata(
         &input.alt_text,
         Some(&input.source_url),
@@ -334,7 +338,9 @@ pub(crate) async fn session_update_image_metadata(
         Some(&input.source_attribution),
     )?;
     let mut transaction = state.pool.begin().await?;
-    ensure_owned_recipe(&mut transaction, &recipe_id, &user.id).await?;
+    let version =
+        claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
+            .await?;
     let updated = sqlx::query(
         "UPDATE recipe_images SET alt_text = ?, source_url = ?, source_license = ?,
            source_attribution = ?, version = version + 1, updated_at = ?
@@ -351,21 +357,29 @@ pub(crate) async fn session_update_image_metadata(
     if updated.rows_affected() != 1 {
         return Err(AppError::NotFound);
     }
-    sqlx::query(
-        "UPDATE recipes SET version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    )
-    .bind(&recipe_id)
-    .execute(&mut *transaction)
-    .await?;
     transaction.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(axum::Json(RecipeVersion { version }))
 }
 
-async fn ensure_owned_recipe(
+async fn claim_owned_recipe_version(
     transaction: &mut Transaction<'_, Sqlite>,
     recipe_id: &str,
     owner_id: &str,
-) -> AppResult<()> {
+    expected_version: i64,
+) -> AppResult<i64> {
+    let version: Option<i64> = sqlx::query_scalar(
+        "UPDATE recipes SET version = version + 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND owner_id = ? AND version = ?
+         RETURNING version",
+    )
+    .bind(recipe_id)
+    .bind(owner_id)
+    .bind(expected_version)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(version) = version {
+        return Ok(version);
+    }
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM recipes WHERE id = ? AND owner_id = ?")
             .bind(recipe_id)
@@ -373,9 +387,13 @@ async fn ensure_owned_recipe(
             .fetch_optional(&mut **transaction)
             .await?;
     if exists.is_none() {
-        return Err(AppError::NotFound);
+        Err(AppError::NotFound)
+    } else {
+        Err(AppError::Conflict(
+            "recipe changed since it was opened; reload the latest version and compare your edits"
+                .into(),
+        ))
     }
-    Ok(())
 }
 
 pub async fn get_recipe_image(
@@ -439,7 +457,7 @@ pub async fn get_recipe_image(
     }
     let bytes: Vec<u8> = row.get("image_bytes");
     let cache = if public {
-        "public, max-age=31536000, immutable"
+        "public, max-age=0, must-revalidate"
     } else {
         "private, no-store"
     };
