@@ -2811,11 +2811,15 @@ mod tests {
     }
 
     fn multipart_image(bytes: &[u8]) -> (String, Vec<u8>) {
+        multipart_image_with_alt(bytes, "Blue soup")
+    }
+
+    fn multipart_image_with_alt(bytes: &[u8], alt_text: &str) -> (String, Vec<u8>) {
         let boundary = "cook-test-boundary";
         let mut body = Vec::new();
         body.extend_from_slice(
             format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"altText\"\r\n\r\nBlue soup\r\n"
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"altText\"\r\n\r\n{alt_text}\r\n"
             )
             .as_bytes(),
         );
@@ -4329,6 +4333,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", &owner_cookie)
                     .header("if-match", "\"recipe-v2\"")
+                    .header("idempotency-key", "metadata-private-image")
                     .body(Body::from(
                         json!({
                             "altText": "Updated blue soup",
@@ -4982,6 +4987,7 @@ mod tests {
                     .header("content-type", content_type)
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v3\"")
+                    .header("idempotency-key", "interactive-upload")
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -4989,6 +4995,38 @@ mod tests {
             .unwrap();
         assert_eq!(upload.status(), StatusCode::OK);
         assert_eq!(response_json(upload).await["version"], 4);
+        let (replay_content_type, replay_body) = multipart_image(&test_png());
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", replay_content_type)
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v3\"")
+                    .header("idempotency-key", "interactive-upload")
+                    .body(Body::from(replay_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["version"], 4);
+        let (different_content_type, different_body) =
+            multipart_image_with_alt(&test_png(), "Different cover");
+        let reused_for_different_upload = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", different_content_type)
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v4\"")
+                    .header("idempotency-key", "interactive-upload")
+                    .body(Body::from(different_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reused_for_different_upload.status(), StatusCode::CONFLICT);
         let stale_content_after_image = app
             .clone()
             .oneshot(
@@ -5016,6 +5054,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v4\"")
+                    .header("idempotency-key", "interactive-metadata")
                     .body(Body::from(metadata.to_string()))
                     .unwrap(),
             )
@@ -5023,18 +5062,62 @@ mod tests {
             .unwrap();
         assert_eq!(metadata_update.status(), StatusCode::OK);
         assert_eq!(response_json(metadata_update).await["version"], 5);
-        let stale_metadata = app
+        let metadata_replay = app
+            .clone()
             .oneshot(
                 Request::put(format!("/api/recipes/{recipe_id}/cover"))
                     .header("content-type", "application/json")
-                    .header("cookie", cookie)
+                    .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v4\"")
+                    .header("idempotency-key", "interactive-metadata")
+                    .body(Body::from(metadata.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata_replay.status(), StatusCode::OK);
+        assert_eq!(response_json(metadata_replay).await["version"], 5);
+        let stale_metadata = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v4\"")
+                    .header("idempotency-key", "stale-interactive-metadata")
                     .body(Body::from(metadata.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(stale_metadata.status(), StatusCode::CONFLICT);
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v5\"")
+                    .header("idempotency-key", "interactive-delete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert_eq!(response_json(deleted).await["version"], 6);
+        let delete_replay = app
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("cookie", cookie)
+                    .header("if-match", "\"recipe-v5\"")
+                    .header("idempotency-key", "interactive-delete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_replay.status(), StatusCode::OK);
+        assert_eq!(response_json(delete_replay).await["version"], 6);
     }
 
     #[tokio::test]

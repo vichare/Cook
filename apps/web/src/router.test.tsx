@@ -280,6 +280,7 @@ describe('shopping list', () => {
         coverFile: file,
         removeCover: false,
         coverMetadata,
+        coverMutationKey: 'upload-retry-key',
         acknowledgeVersion: (version) => {
           acknowledgedVersion = version
         },
@@ -295,6 +296,7 @@ describe('shopping list', () => {
         coverFile: file,
         removeCover: false,
         coverMetadata,
+        coverMutationKey: 'upload-retry-key',
         acknowledgeVersion: (version) => {
           acknowledgedVersion = version
         },
@@ -305,6 +307,7 @@ describe('shopping list', () => {
         file,
         coverMetadata,
         4,
+        'upload-retry-key',
       )
     })
 
@@ -322,6 +325,7 @@ describe('shopping list', () => {
         coverFile: null,
         removeCover: false,
         coverMetadata,
+        coverMutationKey: 'metadata-retry-key',
         acknowledgeVersion: (version) => {
           acknowledgedVersion = version
         },
@@ -337,6 +341,7 @@ describe('shopping list', () => {
         coverFile: null,
         removeCover: false,
         coverMetadata,
+        coverMutationKey: 'metadata-retry-key',
         acknowledgeVersion: (version) => {
           acknowledgedVersion = version
         },
@@ -346,6 +351,82 @@ describe('shopping list', () => {
         'recipe-1',
         coverMetadata,
         4,
+        'metadata-retry-key',
+      )
+    })
+
+    it('replays a lost successful upload response with the same mutation key', async () => {
+      const file = new File(['cover'], 'cover.png', { type: 'image/png' })
+      const committed = {
+        ...originalRecipe,
+        ...editedForm,
+        version: 5,
+        coverImage: {
+          ...originalRecipe.coverImage!,
+          id: 'committed-cover',
+          version: 2,
+          altText: coverMetadata.altText,
+        },
+      }
+      uploadRecipeCover.mockResolvedValueOnce({ version: 5 })
+      recipeApi.mockResolvedValueOnce(committed)
+
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion: 4,
+        coverFile: file,
+        removeCover: false,
+        coverMetadata,
+        coverMutationKey: 'lost-upload-key',
+        acknowledgeVersion: vi.fn(),
+      })).resolves.toMatchObject({ version: 5 })
+      expect(uploadRecipeCover).toHaveBeenCalledWith(
+        'recipe-1',
+        file,
+        coverMetadata,
+        4,
+        'lost-upload-key',
+      )
+    })
+
+    it('does not accept an external same-metadata cover as the attempted upload', async () => {
+      const { ApiError } = await import('./api')
+      const file = new File(['my-cover'], 'cover.png', { type: 'image/png' })
+      recipeApi.mockResolvedValueOnce({
+        ...originalRecipe,
+        ...editedForm,
+        version: 5,
+        coverImage: {
+          ...originalRecipe.coverImage!,
+          id: 'external-cover',
+          version: 2,
+          altText: coverMetadata.altText,
+        },
+      })
+      uploadRecipeCover.mockRejectedValueOnce(
+        new ApiError('recipe changed', 409, 'conflict'),
+      )
+
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion: 4,
+        coverFile: file,
+        removeCover: false,
+        coverMetadata,
+        coverMutationKey: 'uncommitted-upload-key',
+        acknowledgeVersion: vi.fn(),
+      })).rejects.toEqual(expect.objectContaining({
+        status: 409,
+        code: 'conflict',
+      }))
+      expect(uploadRecipeCover).toHaveBeenCalledWith(
+        'recipe-1',
+        file,
+        coverMetadata,
+        4,
+        'uncommitted-upload-key',
       )
     })
 
@@ -362,6 +443,7 @@ describe('shopping list', () => {
         coverFile: null,
         removeCover: false,
         coverMetadata,
+        coverMutationKey: 'external-conflict-key',
         acknowledgeVersion: vi.fn(),
       })).rejects.toEqual(expect.objectContaining({
         status: 409,

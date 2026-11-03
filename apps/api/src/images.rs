@@ -296,13 +296,62 @@ pub(crate) async fn session_upload_image(
     Path(recipe_id): Path<String>,
     multipart: Multipart,
 ) -> AppResult<axum::Json<RecipeVersion>> {
+    let idempotency_key = cover_idempotency_key(&headers)?;
     let expected_version = expected_recipe_version(&headers)?;
     let image = parse_image_multipart(multipart).await?;
+    let fingerprint = cover_mutation_fingerprint(
+        "upload",
+        &[
+            image.sha256.as_slice(),
+            image.metadata.alt_text.as_bytes(),
+            image
+                .metadata
+                .source_url
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+            image
+                .metadata
+                .source_license
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+            image
+                .metadata
+                .source_attribution
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        ],
+    );
     let mut transaction = state.pool.begin().await?;
+    if let Some(version) = replay_cover_mutation(
+        &mut transaction,
+        &user.id,
+        &recipe_id,
+        &idempotency_key,
+        "upload",
+        &fingerprint,
+    )
+    .await?
+    {
+        transaction.commit().await?;
+        return Ok(axum::Json(RecipeVersion { version }));
+    }
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
             .await?;
     upsert_image(&mut transaction, &recipe_id, &image).await?;
+    record_cover_mutation(
+        &mut transaction,
+        &user.id,
+        &recipe_id,
+        &idempotency_key,
+        "upload",
+        &fingerprint,
+        version,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(axum::Json(RecipeVersion { version }))
 }
@@ -313,12 +362,37 @@ pub(crate) async fn session_delete_image(
     headers: HeaderMap,
     Path(recipe_id): Path<String>,
 ) -> AppResult<axum::Json<RecipeVersion>> {
+    let idempotency_key = cover_idempotency_key(&headers)?;
     let expected_version = expected_recipe_version(&headers)?;
+    let fingerprint = cover_mutation_fingerprint("delete", &[]);
     let mut transaction = state.pool.begin().await?;
+    if let Some(version) = replay_cover_mutation(
+        &mut transaction,
+        &user.id,
+        &recipe_id,
+        &idempotency_key,
+        "delete",
+        &fingerprint,
+    )
+    .await?
+    {
+        transaction.commit().await?;
+        return Ok(axum::Json(RecipeVersion { version }));
+    }
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
             .await?;
     delete_image(&mut transaction, &recipe_id).await?;
+    record_cover_mutation(
+        &mut transaction,
+        &user.id,
+        &recipe_id,
+        &idempotency_key,
+        "delete",
+        &fingerprint,
+        version,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(axum::Json(RecipeVersion { version }))
 }
@@ -330,6 +404,7 @@ pub(crate) async fn session_update_image_metadata(
     Path(recipe_id): Path<String>,
     axum::Json(input): axum::Json<ImageMetadataUpdate>,
 ) -> AppResult<axum::Json<RecipeVersion>> {
+    let idempotency_key = cover_idempotency_key(&headers)?;
     let expected_version = expected_recipe_version(&headers)?;
     let metadata = validate_metadata(
         &input.alt_text,
@@ -337,7 +412,41 @@ pub(crate) async fn session_update_image_metadata(
         Some(&input.source_license),
         Some(&input.source_attribution),
     )?;
+    let fingerprint = cover_mutation_fingerprint(
+        "metadata",
+        &[
+            metadata.alt_text.as_bytes(),
+            metadata
+                .source_url
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+            metadata
+                .source_license
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+            metadata
+                .source_attribution
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        ],
+    );
     let mut transaction = state.pool.begin().await?;
+    if let Some(version) = replay_cover_mutation(
+        &mut transaction,
+        &user.id,
+        &recipe_id,
+        &idempotency_key,
+        "metadata",
+        &fingerprint,
+    )
+    .await?
+    {
+        transaction.commit().await?;
+        return Ok(axum::Json(RecipeVersion { version }));
+    }
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
             .await?;
@@ -357,8 +466,104 @@ pub(crate) async fn session_update_image_metadata(
     if updated.rows_affected() != 1 {
         return Err(AppError::NotFound);
     }
+    record_cover_mutation(
+        &mut transaction,
+        &user.id,
+        &recipe_id,
+        &idempotency_key,
+        "metadata",
+        &fingerprint,
+        version,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(axum::Json(RecipeVersion { version }))
+}
+
+fn cover_idempotency_key(headers: &HeaderMap) -> AppResult<String> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| AppError::Validation("Idempotency-Key header is required".into()))?;
+    if !(8..=128).contains(&key.len())
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(AppError::Validation(
+            "Idempotency-Key must contain 8 to 128 URL-safe characters".into(),
+        ));
+    }
+    Ok(key.to_string())
+}
+
+fn cover_mutation_fingerprint(operation: &str, fields: &[&[u8]]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update((operation.len() as u64).to_be_bytes());
+    digest.update(operation.as_bytes());
+    for field in fields {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest.finalize().into()
+}
+
+async fn replay_cover_mutation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    recipe_id: &str,
+    idempotency_key: &str,
+    operation: &str,
+    fingerprint: &[u8; 32],
+) -> AppResult<Option<i64>> {
+    let prior = sqlx::query(
+        "SELECT operation, request_fingerprint, result_version
+         FROM recipe_cover_mutations
+         WHERE owner_id = ? AND recipe_id = ? AND idempotency_key = ?",
+    )
+    .bind(owner_id)
+    .bind(recipe_id)
+    .bind(idempotency_key)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(prior) = prior else {
+        return Ok(None);
+    };
+    let prior_operation: String = prior.get("operation");
+    let prior_fingerprint: Vec<u8> = prior.get("request_fingerprint");
+    if prior_operation != operation || prior_fingerprint.as_slice() != fingerprint {
+        return Err(AppError::Conflict(
+            "Idempotency-Key was already used for a different cover mutation".into(),
+        ));
+    }
+    Ok(Some(prior.get("result_version")))
+}
+
+async fn record_cover_mutation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    recipe_id: &str,
+    idempotency_key: &str,
+    operation: &str,
+    fingerprint: &[u8; 32],
+    result_version: i64,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO recipe_cover_mutations
+         (owner_id, recipe_id, idempotency_key, operation, request_fingerprint,
+          result_version, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(owner_id)
+    .bind(recipe_id)
+    .bind(idempotency_key)
+    .bind(operation)
+    .bind(fingerprint.as_slice())
+    .bind(result_version)
+    .bind(Utc::now().timestamp())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn claim_owned_recipe_version(

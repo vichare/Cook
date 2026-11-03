@@ -153,6 +153,7 @@ export const api = {
       sourceAttribution: string
     },
     expectedVersion: number,
+    idempotencyKey: string,
   ) => {
     const body = new FormData()
     body.set('image', image)
@@ -163,7 +164,10 @@ export const api = {
     const response = await fetch(`/api/recipes/${id}/cover`, {
       method: 'POST',
       credentials: 'same-origin',
-      headers: { 'if-match': `"recipe-v${expectedVersion}"` },
+      headers: {
+        'if-match': `"recipe-v${expectedVersion}"`,
+        'idempotency-key': idempotencyKey,
+      },
       body,
     })
     if (!response.ok) {
@@ -176,10 +180,13 @@ export const api = {
     }
     return response.json() as Promise<{ version: number }>
   },
-  deleteRecipeCover: (id: string, expectedVersion: number) =>
+  deleteRecipeCover: (id: string, expectedVersion: number, idempotencyKey: string) =>
     request<{ version: number }>(`/api/recipes/${id}/cover`, {
       method: 'DELETE',
-      headers: { 'if-match': `"recipe-v${expectedVersion}"` },
+      headers: {
+        'if-match': `"recipe-v${expectedVersion}"`,
+        'idempotency-key': idempotencyKey,
+      },
     }),
   updateRecipeCoverMetadata: (
     id: string,
@@ -190,11 +197,15 @@ export const api = {
       sourceAttribution: string
     },
     expectedVersion: number,
+    idempotencyKey: string,
   ) =>
     request<{ version: number }>(`/api/recipes/${id}/cover`, {
       method: 'PUT',
       body: JSON.stringify(metadata),
-      headers: { 'if-match': `"recipe-v${expectedVersion}"` },
+      headers: {
+        'if-match': `"recipe-v${expectedVersion}"`,
+        'idempotency-key': idempotencyKey,
+      },
     }),
   recipeRevisions: (recipeId: string) =>
     request<RecipeRevision[]>(`/api/recipe-revisions?recipeId=${encodeURIComponent(recipeId)}`),

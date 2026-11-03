@@ -589,9 +589,12 @@ paths:
     parameters:
       - $ref: "#/components/parameters/RecipeId"
     post:
-      description: Replaces the authenticated owner's single cover image. JPEG, PNG, and WebP are decoded under resource limits, orientation-corrected, resized to at most 1600px, metadata-stripped, and re-encoded as JPEG.
+      description: Replaces the authenticated owner's single cover image. JPEG, PNG, and WebP are decoded under resource limits, orientation-corrected, resized to at most 1600px, metadata-stripped, and re-encoded as JPEG. Retrying the same owner/recipe Idempotency-Key with the same normalized image and metadata replays the original version result.
       security:
         - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RecipeIfMatch"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -614,6 +617,7 @@ paths:
         - sessionCookie: []
       parameters:
         - $ref: "#/components/parameters/RecipeIfMatch"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -635,6 +639,7 @@ paths:
         - sessionCookie: []
       parameters:
         - $ref: "#/components/parameters/RecipeIfMatch"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: Cover image removed and recipe version incremented

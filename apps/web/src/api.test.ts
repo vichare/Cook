@@ -18,10 +18,13 @@ describe('recipe cover API', () => {
       sourceUrl: 'https://example.test/owned-image',
       sourceLicense: 'CC BY 4.0',
       sourceAttribution: 'Example Cook',
-    }, 1)
+    }, 1, 'cover-operation-1')
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(init.headers).toEqual({ 'if-match': '"recipe-v1"' })
+    expect(init.headers).toEqual({
+      'if-match': '"recipe-v1"',
+      'idempotency-key': 'cover-operation-1',
+    })
     expect(init.body).toBeInstanceOf(FormData)
     const body = init.body as FormData
     expect(body.get('image')).toBe(file)
