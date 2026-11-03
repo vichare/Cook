@@ -2,6 +2,8 @@
 
 Cook is a deployable recipe and private-pantry recommendation MVP. It combines user-authored recipes, per-account pantry state, configurable recommendation sources, and deterministic explanations for what can be cooked now.
 
+Pantry items can carry one optional date-only expiration. Ingredient entry uses shared Unicode normalization, multilingual pasted-list splitting, explicit canonical selections, and accessible suggestions; fuzzy matches are advisory and never silently alter recommendation hard filters. Expired items are explained as verification concerns rather than being changed to “used up.”
+
 ## Stack
 
 - React 19, TypeScript strict, Vite, TanStack Router and Query

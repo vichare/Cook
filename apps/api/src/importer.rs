@@ -31,6 +31,7 @@ impl LicensedRecipeImporter for FixtureImporter {
                 ingredients: vec![IngredientInput {
                     name: "bread".into(),
                     quantity_note: "one slice".into(),
+                    canonical_ingredient_id: None,
                 }],
             },
             source_url: "https://example.test/recipes/licensed-fixture".into(),

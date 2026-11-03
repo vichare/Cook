@@ -9,6 +9,8 @@
   --line: #d7d1c5;
   --danger: #a9342f;
   --shadow: 0 18px 48px rgb(24 60 43 / 10%);
+  font-size: 16px;
+  line-height: 1.5;
 }
 
 * { box-sizing: border-box; }
@@ -32,7 +34,7 @@ h1, h2 { font-family: Georgia, serif; color: var(--forest); }
 h1 { margin: .2rem 0 .7rem; font-size: clamp(2.2rem, 5vw, 4.5rem); line-height: .98; }
 h2 { margin: .3rem 0 .6rem; }
 .eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: .75rem; font-weight: 800; color: var(--leaf); }
-.button { border: 0; border-radius: 999px; padding: .72rem 1rem; cursor: pointer; font-weight: 750; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+.button { border: 0; border-radius: 999px; min-height: 44px; min-width: 44px; padding: .72rem 1rem; cursor: pointer; font-weight: 750; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
 .button:disabled { opacity: .55; cursor: not-allowed; }
 .primary { color: white; background: var(--forest); }
 .secondary { color: var(--forest); background: #e4ecdf; }
@@ -49,14 +51,14 @@ h2 { margin: .3rem 0 .6rem; }
 .card-list { display: grid; gap: 1rem; }
 .recipe-card, .recommendation-card, .detail-card { padding: 1.5rem; }
 .card-heading { display: flex; justify-content: space-between; align-items: start; gap: 1rem; }
-.status { display: inline-block; border-radius: 999px; padding: .28rem .6rem; font-size: .72rem; font-weight: 850; letter-spacing: .06em; text-transform: uppercase; }
+.status { display: inline-block; border-radius: 999px; padding: .35rem .7rem; font-size: .875rem; font-weight: 850; letter-spacing: .04em; text-transform: uppercase; }
 .ready { background: #dcefdc; color: #1d5b31; }
 .verify { background: #fff0bf; color: #775500; }
 .shop { background: #f9dfca; color: #7e3c11; }
 .blocked { background: #ead9d7; color: #762f2a; }
-.filter-panel, .inline-form { padding: 1.25rem; display: grid; grid-template-columns: repeat(4, 1fr); align-items: end; gap: 1rem; margin-bottom: 1.5rem; }
+.filter-panel, .inline-form { padding: 1.25rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); align-items: start; gap: 1rem; margin-bottom: 1.5rem; }
 label { display: flex; flex-direction: column; gap: .42rem; font-weight: 700; }
-input, textarea, select { width: 100%; border: 1px solid #aaa394; border-radius: .65rem; padding: .72rem; background: white; color: inherit; }
+input, textarea, select { width: 100%; min-height: 44px; border: 1px solid #767066; border-radius: .65rem; padding: .72rem; background: white; color: inherit; }
 .check-row { flex-direction: row; align-items: center; }
 .check-row input { width: auto; }
 .notice { margin: 1rem 0; padding: .9rem 1rem; border-radius: 1rem; display: flex; justify-content: space-between; align-items: center; background: #fff0bf; }
@@ -65,7 +67,7 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .ingredient-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: .75rem; margin-bottom: .75rem; align-items: start; }
 .field-error, .error { color: var(--danger); }
 .pantry-table { border: 1px solid var(--line); border-radius: 1rem; overflow: hidden; background: var(--cream); }
-.pantry-row { padding: 1rem; display: grid; grid-template-columns: 1fr .7fr 1.5fr auto; gap: 1rem; align-items: center; border-bottom: 1px solid var(--line); }
+.pantry-row { padding: 1rem; display: grid; grid-template-columns: minmax(140px, 1fr) auto minmax(150px, 1fr) minmax(190px, 1.2fr) auto auto; gap: 1rem; align-items: center; border-bottom: 1px solid var(--line); }
 .pantry-row:last-child { border-bottom: 0; }
 .pre-line { white-space: pre-line; line-height: 1.65; }
 .state-panel { width: min(700px, calc(100% - 2rem)); margin: 4rem auto; padding: 2rem; text-align: center; border: 1px dashed #aaa394; border-radius: 1rem; }
@@ -87,6 +89,22 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .secret-once code { overflow-wrap: anywhere; padding: .8rem; background: white; border-radius: .5rem; }
 .choice-list { display: grid; gap: .5rem; margin: 1.5rem 0; }
 .compact { grid-template-columns: minmax(220px, 1fr) auto; }
+.form-actions, .date-shortcuts { display: flex; flex-wrap: wrap; gap: .65rem; align-items: center; }
+.expiration-editor { display: grid; gap: .8rem; }
+.pantry-form .expiration-editor, .pantry-form .form-actions { grid-column: 1 / -1; }
+.expiration-editor .selected { box-shadow: inset 0 0 0 2px var(--forest); }
+.field-help, .combobox-status { margin: 0; color: #435248; font-size: .95rem; }
+.expiry-warning { color: #762f2a; font-weight: 750; }
+.ingredient-combobox { position: relative; display: grid; gap: .42rem; }
+.ingredient-listbox { position: absolute; z-index: 15; top: calc(100% - 1.4rem); left: 0; right: 0; max-height: 19rem; overflow: auto; padding: .4rem; border: 2px solid var(--forest); border-radius: .75rem; background: white; box-shadow: var(--shadow); }
+.ingredient-option { width: 100%; min-height: 52px; padding: .7rem; border: 0; border-bottom: 1px solid var(--line); background: white; color: inherit; text-align: left; display: grid; gap: .15rem; cursor: pointer; }
+.ingredient-option:last-child { border-bottom: 0; }
+.ingredient-option:hover, .ingredient-option.active, .ingredient-option[aria-selected="true"] { background: #e4ecdf; outline: 2px solid var(--forest); outline-offset: -2px; }
+.ingredient-option span, .ingredient-option small { color: #435248; }
+.ingredient-filter { min-width: 0; display: grid; gap: .65rem; }
+.ingredient-chips { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: .5rem; }
+.ingredient-chips li { display: flex; align-items: center; gap: .4rem; padding: .25rem .25rem .25rem .7rem; border: 1px solid var(--line); border-radius: 999px; background: white; }
+.ingredient-chips .button { min-height: 36px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 760px) {
@@ -96,4 +114,8 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
   .page-header { align-items: start; flex-direction: column; }
   .ingredient-row, .pantry-row { grid-template-columns: 1fr; }
   .confirmation-sheet { top: auto; bottom: 0; height: auto; max-height: 88vh; border-radius: 1.5rem 1.5rem 0 0; }
+}
+
+@media (forced-colors: active) {
+  .status, .button, input, textarea, select, .ingredient-option { border: 1px solid ButtonText; }
 }

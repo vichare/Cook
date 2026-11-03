@@ -15,6 +15,7 @@ import { z } from 'zod'
 import { ApiError, api } from './api'
 import type {
   ImportDraft,
+  IngredientReference,
   PantryItem,
   PantryStatus,
   Recipe,
@@ -22,6 +23,14 @@ import type {
   SecuritySettings as SecuritySettingsData,
   User,
 } from './types'
+import { IngredientCombobox } from './IngredientCombobox'
+import {
+  expirationLabel,
+  expirationShortcut,
+  localDateValue,
+  oneMonthAfter,
+  splitIngredientList,
+} from './ingredients'
 import { createPasskey, getPasskey } from './webauthn'
 
 interface RouterContext {
@@ -321,12 +330,18 @@ function HomePage() {
 }
 
 function RecommendationsPage() {
-  const [filters, setFilters] = useState({ preferred: '', required: '', excluded: '', pantryOnly: false })
-  const [submitted, setSubmitted] = useState({
-    preferred: [] as string[],
-    required: [] as string[],
-    excluded: [] as string[],
+  const [filters, setFilters] = useState({
+    preferred: [] as IngredientReference[],
+    required: [] as IngredientReference[],
+    excluded: [] as IngredientReference[],
     pantryOnly: false,
+  })
+  const [submitted, setSubmitted] = useState({
+    preferred: [] as IngredientReference[],
+    required: [] as IngredientReference[],
+    excluded: [] as IngredientReference[],
+    pantryOnly: false,
+    today: localDateValue(new Date()),
   })
   const recommendations = useQuery({
     queryKey: ['recommendations', submitted],
@@ -344,26 +359,24 @@ function RecommendationsPage() {
         className="filter-panel"
         onSubmit={(event) => {
           event.preventDefault()
-          setSubmitted({
-            preferred: split(filters.preferred),
-            required: split(filters.required),
-            excluded: split(filters.excluded),
-            pantryOnly: filters.pantryOnly,
-          })
+          setSubmitted({ ...filters, today: localDateValue(new Date()) })
         }}
       >
-        <label>
-          Hope to use
-          <input value={filters.preferred} onChange={(event) => setFilters({ ...filters, preferred: event.target.value })} placeholder="egg, tomato" />
-        </label>
-        <label>
-          Must use
-          <input value={filters.required} onChange={(event) => setFilters({ ...filters, required: event.target.value })} />
-        </label>
-        <label>
-          Do not use
-          <input value={filters.excluded} onChange={(event) => setFilters({ ...filters, excluded: event.target.value })} />
-        </label>
+        <IngredientFilterInput
+          label="Hope to use"
+          values={filters.preferred}
+          onChange={(preferred) => setFilters({ ...filters, preferred })}
+        />
+        <IngredientFilterInput
+          label="Must use"
+          values={filters.required}
+          onChange={(required) => setFilters({ ...filters, required })}
+        />
+        <IngredientFilterInput
+          label="Do not use"
+          values={filters.excluded}
+          onChange={(excluded) => setFilters({ ...filters, excluded })}
+        />
         <label className="check-row">
           <input
             type="checkbox"
@@ -405,6 +418,63 @@ function RecommendationsPage() {
       </QueryState>
       <PantryConfirmation open={confirmOpen} onOpenChange={setConfirmOpen} names={verifyNames} />
     </Page>
+  )
+}
+
+function IngredientFilterInput({
+  label,
+  values,
+  onChange,
+}: {
+  label: string
+  values: IngredientReference[]
+  onChange: (values: IngredientReference[]) => void
+}) {
+  const [draft, setDraft] = useState<IngredientReference>({ name: '', canonicalIngredientId: null })
+  function add(next: IngredientReference) {
+    const additions = splitIngredientList(next.name).map((name, index) => ({
+      name,
+      canonicalIngredientId: index === 0 ? next.canonicalIngredientId : null,
+    }))
+    const existing = new Set(values.map((value) => value.name.normalize('NFKC').toLocaleLowerCase()))
+    onChange([
+      ...values,
+      ...additions.filter((value) => !existing.has(value.name.normalize('NFKC').toLocaleLowerCase())),
+    ])
+    setDraft({ name: '', canonicalIngredientId: null })
+  }
+  return (
+    <fieldset className="ingredient-filter">
+      <legend>{label}</legend>
+      <IngredientCombobox
+        label={`Add ingredient to ${label.toLowerCase()}`}
+        value={draft}
+        onChange={setDraft}
+        onCommit={add}
+        onPasteList={(names) => {
+          onChange([...values, ...names.map((name) => ({ name, canonicalIngredientId: null }))])
+          setDraft({ name: '', canonicalIngredientId: null })
+        }}
+        placeholder="Type or paste ingredients"
+      />
+      {values.length > 0 && (
+        <ul className="ingredient-chips" aria-label={`${label} ingredients`}>
+          {values.map((value, index) => (
+            <li key={`${value.name}-${index}`}>
+              <span>{value.name}</span>
+              <button
+                type="button"
+                className="button ghost"
+                aria-label={`Remove ${value.name} from ${label.toLowerCase()}`}
+                onClick={() => onChange(values.filter((_, itemIndex) => itemIndex !== index))}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </fieldset>
   )
 }
 
@@ -522,7 +592,11 @@ const recipeSchema = z.object({
   description: z.string(),
   instructions: z.string(),
   visibility: z.enum(['private', 'public']),
-  ingredients: z.array(z.object({ name: z.string().trim().min(1, 'Ingredient name is required'), quantityNote: z.string() })).min(1),
+  ingredients: z.array(z.object({
+    name: z.string().trim().min(1, 'Ingredient name is required'),
+    quantityNote: z.string(),
+    canonicalIngredientId: z.string().nullable(),
+  })).min(1),
 })
 type RecipeForm = z.infer<typeof recipeSchema>
 
@@ -536,7 +610,7 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
       description: '',
       instructions: '',
       visibility: 'private',
-      ingredients: [{ name: '', quantityNote: '' }],
+      ingredients: [{ name: '', quantityNote: '', canonicalIngredientId: null }],
     },
   })
   const fields = useFieldArray({ control: form.control, name: 'ingredients' })
@@ -573,11 +647,28 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
         <legend>Ingredients</legend>
         {fields.fields.map((field, index) => (
           <div className="ingredient-row" key={field.id}>
-            <label>
-              <span className="sr-only">Ingredient {index + 1}</span>
-              <input {...form.register(`ingredients.${index}.name`)} placeholder="Ingredient" />
+            <div>
+              <IngredientCombobox
+                label={`Ingredient ${index + 1}`}
+                value={{
+                  name: form.watch(`ingredients.${index}.name`),
+                  canonicalIngredientId: form.watch(`ingredients.${index}.canonicalIngredientId`),
+                }}
+                onChange={(value) => {
+                  form.setValue(`ingredients.${index}.name`, value.name, { shouldDirty: true })
+                  form.setValue(`ingredients.${index}.canonicalIngredientId`, value.canonicalIngredientId, { shouldDirty: true })
+                }}
+                onPasteList={(names) => {
+                  form.setValue(`ingredients.${index}.name`, names[0], { shouldDirty: true })
+                  form.setValue(`ingredients.${index}.canonicalIngredientId`, null, { shouldDirty: true })
+                  for (const name of names.slice(1)) {
+                    fields.append({ name, quantityNote: '', canonicalIngredientId: null })
+                  }
+                }}
+                placeholder="Type or paste ingredients"
+              />
               <FieldError message={form.formState.errors.ingredients?.[index]?.name?.message} />
-            </label>
+            </div>
             <label>
               <span className="sr-only">Quantity note for ingredient {index + 1}</span>
               <input {...form.register(`ingredients.${index}.quantityNote`)} placeholder="Quantity note" />
@@ -589,7 +680,7 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
             )}
           </div>
         ))}
-        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '' })}>
+        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '', canonicalIngredientId: null })}>
           Add ingredient
         </button>
       </fieldset>
@@ -604,27 +695,40 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
 function PantryPage() {
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
   const queryClient = useQueryClient()
-  const [draft, setDraft] = useState({ name: '', status: 'have' as PantryStatus, quantityNote: '' })
+  const [draft, setDraft] = useState({
+    name: '',
+    status: 'have' as PantryStatus,
+    quantityNote: '',
+    expiresOn: null as string | null,
+    canonicalIngredientId: null as string | null,
+  })
+  const [editingName, setEditingName] = useState<string | null>(null)
   const save = useMutation({
     mutationFn: api.savePantry,
     onSuccess: (items) => {
       queryClient.setQueryData(['pantry'], items)
-      setDraft({ name: '', status: 'have', quantityNote: '' })
+      setDraft({ name: '', status: 'have', quantityNote: '', expiresOn: null, canonicalIngredientId: null })
+      setEditingName(null)
     },
   })
   return (
-    <Page title="Private pantry" intro="Quantity is a note; confidence is available, used up, or uncertain.">
+    <Page title="Private pantry" intro="Track availability and an optional calendar expiration date for each ingredient.">
       <form
-        className="inline-form"
+        className="inline-form pantry-form"
         onSubmit={(event) => {
           event.preventDefault()
           save.mutate([draft])
         }}
       >
-        <label>
-          Ingredient
-          <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required />
-        </label>
+        <IngredientCombobox
+          label="Ingredient"
+          value={{ name: draft.name, canonicalIngredientId: draft.canonicalIngredientId }}
+          onChange={(value) => setDraft({ ...draft, ...value })}
+          onPasteList={(names) =>
+            setDraft({ ...draft, name: names.join(', '), canonicalIngredientId: null })
+          }
+          placeholder="Type or paste one or more ingredients"
+        />
         <label>
           Status
           <select
@@ -640,8 +744,29 @@ function PantryPage() {
           Quantity note
           <input value={draft.quantityNote} onChange={(event) => setDraft({ ...draft, quantityNote: event.target.value })} />
         </label>
-        <button className="button primary">Save item</button>
+        <ExpirationEditor
+          value={draft.expiresOn}
+          onChange={(expiresOn) => setDraft({ ...draft, expiresOn })}
+        />
+        <div className="form-actions">
+          <button className="button primary" disabled={!draft.name.trim() || save.isPending}>
+            {editingName ? `Save changes to ${editingName}` : 'Save pantry item'}
+          </button>
+          {editingName && (
+            <button
+              type="button"
+              className="button ghost"
+              onClick={() => {
+                setDraft({ name: '', status: 'have', quantityNote: '', expiresOn: null, canonicalIngredientId: null })
+                setEditingName(null)
+              }}
+            >
+              Cancel editing
+            </button>
+          )}
+        </div>
       </form>
+      {editingName && <p role="status">Editing {editingName}. Change any field, then save.</p>}
       {save.error && <ErrorText error={save.error} />}
       <QueryState query={pantry} empty="Your pantry is empty. Add an ingredient above.">
         <div className="pantry-table" role="table" aria-label="Pantry items">
@@ -649,9 +774,28 @@ function PantryPage() {
             <div className="pantry-row" role="row" key={item.id}>
               <strong role="cell">{item.name}</strong>
               <span role="cell" className={`status ${item.status === 'have' ? 'ready' : item.status === 'out' ? 'shop' : 'verify'}`}>
-                {item.status}
+                {pantryStatusLabel(item.status)}
               </span>
               <span role="cell">{item.quantityNote || 'No quantity note'}</span>
+              <span role="cell" className={item.expiresOn && item.expiresOn <= localDateValue(new Date()) ? 'expiry-warning' : ''}>
+                {expirationLabel(item.expiresOn)}
+              </span>
+              <button
+                type="button"
+                className="button ghost"
+                onClick={() => {
+                  setDraft({
+                    name: item.name,
+                    status: item.status,
+                    quantityNote: item.quantityNote,
+                    expiresOn: item.expiresOn,
+                    canonicalIngredientId: item.canonicalIngredientId,
+                  })
+                  setEditingName(item.name)
+                }}
+              >
+                Edit item
+              </button>
               <button
                 className="button ghost"
                 onClick={() =>
@@ -660,6 +804,8 @@ function PantryPage() {
                       name: item.name,
                       quantityNote: item.quantityNote,
                       status: nextStatus(item.status),
+                      expiresOn: item.expiresOn,
+                      canonicalIngredientId: item.canonicalIngredientId,
                     },
                   ])
                 }
@@ -671,6 +817,47 @@ function PantryPage() {
         </div>
       </QueryState>
     </Page>
+  )
+}
+
+export function ExpirationEditor({
+  value,
+  onChange,
+  now = new Date(),
+}: {
+  value: string | null
+  onChange: (value: string | null) => void
+  now?: Date
+}) {
+  const options = [
+    ['No expiration date', null],
+    ['Today', localDateValue(now)],
+    ['Tomorrow', expirationShortcut(1, now)],
+    ['One week', expirationShortcut(7, now)],
+    ['One month', oneMonthAfter(now)],
+  ] as const
+  return (
+    <fieldset className="expiration-editor">
+      <legend>Expiration date (optional)</legend>
+      <label>
+        Choose a calendar date
+        <input type="date" value={value ?? ''} onChange={(event) => onChange(event.target.value || null)} />
+      </label>
+      <div className="date-shortcuts" role="group" aria-label="Expiration date shortcuts">
+        {options.map(([label, date]) => (
+          <button
+            type="button"
+            className={value === date ? 'button secondary selected' : 'button ghost'}
+            aria-pressed={value === date}
+            key={label}
+            onClick={() => onChange(date)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <p className="field-help">Dates use your calendar day and do not include a time zone.</p>
+    </fieldset>
   )
 }
 
@@ -841,7 +1028,16 @@ export function AccountSecuritySettings() {
                     <strong>{passkey.name}</strong>
                     <span>Added {new Date(passkey.createdAt).toLocaleDateString()}</span>
                     <span>{passkey.lastUsedAt ? `Last used ${new Date(passkey.lastUsedAt).toLocaleString()}` : 'Not used yet'}</span>
-                    <button className="button ghost" onClick={() => revoke.mutate(passkey.id)}>Revoke</button>
+                    <button
+                      className="button ghost"
+                      onClick={() => {
+                        if (window.confirm(`Revoke passkey “${passkey.name}”? You cannot undo this action.`)) {
+                          revoke.mutate(passkey.id)
+                        }
+                      }}
+                    >
+                      Revoke passkey
+                    </button>
                   </article>
                 ))}
               </div>
@@ -1000,7 +1196,16 @@ function ImportTokenSettings() {
               <span>{token.prefix}… · {token.scope}</span>
               <span>{token.revokedAt ? 'Revoked' : `Expires ${token.expiresAt ?? 'never'}`}</span>
               {!token.revokedAt && (
-                <button className="button ghost" onClick={() => revoke.mutate(token.id)}>Revoke</button>
+                <button
+                  className="button ghost"
+                  onClick={() => {
+                    if (window.confirm(`Revoke import token “${token.name}”? You cannot undo this action.`)) {
+                      revoke.mutate(token.id)
+                    }
+                  }}
+                >
+                  Revoke token
+                </button>
               )}
             </article>
           ))}
@@ -1069,7 +1274,16 @@ function ImportDraftPage() {
             </section>
             {draft.data.status === 'draft' && (
               <div className="dialog-actions">
-                <button className="button ghost" onClick={() => discard.mutate()}>Discard</button>
+                <button
+                  className="button ghost"
+                  onClick={() => {
+                    if (window.confirm('Discard this import draft? You cannot undo this action.')) {
+                      discard.mutate()
+                    }
+                  }}
+                >
+                  Discard draft
+                </button>
                 <button className="button primary" onClick={() => accept.mutate()}>Accept as private recipe</button>
               </div>
             )}
@@ -1119,7 +1333,7 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
             {fields.fields.length > 1 && <button type="button" className="button ghost" onClick={() => fields.remove(index)}>Remove</button>}
           </div>
         ))}
-        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '' })}>Add ingredient</button>
+        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '', canonicalIngredientId: null })}>Add ingredient</button>
       </fieldset>
       <button className="button secondary" disabled={save.isPending}>Save draft changes</button>
       {save.isSuccess && <p role="status">Draft saved.</p>}
@@ -1319,10 +1533,10 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Unexpected error'
 }
 
-function split(value: string) {
-  return value.split(',').map((item) => item.trim()).filter(Boolean)
-}
-
 function nextStatus(status: PantryStatus): PantryStatus {
   return status === 'have' ? 'unknown' : status === 'unknown' ? 'out' : 'have'
+}
+
+function pantryStatusLabel(status: PantryStatus): string {
+  return status === 'have' ? 'Available' : status === 'out' ? 'Used up' : 'Uncertain'
 }

@@ -1,7 +1,13 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { AccountSecuritySettings, EmailOtpLogin, PantryConfirmation, ProfileSetup } from './router'
+import {
+  AccountSecuritySettings,
+  EmailOtpLogin,
+  ExpirationEditor,
+  PantryConfirmation,
+  ProfileSetup,
+} from './router'
 
 const { requestEmailLink, requestEmailOtp, saveProfile, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
   saveProfile: vi.fn().mockImplementation((nickname: string | null) =>
@@ -107,6 +113,20 @@ describe('pantry confirmation', () => {
     expect(screen.getByRole('button', { name: 'Save answers' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Skip for now' }))
     expect(screen.getByRole('button', { name: 'Save answers' })).toBeDisabled()
+  })
+
+  describe('expiration editor', () => {
+    it('offers large explicit shortcuts and can clear the date', () => {
+      const onChange = vi.fn()
+      render(
+        <ExpirationEditor value="2026-01-31" onChange={onChange} now={new Date(2026, 0, 31, 12)} />,
+      )
+      expect(screen.getByRole('button', { name: 'Today' })).toHaveAttribute('aria-pressed', 'true')
+      fireEvent.click(screen.getByRole('button', { name: 'One month' }))
+      expect(onChange).toHaveBeenLastCalledWith('2026-02-28')
+      fireEvent.click(screen.getByRole('button', { name: 'No expiration date' }))
+      expect(onChange).toHaveBeenLastCalledWith(null)
+    })
   })
 })
 

@@ -4,6 +4,7 @@ pub mod db;
 pub mod error;
 pub mod importer;
 pub mod imports;
+pub mod ingredients;
 pub mod models;
 pub mod passwordless;
 pub mod recommendation;

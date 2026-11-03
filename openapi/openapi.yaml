@@ -332,6 +332,25 @@ paths:
               items: { $ref: "#/components/schemas/PantryItemInput" }
       responses:
         "200": { description: Updated account pantry }
+  /api/ingredients/suggestions:
+    get:
+      description: Returns ranked ingredient candidates visible to the current account. Fuzzy results are advisory and are never applied to hard recommendation matching without explicit selection.
+      security:
+        - sessionCookie: []
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 120 }
+      responses:
+        "200":
+          description: Exact, confirmed-alias, prefix, substring, and bounded-fuzzy candidates in rank order
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/IngredientSuggestion" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /api/settings/recommendations:
     get:
       responses:
@@ -629,10 +648,16 @@ components:
           items: { $ref: "#/components/schemas/Passkey" }
     Ingredient:
       type: object
-      required: [name]
+      required: [name, quantityNote]
       properties:
-        name: { type: string }
-        quantityNote: { type: string }
+        name:
+          type: string
+          minLength: 1
+          description: A pasted delimiter-separated list is accepted on write; each resulting ingredient name is limited to 120 characters.
+        quantityNote: { type: string, maxLength: 240 }
+        canonicalIngredientId:
+          type: [string, "null"]
+          description: Canonical identity selected explicitly by the user. Omit or send null to keep the normalized input without alias binding.
     RecipeInput:
       type: object
       required: [title, description, instructions, visibility, ingredients]
@@ -679,17 +704,46 @@ components:
       type: object
       required: [name, status, quantityNote]
       properties:
-        name: { type: string }
+        name:
+          type: string
+          description: May contain a comma, full-width comma, Chinese enumeration comma, semicolon, full-width semicolon, or newline separated list. The server NFKC-normalizes and deduplicates entries; each resulting name is limited to 120 characters.
         status: { type: string, enum: [have, out, unknown] }
-        quantityNote: { type: string }
+        quantityNote: { type: string, maxLength: 240 }
+        expiresOn:
+          type: [string, "null"]
+          format: date
+          description: Date-only pantry expiration. Omit to preserve the current value; send null to clear it.
+        canonicalIngredientId:
+          type: [string, "null"]
+          description: Canonical identity selected explicitly by the user.
     PantryItem:
       allOf:
         - $ref: "#/components/schemas/PantryItemInput"
         - type: object
-          required: [id]
+          required: [id, expiresOn, canonicalIngredientId]
           properties:
             id: { type: string, format: uuid }
             confirmedAt: { type: [string, "null"], format: date-time }
+    IngredientReference:
+      oneOf:
+        - type: string
+        - type: object
+          required: [name]
+          properties:
+            name:
+              type: string
+              minLength: 1
+              description: May contain a supported delimiter-separated list; each resulting name is limited to 120 characters.
+            canonicalIngredientId: { type: [string, "null"] }
+      description: Legacy strings remain accepted. Structured references preserve an explicit canonical selection; fuzzy suggestions are never inferred here.
+    IngredientSuggestion:
+      type: object
+      required: [canonicalIngredientId, displayName, matchedText, reason]
+      properties:
+        canonicalIngredientId: { type: string }
+        displayName: { type: string }
+        matchedText: { type: string }
+        reason: { type: string, enum: [exact, alias, prefix, substring, similar] }
     RecommendationSettings:
       type: object
       required: [includeFavorites, includeOwn, includePublic, verificationDays]
@@ -701,10 +755,14 @@ components:
     RecommendationRequest:
       type: object
       properties:
-        preferred: { type: array, items: { type: string } }
-        required: { type: array, items: { type: string } }
-        excluded: { type: array, items: { type: string } }
+        preferred: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
+        required: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
+        excluded: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
         pantryOnly: { type: boolean }
+        today:
+          type: string
+          format: date
+          description: User-local calendar date used for date-only expiration classification. The server UTC date is used when omitted.
     Recommendation:
       type: object
       required: [recipe, status, available, verify, missing, reasons, score]

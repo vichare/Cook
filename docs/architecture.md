@@ -34,13 +34,18 @@ The recommendation engine is deterministic:
 1. Select candidates from enabled sources: favorites, owned recipes, and other users' public recipes.
 2. Apply hard filters before scoring: excluded ingredients remove a recipe; every required ingredient must be present in the recipe.
 3. Classify each ingredient from the current user's pantry:
-   - recently confirmed `have`: available;
+   - recently confirmed, unexpired `have`: available;
+   - expired or expiring-today `have`: verify with an explicit date reason;
    - stale `have` or `unknown`: verify;
    - absent or `out`: missing.
 4. Classify recipes as `READY`, `VERIFY`, `SHOP`, or `BLOCKED`. Pantry-only mode marks recipes with any missing or not-yet-confirmed ingredient as `BLOCKED`.
 5. Sort by status, preferred-ingredient matches, confirmed ingredient count, then title.
 
 Responses include available, verification, and missing lists plus human-readable reasons.
+
+Ingredient matching uses canonical identities selected by the user, with normalized-name fallback for existing or unbound entries. The authoritative normalization pipeline performs Unicode NFKC, Unicode lowercasing where applicable, whitespace normalization, trimming, and collapse. It also splits pasted comma, full-width comma, Chinese enumeration comma, semicolon, full-width semicolon, and newline lists. Owner-confirmed aliases may participate in hard matching; bounded fuzzy matching is limited to input suggestions and is never applied automatically.
+
+Suggestion candidates come only from the current account's pantry and recipes, visible public recipe ingredients, and that account's private aliases. Selecting a suggestion can create an owner-scoped alias; retaining the original input creates no alias. Pantry expiration is stored as ISO date-only text, and recommendation requests include the browser's local calendar date so “today” does not depend on server timezone. If an older client omits it, the API uses the server UTC date.
 
 ## Import boundary
 
@@ -53,3 +58,7 @@ All imported fields are untrusted and validated before persistence. Drafts are o
 ## Public profile boundary
 
 OIDC email, display name, issuer, and subject are private. Public recipe DTOs contain a nullable opt-in nickname and an `isOwner` flag instead of the recipe owner's UUID. Null is the stable anonymous state; localized anonymous labels exist only in the UI. Recipe queries join the current nickname dynamically so a profile change updates prior public recipes without rewriting recipe rows.
+
+## Accessibility baseline
+
+The web UI targets WCAG 2.2 AA with 16px or larger default text, 44px minimum control targets, high contrast, visible focus, keyboard operation, textual status cues, and layouts that reflow at 200% zoom. Ingredient suggestions use an ARIA combobox/listbox with active-option tracking and live announcements. Destructive credential, token, and draft actions require explicit confirmation.

@@ -8,6 +8,7 @@ import type {
   RecommendationSettings,
   AuthConfig,
   EmailOtpChallenge,
+  IngredientSuggestion,
   PasskeySummary,
   SecuritySettings,
   User,
@@ -109,8 +110,13 @@ export const api = {
   favorite: (id: string, favorite: boolean) =>
     request<void>(`/api/recipes/${id}/favorite`, { method: favorite ? 'PUT' : 'DELETE' }),
   pantry: () => request<PantryItem[]>('/api/pantry'),
-  savePantry: (items: Array<Pick<PantryItem, 'name' | 'status' | 'quantityNote'>>) =>
+  savePantry: (items: Array<Pick<PantryItem, 'name' | 'status' | 'quantityNote'> & {
+    expiresOn?: string | null
+    canonicalIngredientId?: string | null
+  }>) =>
     request<PantryItem[]>('/api/pantry', { method: 'PUT', body: JSON.stringify(items) }),
+  ingredientSuggestions: (query: string) =>
+    request<IngredientSuggestion[]>(`/api/ingredients/suggestions?q=${encodeURIComponent(query)}`),
   settings: () => request<RecommendationSettings>('/api/settings/recommendations'),
   saveSettings: (value: RecommendationSettings) =>
     request<RecommendationSettings>('/api/settings/recommendations', {
@@ -118,10 +124,11 @@ export const api = {
       body: JSON.stringify(value),
     }),
   recommendations: (value: {
-    preferred: string[]
-    required: string[]
-    excluded: string[]
+    preferred: Array<{ name: string; canonicalIngredientId: string | null }>
+    required: Array<{ name: string; canonicalIngredientId: string | null }>
+    excluded: Array<{ name: string; canonicalIngredientId: string | null }>
     pantryOnly: boolean
+    today: string
   }) =>
     request<Recommendation[]>('/api/recommendations', {
       method: 'POST',

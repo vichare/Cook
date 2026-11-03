@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
 
-use crate::models::{
-    normalize_ingredient, PantryItem, PantryStatus, Recipe, RecommendationRequest,
+use crate::{
+    ingredients::normalize_ingredient,
+    models::{IngredientReference, PantryItem, PantryStatus, Recipe, RecommendationRequest},
 };
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -37,7 +38,12 @@ pub fn recommend(
 ) -> Vec<Recommendation> {
     let pantry: HashMap<_, _> = pantry
         .iter()
-        .map(|item| (normalize_ingredient(&item.name), item))
+        .map(|item| {
+            (
+                ingredient_key(item.canonical_ingredient_id.as_deref(), &item.name),
+                item,
+            )
+        })
         .collect();
     let required = normalized_set(&request.required);
     let excluded = normalized_set(&request.excluded);
@@ -50,7 +56,12 @@ pub fn recommend(
             let ingredients: HashSet<_> = recipe
                 .ingredients
                 .iter()
-                .map(|ingredient| normalize_ingredient(&ingredient.name))
+                .map(|ingredient| {
+                    ingredient_key(
+                        ingredient.canonical_ingredient_id.as_deref(),
+                        &ingredient.name,
+                    )
+                })
                 .collect();
             if !excluded.is_disjoint(&ingredients) || !required.is_subset(&ingredients) {
                 return None;
@@ -60,10 +71,15 @@ pub fn recommend(
             let mut verify = Vec::new();
             let mut missing = Vec::new();
             for ingredient in &recipe.ingredients {
-                let normalized = normalize_ingredient(&ingredient.name);
+                let normalized = ingredient_key(
+                    ingredient.canonical_ingredient_id.as_deref(),
+                    &ingredient.name,
+                );
                 match pantry.get(&normalized) {
                     Some(item)
-                        if item.status == PantryStatus::Have && is_fresh(item, stale_before) =>
+                        if item.status == PantryStatus::Have
+                            && !is_expired(item, now.date_naive())
+                            && is_fresh(item, stale_before) =>
                     {
                         available.push(ingredient.name.clone())
                     }
@@ -99,6 +115,17 @@ pub fn recommend(
                     "{preferred_matches} preferred ingredient(s) included"
                 ));
             }
+            for ingredient in &recipe.ingredients {
+                let key = ingredient_key(
+                    ingredient.canonical_ingredient_id.as_deref(),
+                    &ingredient.name,
+                );
+                if let Some(item) = pantry.get(&key) {
+                    if let Some(expiry_reason) = expiry_reason(item, now.date_naive()) {
+                        reasons.push(format!("{}: {expiry_reason}", ingredient.name));
+                    }
+                }
+            }
             if blocked {
                 reasons.push(
                     "Blocked by pantry-only mode because ingredients are not confirmed available"
@@ -125,12 +152,41 @@ pub fn recommend(
     results
 }
 
-fn normalized_set(values: &[String]) -> HashSet<String> {
+fn normalized_set(values: &[IngredientReference]) -> HashSet<String> {
     values
         .iter()
-        .map(|value| normalize_ingredient(value))
+        .map(|value| ingredient_key(value.canonical_ingredient_id(), value.name()))
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+fn ingredient_key(canonical_id: Option<&str>, name: &str) -> String {
+    canonical_id
+        .map(str::to_string)
+        .unwrap_or_else(|| normalize_ingredient(name))
+}
+
+fn is_expired(item: &PantryItem, today: NaiveDate) -> bool {
+    item.expires_on
+        .as_deref()
+        .and_then(parse_date)
+        .is_some_and(|date| date <= today)
+}
+
+fn expiry_reason(item: &PantryItem, today: NaiveDate) -> Option<String> {
+    let expires_on = item.expires_on.as_deref()?;
+    let date = parse_date(expires_on)?;
+    if date < today {
+        Some(format!("expired on {expires_on}; verify before using"))
+    } else if date == today {
+        Some("expires today; verify before using".into())
+    } else {
+        None
+    }
+}
+
+fn parse_date(value: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
 }
 
 fn is_fresh(item: &PantryItem, stale_before: DateTime<Utc>) -> bool {
@@ -170,6 +226,7 @@ mod tests {
                 .map(|name| IngredientInput {
                     name: (*name).into(),
                     quantity_note: String::new(),
+                    canonical_ingredient_id: None,
                 })
                 .collect(),
             is_favorite: false,
@@ -184,6 +241,8 @@ mod tests {
             status,
             quantity_note: String::new(),
             confirmed_at: confirmed_at.map(str::to_string),
+            expires_on: None,
+            canonical_ingredient_id: None,
         }
     }
 
@@ -262,5 +321,51 @@ mod tests {
         );
         assert_eq!(results[0].status, RecommendationStatus::Blocked);
         assert_eq!(results[0].verify, vec!["bread"]);
+    }
+
+    #[test]
+    fn expired_have_requires_verification_without_becoming_used_up() {
+        let now = DateTime::parse_from_rfc3339("2026-11-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut item = pantry("milk", PantryStatus::Have, Some("2026-11-04T00:00:00Z"));
+        item.expires_on = Some("2026-11-03".into());
+        let results = recommend(
+            vec![recipe("1", "Milk drink", &["milk"])],
+            &[item],
+            &RecommendationRequest::default(),
+            14,
+            now,
+        );
+        assert_eq!(results[0].status, RecommendationStatus::Verify);
+        assert_eq!(results[0].verify, vec!["milk"]);
+        assert!(results[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("expired on 2026-11-03")));
+    }
+
+    #[test]
+    fn expires_today_blocks_pantry_only_with_clear_reason() {
+        let now = DateTime::parse_from_rfc3339("2026-11-04T23:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut item = pantry("milk", PantryStatus::Have, Some("2026-11-04T00:00:00Z"));
+        item.expires_on = Some("2026-11-04".into());
+        let results = recommend(
+            vec![recipe("1", "Milk drink", &["milk"])],
+            &[item],
+            &RecommendationRequest {
+                pantry_only: true,
+                ..Default::default()
+            },
+            14,
+            now,
+        );
+        assert_eq!(results[0].status, RecommendationStatus::Blocked);
+        assert!(results[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("expires today")));
     }
 }

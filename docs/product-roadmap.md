@@ -4,6 +4,24 @@ This document records future product direction separately from the shipped MVP. 
 
 ## Confirmed
 
+### Pantry expiration
+
+Each pantry item has one optional date-only expiration value using ISO `YYYY-MM-DD`. The value can be set, replaced, or cleared without timezone conversion. The UI provides a native date field plus large shortcuts for no date, today, tomorrow, one week, and one month. Expired and expiring-today items remain pantry items rather than being changed to “used up,” but recommendation results require verification and explain the date concern; pantry-only results are blocked until the user confirms a suitable item.
+
+The current scope intentionally models one pantry item with at most one expiration date. Multiple batches of the same ingredient with different quantities or expiration dates are future scope and remain **unverified**.
+
+### Canonical ingredient matching
+
+All ingredient entry points use a shared server-authoritative normalization pipeline: Unicode NFKC, Unicode lowercasing where applicable, full-width and other whitespace normalization, trimming, and whitespace collapse. Pasted lists support commas, full-width commas, Chinese enumeration commas, semicolons, full-width semicolons, and newlines, then remove empty and canonically duplicate values while retaining a readable display name.
+
+Ingredient suggestions are ranked as exact normalized match, owner-confirmed alias, prefix, substring, then bounded typo similarity. Suggestions may use the current account's pantry, owned recipes, visible public recipes, and owner-scoped aliases. A similar spelling or possible synonym is advisory only: Cook never silently changes an ingredient or uses a fuzzy match for recommendation hard filters. The user must explicitly select a canonical candidate, and “keep as entered” always remains available. Cook does not ship an unreviewed large synonym table.
+
+### Older-adult accessibility baseline
+
+Cook targets WCAG 2.2 AA, supports 200% text zoom and reflow, uses at least 16px default body text and 44-by-44 CSS-pixel controls, provides visible keyboard focus and high contrast, and never communicates status only by color. Important forms retain entered values on recoverable errors, use plain-language recovery guidance, and do not impose short automatic timeouts. Destructive credential, token, and import-draft actions require confirmation.
+
+Autocomplete follows the combobox/listbox ARIA pattern with keyboard navigation, Enter selection, Escape dismissal, result-count and selection announcements, explicit labels, and no hover-only behavior.
+
 ### Public recipe nickname
 
 Google email, display name, issuer, and subject remain private authentication data and are never reused automatically as a public author identity. A user may opt into a non-unique Unicode nickname, clear it later, or remain in the language-independent anonymous state represented by a null nickname. The UI renders the anonymous label for the current locale.

@@ -372,7 +372,7 @@ pub(crate) async fn accept_import_draft(
     .bind(row.get::<Option<f64>, _>("confidence"))
     .execute(&mut *transaction)
     .await?;
-    insert_ingredients(&mut transaction, &recipe_id, &ingredients).await?;
+    insert_ingredients(&mut transaction, &recipe_id, &user.id, &ingredients).await?;
     let result = sqlx::query(
         "UPDATE import_drafts
          SET status = 'consumed', accepted_recipe_id = ?, consumed_at = ?, updated_at = ?
@@ -631,6 +631,7 @@ async fn load_draft_ingredients(pool: &SqlitePool, id: &str) -> AppResult<Vec<In
         .map(|(name, quantity_note)| IngredientInput {
             name,
             quantity_note,
+            canonical_ingredient_id: None,
         })
         .collect())
 }
@@ -651,6 +652,7 @@ async fn load_draft_ingredients_tx(
         .map(|(name, quantity_note)| IngredientInput {
             name,
             quantity_note,
+            canonical_ingredient_id: None,
         })
         .collect())
 }
@@ -747,6 +749,7 @@ mod tests {
             ingredients: vec![IngredientInput {
                 name: "water".into(),
                 quantity_note: String::new(),
+                canonical_ingredient_id: None,
             }],
             steps: vec!["Stir.".into()],
             warnings: vec![],
@@ -758,6 +761,7 @@ mod tests {
             .map(|index| IngredientInput {
                 name: format!("ingredient {index}"),
                 quantity_note: String::new(),
+                canonical_ingredient_id: None,
             })
             .collect();
         assert!(validate_submission(&input).is_err());

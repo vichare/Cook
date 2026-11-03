@@ -36,6 +36,19 @@ export interface SecuritySettings {
 export interface Ingredient {
   name: string
   quantityNote: string
+  canonicalIngredientId: string | null
+}
+
+export interface IngredientReference {
+  name: string
+  canonicalIngredientId: string | null
+}
+
+export interface IngredientSuggestion {
+  canonicalIngredientId: string
+  displayName: string
+  matchedText: string
+  reason: 'exact' | 'alias' | 'prefix' | 'substring' | 'similar'
 }
 
 export interface Recipe {
@@ -65,6 +78,8 @@ export interface PantryItem {
   status: PantryStatus
   quantityNote: string
   confirmedAt: string | null
+  expiresOn: string | null
+  canonicalIngredientId: string | null
 }
 
 export interface RecommendationSettings {

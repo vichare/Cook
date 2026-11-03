@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +22,8 @@ pub struct IngredientInput {
     pub name: String,
     #[serde(default)]
     pub quantity_note: String,
+    #[serde(default)]
+    pub canonical_ingredient_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -68,13 +70,32 @@ pub struct RecipeSource {
     pub confidence: Option<f64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PantryItemInput {
     pub name: String,
     pub status: PantryStatus,
     #[serde(default)]
     pub quantity_note: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_update")]
+    pub expires_on: NullableUpdate<String>,
+    #[serde(default)]
+    pub canonical_ingredient_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum NullableUpdate<T> {
+    #[default]
+    Missing,
+    Value(Option<T>),
+}
+
+fn deserialize_nullable_update<'de, D, T>(deserializer: D) -> Result<NullableUpdate<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(NullableUpdate::Value)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -85,6 +106,8 @@ pub struct PantryItem {
     pub status: PantryStatus,
     pub quantity_note: String,
     pub confirmed_at: Option<String>,
+    pub expires_on: Option<String>,
+    pub canonical_ingredient_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -137,22 +160,50 @@ impl Default for RecommendationSettings {
 #[serde(rename_all = "camelCase")]
 pub struct RecommendationRequest {
     #[serde(default)]
-    pub preferred: Vec<String>,
+    pub preferred: Vec<IngredientReference>,
     #[serde(default)]
-    pub required: Vec<String>,
+    pub required: Vec<IngredientReference>,
     #[serde(default)]
-    pub excluded: Vec<String>,
+    pub excluded: Vec<IngredientReference>,
     #[serde(default)]
     pub pantry_only: bool,
+    #[serde(default)]
+    pub today: Option<String>,
 }
 
-pub fn normalize_ingredient(value: &str) -> String {
-    value
-        .trim()
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum IngredientReference {
+    Name(String),
+    Selection {
+        name: String,
+        #[serde(rename = "canonicalIngredientId")]
+        canonical_ingredient_id: Option<String>,
+    },
+}
+
+impl IngredientReference {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::Selection { name, .. } => name,
+        }
+    }
+
+    pub fn canonical_ingredient_id(&self) -> Option<&str> {
+        match self {
+            Self::Name(_) => None,
+            Self::Selection {
+                canonical_ingredient_id,
+                ..
+            } => canonical_ingredient_id.as_deref(),
+        }
+    }
+}
+
+impl From<&str> for IngredientReference {
+    fn from(value: &str) -> Self {
+        Self::Name(value.into())
+    }
 }
 
 pub fn normalize_nickname(value: Option<&str>) -> Result<Option<String>, &'static str> {

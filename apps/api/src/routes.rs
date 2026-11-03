@@ -7,7 +7,7 @@ use axum::{
     Extension, Json, Router,
 };
 use axum_extra::extract::cookie::CookieJar;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use rust_web_auth_core::{AuthenticatedContext, LoginCallback, LoginError, UserId};
 use rust_web_auth_email_otp::{EmailOtpRequest, EmailOtpVerification};
 use rust_web_auth_http::{expired_cookie, issued_cookie};
@@ -24,9 +24,12 @@ use crate::{
     config::AuthMode,
     error::{AppError, AppResult},
     imports,
+    ingredients::{
+        clean_display_name, match_reason, normalize_ingredient, split_ingredient_list, MatchReason,
+    },
     models::{
-        normalize_ingredient, normalize_nickname, IngredientInput, PantryItem, PantryItemInput,
-        PantryStatus, ProfileInput, Recipe, RecipeInput, RecipeSource, RecommendationRequest,
+        normalize_nickname, IngredientInput, PantryItem, PantryItemInput, PantryStatus,
+        ProfileInput, Recipe, RecipeInput, RecipeSource, RecommendationRequest,
         RecommendationSettings, User,
     },
     passwordless::{
@@ -73,6 +76,7 @@ pub fn router(state: AppState) -> Router {
             put(favorite_recipe).delete(unfavorite_recipe),
         )
         .route("/api/pantry", get(list_pantry).put(upsert_pantry))
+        .route("/api/ingredients/suggestions", get(ingredient_suggestions))
         .route(
             "/api/settings/recommendations",
             get(get_settings).put(update_settings),
@@ -187,6 +191,21 @@ struct PasskeyRegistrationInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PasskeyAuthenticationInput {
     email: String,
+}
+
+#[derive(Deserialize)]
+struct IngredientSuggestionQuery {
+    #[serde(default)]
+    q: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngredientSuggestion {
+    canonical_ingredient_id: String,
+    display_name: String,
+    matched_text: String,
+    reason: MatchReason,
 }
 
 #[derive(Clone)]
@@ -806,8 +825,9 @@ async fn get_recipe(
 async fn create_recipe(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
-    Json(input): Json<RecipeInput>,
+    Json(mut input): Json<RecipeInput>,
 ) -> AppResult<(StatusCode, Json<Recipe>)> {
+    input.ingredients = expand_ingredient_inputs(input.ingredients);
     validate_recipe(&input)?;
     let id = Uuid::new_v4().to_string();
     save_recipe(&state.pool, &id, &user.id, &input, false).await?;
@@ -823,8 +843,9 @@ async fn update_recipe(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
     Path(id): Path<String>,
-    Json(input): Json<RecipeInput>,
+    Json(mut input): Json<RecipeInput>,
 ) -> AppResult<Json<Recipe>> {
+    input.ingredients = expand_ingredient_inputs(input.ingredients);
     validate_recipe(&input)?;
     let mut transaction = state.pool.begin().await?;
     let result = sqlx::query(
@@ -842,7 +863,7 @@ async fn update_recipe(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
-    replace_ingredients(&mut transaction, &id, &input.ingredients).await?;
+    replace_ingredients(&mut transaction, &id, &user.id, &input.ingredients).await?;
     transaction.commit().await?;
     let recipe = load_visible_recipes(&state.pool, &user.id, Some(&id))
         .await?
@@ -895,6 +916,78 @@ async fn unfavorite_recipe(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn ingredient_suggestions(
+    State(state): State<AppState>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Query(query): Query<IngredientSuggestionQuery>,
+) -> AppResult<Json<Vec<IngredientSuggestion>>> {
+    let query_text = clean_display_name(&query.q);
+    if query_text.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    if query_text.chars().count() > 120 {
+        return Err(AppError::Validation(
+            "ingredient search must be at most 120 characters".into(),
+        ));
+    }
+    let candidates: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.id, c.display_name, c.normalized_name
+         FROM ingredient_catalog c
+         WHERE EXISTS (
+             SELECT 1 FROM pantry_items p
+             WHERE p.canonical_ingredient_id = c.id AND p.owner_id = ?
+         ) OR EXISTS (
+             SELECT 1
+             FROM recipe_ingredients ri
+             JOIN recipes r ON r.id = ri.recipe_id
+             WHERE ri.canonical_ingredient_id = c.id
+               AND (r.owner_id = ? OR r.visibility = 'public')
+         ) OR EXISTS (
+             SELECT 1 FROM ingredient_aliases a
+             WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?
+         )",
+    )
+    .bind(&user.id)
+    .bind(&user.id)
+    .bind(&user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    let aliases: Vec<(String, String)> = sqlx::query_as(
+        "SELECT canonical_ingredient_id, alias_name
+         FROM ingredient_aliases WHERE owner_id = ?",
+    )
+    .bind(&user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut alias_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (canonical_id, alias_name) in aliases {
+        alias_map.entry(canonical_id).or_default().push(alias_name);
+    }
+    let mut suggestions = candidates
+        .into_iter()
+        .filter_map(|(id, display_name, normalized_name)| {
+            let aliases = alias_map.get(&id).cloned().unwrap_or_default();
+            let reason = match_reason(&query_text, &normalized_name, &aliases)?;
+            let matched_text =
+                matched_suggestion_text(&query_text, &display_name, &aliases, reason);
+            Some(IngredientSuggestion {
+                canonical_ingredient_id: id,
+                display_name,
+                matched_text,
+                reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|left, right| {
+        left.reason
+            .cmp(&right.reason)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+    suggestions.truncate(8);
+    Ok(Json(suggestions))
+}
+
 async fn list_pantry(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
@@ -907,6 +1000,7 @@ async fn upsert_pantry(
     Extension(CurrentUser(user)): Extension<CurrentUser>,
     Json(items): Json<Vec<PantryItemInput>>,
 ) -> AppResult<Json<Vec<PantryItem>>> {
+    let items = expand_pantry_inputs(items);
     if items.len() > 100 {
         return Err(AppError::Validation(
             "at most 100 pantry items can be updated".into(),
@@ -918,20 +1012,75 @@ async fn upsert_pantry(
         if normalized.is_empty() {
             return Err(AppError::Validation("pantry item name is required".into()));
         }
-        sqlx::query(
-            "INSERT INTO pantry_items (id, owner_id, name, normalized_name, status, quantity_note, confirmed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(owner_id, normalized_name) DO UPDATE SET
-               name = excluded.name, status = excluded.status, quantity_note = excluded.quantity_note,
-               confirmed_at = excluded.confirmed_at, updated_at = CURRENT_TIMESTAMP",
+        if item.name.chars().count() > 120 || item.quantity_note.chars().count() > 240 {
+            return Err(AppError::Validation(
+                "pantry names may use 120 characters and notes may use 240".into(),
+            ));
+        }
+        let canonical_id = resolve_canonical_ingredient(
+            &mut transaction,
+            &user.id,
+            &item.name,
+            item.canonical_ingredient_id.as_deref(),
         )
-        .bind(Uuid::new_v4().to_string())
+        .await?;
+        let existing_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM pantry_items
+             WHERE owner_id = ? AND (normalized_name = ? OR canonical_ingredient_id = ?)
+             ORDER BY CASE WHEN normalized_name = ? THEN 0 ELSE 1 END",
+        )
         .bind(&user.id)
-        .bind(item.name.trim())
+        .bind(&normalized)
+        .bind(&canonical_id)
+        .bind(&normalized)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let item_id = existing_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let existing_expiry: Option<String> = if existing_ids.is_empty() {
+            None
+        } else {
+            sqlx::query_scalar("SELECT expires_on FROM pantry_items WHERE id = ?")
+                .bind(&item_id)
+                .fetch_one(&mut *transaction)
+                .await?
+        };
+        let expires_on = match item.expires_on {
+            crate::models::NullableUpdate::Value(value) => {
+                validate_expiration_date(value.as_deref())?
+            }
+            crate::models::NullableUpdate::Missing => existing_expiry,
+        };
+        for duplicate_id in existing_ids.iter().skip(1) {
+            sqlx::query("DELETE FROM pantry_items WHERE id = ? AND owner_id = ?")
+                .bind(duplicate_id)
+                .bind(&user.id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO pantry_items
+             (id, owner_id, name, normalized_name, status, quantity_note, confirmed_at,
+              expires_on, canonical_ingredient_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name, normalized_name = excluded.normalized_name,
+               status = excluded.status, quantity_note = excluded.quantity_note,
+               confirmed_at = excluded.confirmed_at, expires_on = excluded.expires_on,
+               canonical_ingredient_id = excluded.canonical_ingredient_id,
+               updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(item_id)
+        .bind(&user.id)
+        .bind(clean_display_name(&item.name))
         .bind(normalized)
         .bind(item.status.as_str())
         .bind(item.quantity_note.trim())
         .bind(Utc::now().to_rfc3339())
+        .bind(expires_on)
+        .bind(canonical_id)
         .execute(&mut *transaction)
         .await?;
     }
@@ -977,8 +1126,32 @@ async fn update_settings(
 async fn get_recommendations(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
-    Json(request): Json<RecommendationRequest>,
+    Json(mut request): Json<RecommendationRequest>,
 ) -> AppResult<Json<Vec<Recommendation>>> {
+    let recommendation_time = if let Some(today) = request.today.as_deref() {
+        parse_date_only(today, "today")?
+            .and_hms_opt(12, 0, 0)
+            .expect("noon is a valid time")
+            .and_utc()
+    } else {
+        Utc::now()
+    };
+    request.preferred = expand_ingredient_references(request.preferred);
+    request.required = expand_ingredient_references(request.required);
+    request.excluded = expand_ingredient_references(request.excluded);
+    for references in [&request.preferred, &request.required, &request.excluded] {
+        if references.len() > 100
+            || references
+                .iter()
+                .any(|reference| reference.name().chars().count() > 120)
+        {
+            return Err(AppError::Validation(
+                "recommendation filters may contain at most 100 ingredients of 120 characters each"
+                    .into(),
+            ));
+        }
+    }
+    resolve_recommendation_request(&state.pool, &user.id, &mut request).await?;
     let settings = load_settings(&state.pool, &user.id).await?;
     let candidates = load_candidate_recipes(&state.pool, &user.id, &settings).await?;
     let pantry = load_pantry(&state.pool, &user.id).await?;
@@ -987,7 +1160,7 @@ async fn get_recommendations(
         &pantry,
         &request,
         settings.verification_days,
-        Utc::now(),
+        recommendation_time,
     )))
 }
 
@@ -1035,12 +1208,332 @@ fn validate_recipe(input: &RecipeInput) -> AppResult<()> {
             "at least one named ingredient is required".into(),
         ));
     }
+    if input.ingredients.len() > 100
+        || input
+            .ingredients
+            .iter()
+            .any(|item| item.name.chars().count() > 120 || item.quantity_note.chars().count() > 240)
+    {
+        return Err(AppError::Validation(
+            "recipes may contain at most 100 ingredients with 120-character names and 240-character notes".into(),
+        ));
+    }
     if input.visibility != "private" && input.visibility != "public" {
         return Err(AppError::Validation(
             "visibility must be private or public".into(),
         ));
     }
     Ok(())
+}
+
+fn expand_ingredient_inputs(items: Vec<IngredientInput>) -> Vec<IngredientInput> {
+    let mut expanded = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        let names = split_ingredient_list(&item.name);
+        let single = names.len() == 1;
+        for name in names {
+            let key = normalize_ingredient(&name);
+            if seen.insert(key) {
+                expanded.push(IngredientInput {
+                    name,
+                    quantity_note: item.quantity_note.clone(),
+                    canonical_ingredient_id: single
+                        .then(|| item.canonical_ingredient_id.clone())
+                        .flatten(),
+                });
+            }
+        }
+    }
+    expanded
+}
+
+fn expand_ingredient_references(
+    references: Vec<crate::models::IngredientReference>,
+) -> Vec<crate::models::IngredientReference> {
+    let mut expanded = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for reference in references {
+        let names = split_ingredient_list(reference.name());
+        let single = names.len() == 1;
+        for name in names {
+            let key = normalize_ingredient(&name);
+            if seen.insert(key) {
+                expanded.push(crate::models::IngredientReference::Selection {
+                    name,
+                    canonical_ingredient_id: single
+                        .then(|| reference.canonical_ingredient_id().map(str::to_string))
+                        .flatten(),
+                });
+            }
+        }
+    }
+    expanded
+}
+
+fn expand_pantry_inputs(items: Vec<PantryItemInput>) -> Vec<PantryItemInput> {
+    let mut expanded = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        let names = split_ingredient_list(&item.name);
+        let single = names.len() == 1;
+        for name in names {
+            let key = normalize_ingredient(&name);
+            if seen.insert(key) {
+                expanded.push(PantryItemInput {
+                    name,
+                    status: item.status,
+                    quantity_note: item.quantity_note.clone(),
+                    expires_on: item.expires_on.clone(),
+                    canonical_ingredient_id: single
+                        .then(|| item.canonical_ingredient_id.clone())
+                        .flatten(),
+                });
+            }
+        }
+    }
+    expanded
+}
+
+fn validate_expiration_date(value: Option<&str>) -> AppResult<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    parse_date_only(value, "expiresOn")?;
+    Ok(Some(value.to_string()))
+}
+
+fn parse_date_only(value: &str, field: &str) -> AppResult<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| AppError::Validation(format!("{field} must use a real YYYY-MM-DD date")))
+}
+
+async fn resolve_canonical_ingredient(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner_id: &str,
+    display_name: &str,
+    selected_id: Option<&str>,
+) -> AppResult<String> {
+    let display_name = clean_display_name(display_name);
+    let normalized = normalize_ingredient(&display_name);
+    if normalized.is_empty() {
+        return Err(AppError::Validation("ingredient name is required".into()));
+    }
+    let canonical_id = if let Some(selected_id) = selected_id {
+        if !canonical_ingredient_is_visible(transaction, owner_id, selected_id).await? {
+            return Err(AppError::Validation(
+                "selected canonical ingredient is not available to this account".into(),
+            ));
+        }
+        selected_id.to_string()
+    } else if let Some(alias_id) = sqlx::query_scalar(
+        "SELECT canonical_ingredient_id FROM ingredient_aliases
+         WHERE owner_id = ? AND alias_normalized = ?",
+    )
+    .bind(owner_id)
+    .bind(&normalized)
+    .fetch_optional(&mut **transaction)
+    .await?
+    {
+        alias_id
+    } else {
+        sqlx::query(
+            "INSERT INTO ingredient_catalog
+             (id, normalized_name, display_name, created_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(normalized_name) DO NOTHING",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&normalized)
+        .bind(&display_name)
+        .bind(Utc::now().timestamp())
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query_scalar("SELECT id FROM ingredient_catalog WHERE normalized_name = ?")
+            .bind(&normalized)
+            .fetch_one(&mut **transaction)
+            .await?
+    };
+    if selected_id.is_some() {
+        let canonical_normalized: String =
+            sqlx::query_scalar("SELECT normalized_name FROM ingredient_catalog WHERE id = ?")
+                .bind(&canonical_id)
+                .fetch_one(&mut **transaction)
+                .await?;
+        if canonical_normalized != normalized {
+            sqlx::query(
+                "INSERT INTO ingredient_aliases
+                 (id, owner_id, alias_name, alias_normalized, canonical_ingredient_id, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(owner_id, alias_normalized) DO UPDATE SET
+                   alias_name = excluded.alias_name,
+                   canonical_ingredient_id = excluded.canonical_ingredient_id",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(owner_id)
+            .bind(&display_name)
+            .bind(&normalized)
+            .bind(&canonical_id)
+            .bind(Utc::now().timestamp())
+            .execute(&mut **transaction)
+            .await?;
+        }
+    }
+    Ok(canonical_id)
+}
+
+async fn canonical_ingredient_is_visible(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner_id: &str,
+    canonical_id: &str,
+) -> AppResult<bool> {
+    let visible: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM ingredient_catalog c
+         WHERE c.id = ? AND (
+           EXISTS (
+             SELECT 1 FROM pantry_items p
+             WHERE p.canonical_ingredient_id = c.id AND p.owner_id = ?
+           ) OR EXISTS (
+             SELECT 1 FROM recipe_ingredients ri
+             JOIN recipes r ON r.id = ri.recipe_id
+             WHERE ri.canonical_ingredient_id = c.id
+               AND (r.owner_id = ? OR r.visibility = 'public')
+           ) OR EXISTS (
+             SELECT 1 FROM ingredient_aliases a
+             WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?
+           )
+         )",
+    )
+    .bind(canonical_id)
+    .bind(owner_id)
+    .bind(owner_id)
+    .bind(owner_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(visible.is_some())
+}
+
+async fn resolve_recommendation_request(
+    pool: &SqlitePool,
+    owner_id: &str,
+    request: &mut RecommendationRequest,
+) -> AppResult<()> {
+    for references in [
+        &mut request.preferred,
+        &mut request.required,
+        &mut request.excluded,
+    ] {
+        for reference in references.iter_mut() {
+            if let crate::models::IngredientReference::Selection {
+                name,
+                canonical_ingredient_id,
+            } = reference
+            {
+                if canonical_ingredient_id.is_none() {
+                    *canonical_ingredient_id = resolve_reference_id(pool, owner_id, name).await?;
+                } else if !canonical_ingredient_is_visible_pool(
+                    pool,
+                    owner_id,
+                    canonical_ingredient_id.as_deref().unwrap_or_default(),
+                )
+                .await?
+                {
+                    return Err(AppError::Validation(
+                        "selected canonical ingredient is not available to this account".into(),
+                    ));
+                }
+            } else {
+                let name = reference.name().to_string();
+                if let Some(canonical_ingredient_id) =
+                    resolve_reference_id(pool, owner_id, &name).await?
+                {
+                    *reference = crate::models::IngredientReference::Selection {
+                        name,
+                        canonical_ingredient_id: Some(canonical_ingredient_id),
+                    };
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_reference_id(
+    pool: &SqlitePool,
+    owner_id: &str,
+    name: &str,
+) -> AppResult<Option<String>> {
+    let normalized = normalize_ingredient(name);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let alias: Option<String> = sqlx::query_scalar(
+        "SELECT canonical_ingredient_id FROM ingredient_aliases
+         WHERE owner_id = ? AND alias_normalized = ?",
+    )
+    .bind(owner_id)
+    .bind(&normalized)
+    .fetch_optional(pool)
+    .await?;
+    if alias.is_some() {
+        return Ok(alias);
+    }
+    Ok(
+        sqlx::query_scalar("SELECT id FROM ingredient_catalog WHERE normalized_name = ?")
+            .bind(normalized)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+async fn canonical_ingredient_is_visible_pool(
+    pool: &SqlitePool,
+    owner_id: &str,
+    canonical_id: &str,
+) -> AppResult<bool> {
+    let visible: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM ingredient_catalog c
+         WHERE c.id = ? AND (
+           EXISTS (SELECT 1 FROM pantry_items p
+                   WHERE p.canonical_ingredient_id = c.id AND p.owner_id = ?)
+           OR EXISTS (
+             SELECT 1 FROM recipe_ingredients ri JOIN recipes r ON r.id = ri.recipe_id
+             WHERE ri.canonical_ingredient_id = c.id
+               AND (r.owner_id = ? OR r.visibility = 'public')
+           )
+           OR EXISTS (SELECT 1 FROM ingredient_aliases a
+                      WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?)
+         )",
+    )
+    .bind(canonical_id)
+    .bind(owner_id)
+    .bind(owner_id)
+    .bind(owner_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(visible.is_some())
+}
+
+fn matched_suggestion_text(
+    query: &str,
+    canonical: &str,
+    aliases: &[String],
+    reason: MatchReason,
+) -> String {
+    if match_reason(query, canonical, &[]) == Some(reason) {
+        return canonical.to_string();
+    }
+    aliases
+        .iter()
+        .find(|alias| {
+            let alias_reason = match match_reason(query, alias, &[]) {
+                Some(MatchReason::Exact) => Some(MatchReason::Alias),
+                value => value,
+            };
+            alias_reason == Some(reason)
+        })
+        .cloned()
+        .unwrap_or_else(|| canonical.to_string())
 }
 
 async fn save_recipe(
@@ -1063,7 +1556,7 @@ async fn save_recipe(
     .bind(&input.visibility)
     .execute(&mut *transaction)
     .await?;
-    insert_ingredients(&mut transaction, id, &input.ingredients).await?;
+    insert_ingredients(&mut transaction, id, owner_id, &input.ingredients).await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -1071,31 +1564,44 @@ async fn save_recipe(
 async fn replace_ingredients(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     recipe_id: &str,
+    owner_id: &str,
     ingredients: &[IngredientInput],
 ) -> AppResult<()> {
     sqlx::query("DELETE FROM recipe_ingredients WHERE recipe_id = ?")
         .bind(recipe_id)
         .execute(&mut **transaction)
         .await?;
-    insert_ingredients(transaction, recipe_id, ingredients).await
+    insert_ingredients(transaction, recipe_id, owner_id, ingredients).await
 }
 
 pub(crate) async fn insert_ingredients(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     recipe_id: &str,
+    owner_id: &str,
     ingredients: &[IngredientInput],
 ) -> AppResult<()> {
+    let ingredients = expand_ingredient_inputs(ingredients.to_vec());
     for (index, ingredient) in ingredients.iter().enumerate() {
+        let canonical_id = resolve_canonical_ingredient(
+            transaction,
+            owner_id,
+            &ingredient.name,
+            ingredient.canonical_ingredient_id.as_deref(),
+        )
+        .await?;
         sqlx::query(
-            "INSERT INTO recipe_ingredients (id, recipe_id, name, normalized_name, quantity_note, sort_order)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO recipe_ingredients
+             (id, recipe_id, name, normalized_name, quantity_note, sort_order,
+              canonical_ingredient_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(recipe_id)
-        .bind(ingredient.name.trim())
+        .bind(clean_display_name(&ingredient.name))
         .bind(normalize_ingredient(&ingredient.name))
         .bind(ingredient.quantity_note.trim())
         .bind(index as i64)
+        .bind(canonical_id)
         .execute(&mut **transaction)
         .await?;
     }
@@ -1193,18 +1699,22 @@ async fn load_candidate_recipes(
 }
 
 async fn load_ingredients(pool: &SqlitePool, recipe_id: &str) -> AppResult<Vec<IngredientInput>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT name, quantity_note FROM recipe_ingredients WHERE recipe_id = ? ORDER BY sort_order",
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT name, quantity_note, canonical_ingredient_id
+         FROM recipe_ingredients WHERE recipe_id = ? ORDER BY sort_order",
     )
     .bind(recipe_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(name, quantity_note)| IngredientInput {
-            name,
-            quantity_note,
-        })
+        .map(
+            |(name, quantity_note, canonical_ingredient_id)| IngredientInput {
+                name,
+                quantity_note,
+                canonical_ingredient_id,
+            },
+        )
         .collect())
 }
 
@@ -1220,8 +1730,18 @@ async fn ensure_visible_recipe(pool: &SqlitePool, user_id: &str, recipe_id: &str
 }
 
 async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryItem>> {
-    let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, name, status, quantity_note, confirmed_at
+    type PantryRow = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<PantryRow> = sqlx::query_as(
+        "SELECT id, name, status, quantity_note, confirmed_at, expires_on,
+                canonical_ingredient_id
          FROM pantry_items WHERE owner_id = ? ORDER BY normalized_name",
     )
     .bind(user_id)
@@ -1230,12 +1750,22 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
     Ok(rows
         .into_iter()
         .map(
-            |(id, name, status, quantity_note, confirmed_at)| PantryItem {
+            |(
+                id,
+                name,
+                status,
+                quantity_note,
+                confirmed_at,
+                expires_on,
+                canonical_ingredient_id,
+            )| PantryItem {
                 id,
                 name,
                 status: PantryStatus::parse(&status),
                 quantity_note,
                 confirmed_at,
+                expires_on,
+                canonical_ingredient_id,
             },
         )
         .collect())
@@ -2009,6 +2539,341 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let pantry: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(pantry, json!([]));
+    }
+
+    #[tokio::test]
+    async fn pantry_dates_split_lists_and_preserve_expiry_when_omitted() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": "Milk",
+                            "status": "have",
+                            "quantityNote": "",
+                            "expiresOn": "2026-02-30"
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": " Ｍｉｌｋ，milk、青菜\nRice ",
+                            "status": "have",
+                            "quantityNote": "fresh",
+                            "expiresOn": "2026-11-04"
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = response_json(created).await;
+        assert_eq!(body.as_array().unwrap().len(), 3);
+        let milk = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "Milk")
+            .unwrap();
+        assert_eq!(milk["expiresOn"], "2026-11-04");
+        assert!(milk["canonicalIngredientId"].is_string());
+
+        let recipe = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Milk glass",
+                            "description": "",
+                            "instructions": "",
+                            "visibility": "private",
+                            "ingredients": [{"name": "Milk", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recipe.status(), StatusCode::CREATED);
+        let recommendations = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({"pantryOnly": false, "today": "2026-11-04"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json(recommendations).await;
+        let milk_recipe = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["title"] == "Milk glass")
+            .unwrap();
+        assert_eq!(milk_recipe["status"], "VERIFY");
+        assert!(milk_recipe["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("expires today")));
+
+        let status_only = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([{"name": "milk", "status": "unknown", "quantityNote": "check"}])
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json(status_only).await;
+        let milk = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "milk")
+            .unwrap();
+        assert_eq!(milk["expiresOn"], "2026-11-04");
+
+        let cleared = app
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": "milk",
+                            "status": "have",
+                            "quantityNote": "",
+                            "expiresOn": null
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json(cleared).await;
+        let milk = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "milk")
+            .unwrap();
+        assert!(milk["expiresOn"].is_null());
+    }
+
+    #[tokio::test]
+    async fn ingredient_suggestions_respect_visibility_and_never_auto_apply_fuzzy_matches() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Owner").await;
+        let other_cookie = login(&app, "Other").await;
+        let pantry = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": "Tomato",
+                            "status": "have",
+                            "quantityNote": ""
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pantry.status(), StatusCode::OK);
+        let pantry_body = response_json(pantry).await;
+        let tomato_id = pantry_body[0]["canonicalIngredientId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let owner_suggestions = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=tomtao")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json(owner_suggestions).await;
+        assert_eq!(body[0]["displayName"], "Tomato");
+        assert_eq!(body[0]["reason"], "similar");
+
+        let other_suggestions = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=tomato")
+                    .header("cookie", &other_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(other_suggestions).await, json!([]));
+
+        let selected_alias = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": "Roma tomato",
+                            "status": "have",
+                            "quantityNote": "",
+                            "canonicalIngredientId": tomato_id
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected_alias.status(), StatusCode::OK);
+        let alias_suggestions = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=roma%20tomato")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json(alias_suggestions).await;
+        assert_eq!(body[0]["canonicalIngredientId"], tomato_id);
+        assert_eq!(body[0]["reason"], "alias");
+
+        let canonical_recipe = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Tomato plate",
+                            "description": "",
+                            "instructions": "",
+                            "visibility": "private",
+                            "ingredients": [{
+                                "name": "Tomato",
+                                "quantityNote": "",
+                                "canonicalIngredientId": tomato_id
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(canonical_recipe.status(), StatusCode::CREATED);
+
+        let recipe = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Powder test",
+                            "description": "",
+                            "instructions": "",
+                            "visibility": "private",
+                            "ingredients": [{"name": "Baking powder", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recipe.status(), StatusCode::CREATED);
+        let baking_soda = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!([{"name": "Baking soda", "status": "have", "quantityNote": ""}])
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(baking_soda.status(), StatusCode::OK);
+        let recommendations = app
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", owner_cookie)
+                    .body(Body::from(json!({"pantryOnly": true}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json(recommendations).await;
+        let powder = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["title"] == "Powder test")
+            .unwrap();
+        assert_eq!(powder["status"], "BLOCKED");
+        assert_eq!(powder["missing"], json!(["Baking powder"]));
+        let tomato = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["title"] == "Tomato plate")
+            .unwrap();
+        assert_eq!(tomato["status"], "READY");
     }
 
     #[tokio::test]
