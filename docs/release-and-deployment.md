@@ -20,7 +20,7 @@ Confirm the GHCR package is public or grants the repository workflow read access
 
 ## Production host bootstrap
 
-The host requires Docker Engine/Compose, nginx, `curl`, `sqlite3`, `flock`, and OpenSSH. Copy the files under `deploy/` into a Cook-specific deployment directory, create a mode-`600` production `.env`, install the nginx configuration, and provision TLS.
+The host requires Docker Engine/Compose, nginx, `curl`, `sqlite3`, `flock`, and OpenSSH. Copy the files under `deploy/` into a Cook-specific deployment directory, create a mode-`600` production `.env`, install the nginx configuration, and provision TLS. Before the first release, create the bind-mounted `data` directory with owner UID `10001`, an appropriate `<deploy-group>`, and mode `2770`. This lets the container owner write while the deployment group performs host-side backup and restore, with setgid inheritance for new files. `upgrade.sh` rejects a missing or incorrectly owned directory, or one the deployment user cannot read/write, rather than attempting a privileged ownership change.
 
 Use a Cook-specific SSH key whose server-side record is restricted to `deploy-hook.sh`. Disable PTY, agent forwarding, port forwarding, and X11 forwarding for that key. Do not share deployment private keys or allow the Cook key to invoke another application's hook.
 
@@ -61,7 +61,7 @@ The forced hook accepts only `deploy vX.Y.Z`. It logs into GHCR with the workflo
 4. starts the new release;
 5. waits up to 60 seconds for `http://127.0.0.1:18080/health`.
 
-If startup or health fails, the script restores the previous `.env`, stops the failed container, restores the pre-upgrade database, and starts the previous image. Review the reported deployment log and verify health after any automatic rollback.
+If startup or health fails, the script restores the previous `.env`, stops the failed container, and restores the pre-upgrade database. It restarts the previous image only when `.env` contained a previous `COOK_IMAGE`. On a failed first deployment there is no prior release to start, so the failed container remains stopped and the hook reports that host bootstrap or configuration must be corrected before retrying. Review the reported deployment log and verify health after any automatic rollback.
 
 To redeploy or roll back manually, run the Deploy workflow with an earlier published tag. Do not retag an existing release.
 
