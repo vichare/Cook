@@ -5,6 +5,7 @@ import {
   AccountSecuritySettings,
   EmailOtpLogin,
   ExpirationEditor,
+  GuestLanguageSelector,
   LanguageSettings,
   PantryConfirmation,
   ProfileSetup,
@@ -61,7 +62,12 @@ const { requestEmailLink, requestEmailOtp, saveLocale, saveProfile, securitySett
     onboardingCompleted: false,
     locale: 'en' as const,
   }),
-  securitySettings: vi.fn().mockResolvedValue({ linkedEmails: [], passkeys: [] }),
+  securitySettings: vi.fn().mockResolvedValue({
+    linkedEmails: [],
+    googleEmail: null,
+    googleSignInStatus: 'unavailable',
+    passkeys: [],
+  }),
   requestEmailLink: vi.fn().mockResolvedValue({
     challengeId: 'link-challenge',
     expiresAt: '2026-11-04T00:10:00Z',
@@ -69,6 +75,8 @@ const { requestEmailLink, requestEmailOtp, saveLocale, saveProfile, securitySett
   }),
   verifyEmailLink: vi.fn().mockResolvedValue({
     linkedEmails: ['linked@example.test'],
+    googleEmail: null,
+    googleSignInStatus: 'unsupported',
     passkeys: [],
   }),
 }))
@@ -214,6 +222,20 @@ describe('pantry confirmation', () => {
 })
 
 describe('email OTP sign-in', () => {
+  it('switches the guest locale without clearing an email already entered', () => {
+    render(
+      <Providers>
+        <GuestLanguageSelector />
+        <EmailOtpLogin onLogin={vi.fn()} passkeyEnabled={false} />
+      </Providers>,
+    )
+    const email = screen.getByLabelText('Email address')
+    fireEvent.change(email, { target: { value: 'user@example.test' } })
+    fireEvent.change(screen.getByLabelText('Interface language'), { target: { value: 'zh-CN' } })
+    expect(email).toHaveValue('user@example.test')
+    expect(screen.getByLabelText('界面语言')).toHaveValue('zh-CN')
+  })
+
   it('accepts a pasted six-digit code with one-time-code autocomplete', async () => {
     requestEmailOtp.mockClear()
     verifyEmailOtp.mockClear()
@@ -237,7 +259,12 @@ describe('email OTP sign-in', () => {
 
 describe('account security', () => {
   it('links email explicitly and keeps passkey registration disabled until linked', async () => {
-    securitySettings.mockResolvedValueOnce({ linkedEmails: [], passkeys: [] })
+    securitySettings.mockResolvedValueOnce({
+      linkedEmails: [],
+      googleEmail: null,
+      googleSignInStatus: 'unavailable',
+      passkeys: [],
+    })
     render(
       <Providers>
         <AccountSecuritySettings />
@@ -250,5 +277,38 @@ describe('account security', () => {
     fireEvent.change(code, { target: { value: '654321' } })
     fireEvent.click(screen.getByRole('button', { name: 'Verify and link email' }))
     await waitFor(() => expect(verifyEmailLink).toHaveBeenCalledWith('link-challenge', '654321'))
+  })
+
+  it('locks Google-first email linking to the verified Google address', async () => {
+    securitySettings.mockResolvedValueOnce({
+      linkedEmails: [],
+      googleEmail: 'owner@gmail.com',
+      googleSignInStatus: 'linked',
+      passkeys: [],
+    })
+    render(
+      <Providers>
+        <AccountSecuritySettings />
+      </Providers>,
+    )
+    const email = await screen.findByLabelText('Email address')
+    await waitFor(() => expect(email).toHaveValue('owner@gmail.com'))
+    expect(email).toHaveAttribute('readonly')
+    expect(screen.getByText(/must exactly match the verified Google email/i)).toBeInTheDocument()
+  })
+
+  it('explains that non-Gmail email-first accounts cannot add Google sign-in', async () => {
+    securitySettings.mockResolvedValueOnce({
+      linkedEmails: ['owner@example.com'],
+      googleEmail: null,
+      googleSignInStatus: 'unsupported',
+      passkeys: [],
+    })
+    render(
+      <Providers>
+        <AccountSecuritySettings />
+      </Providers>,
+    )
+    expect(await screen.findByText(/non-Gmail address/i)).toBeInTheDocument()
   })
 })

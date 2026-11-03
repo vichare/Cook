@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_web_auth_core::{
-    AttemptStore, CasOutcome, IdentityKey, IdentityMapper, LoginAttempt, LoginConfig,
-    LoginRateLimiter, LoginService, RateLimitDecision, SessionConfig, SessionId, SessionRecord,
-    SessionService, SessionStore, StorageError, UserId, VerifiedIdentity,
+    AttemptStore, CasOutcome, IdentityKey, IdentityMapper, LoginAttempt, LoginCallback,
+    LoginCompletion, LoginConfig, LoginError, LoginRateLimiter, LoginService, RateLimitDecision,
+    SessionConfig, SessionId, SessionRecord, SessionService, SessionStore, StorageError, UserId,
+    VerifiedIdentity,
 };
 use rust_web_auth_google::GoogleOidcClient;
 use rust_web_auth_http::CookiePolicy;
@@ -16,11 +17,50 @@ use crate::{
     config::{AuthMode, Config},
     error::{AppError, AppResult},
     models::User,
-    passwordless::{build_passwordless, PasswordlessRuntime},
+    passwordless::{
+        build_passwordless, normalize_email, PasswordlessRuntime, EMAIL_IDENTITY_ISSUER,
+    },
 };
 
 const RATE_LIMIT_WINDOW_SECONDS: i64 = 15 * 60;
 const RATE_LIMIT_ATTEMPTS: i64 = 10;
+
+tokio::task_local! {
+    static GOOGLE_LOGIN_CONTEXT: Arc<Mutex<GoogleLoginContext>>;
+}
+
+#[derive(Default)]
+struct GoogleLoginContext {
+    pending: Option<PendingGoogleCompletion>,
+    rejection: Option<GoogleLoginRejection>,
+}
+
+#[derive(Clone)]
+struct PendingGoogleCompletion {
+    identity: VerifiedIdentity,
+    normalized_email: String,
+    candidate_user_id: String,
+}
+
+#[derive(Clone, Copy)]
+enum GoogleLoginRejection {
+    NonGmailEmailAccount,
+    SplitIdentity,
+}
+
+impl GoogleLoginRejection {
+    fn event_type(self) -> &'static str {
+        match self {
+            Self::NonGmailEmailAccount => "google_link_non_gmail_unsupported",
+            Self::SplitIdentity => "google_identity_split_conflict",
+        }
+    }
+}
+
+pub enum GoogleCompletionError {
+    Login(LoginError),
+    UnsafeAccountLink,
+}
 
 #[derive(Clone)]
 pub struct AuthRuntime {
@@ -30,6 +70,7 @@ pub struct AuthRuntime {
     pub session_cookie: CookiePolicy,
     pub state_cookie: CookiePolicy,
     pub passwordless: PasswordlessRuntime,
+    store: Arc<SqliteAuthStore>,
 }
 
 impl AuthRuntime {
@@ -39,6 +80,26 @@ impl AuthRuntime {
 
     pub fn state_cookie_name(&self) -> &str {
         self.state_cookie.name()
+    }
+
+    pub async fn complete_google(
+        &self,
+        callback: LoginCallback<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<LoginCompletion, GoogleCompletionError> {
+        let login = self.login.as_ref().ok_or(GoogleCompletionError::Login(
+            LoginError::InvalidConfiguration,
+        ))?;
+        let context = Arc::new(Mutex::new(GoogleLoginContext::default()));
+        let result = GOOGLE_LOGIN_CONTEXT
+            .scope(context.clone(), login.complete(callback, now))
+            .await;
+        let rejection = context.lock().ok().and_then(|value| value.rejection);
+        if let Some(rejection) = rejection {
+            self.store.record_google_rejection(rejection).await;
+            return Err(GoogleCompletionError::UnsafeAccountLink);
+        }
+        result.map_err(GoogleCompletionError::Login)
     }
 }
 
@@ -87,6 +148,7 @@ pub fn build_auth(config: &Config, pool: &SqlitePool) -> AppResult<AuthRuntime> 
         state_cookie: CookiePolicy::new(config.auth_environment(), "cook_oauth_state")
             .map_err(|error| AppError::configuration(error.to_string()))?,
         passwordless,
+        store,
     })
 }
 
@@ -206,77 +268,49 @@ impl AttemptStore for SqliteAuthStore {
 #[async_trait]
 impl IdentityMapper for SqliteAuthStore {
     async fn resolve_user(&self, identity: &VerifiedIdentity) -> Result<UserId, StorageError> {
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        if let Some((user_id,)) = sqlx::query_as::<_, (String,)>(
+        let normalized_email = normalize_email(&identity.verified_email).map_err(storage_error)?;
+        let existing_google_user: Option<String> = sqlx::query_scalar(
             "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
         )
         .bind(&identity.key.issuer)
         .bind(&identity.key.subject)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(storage_error)?
-        {
-            sqlx::query("UPDATE users SET profile_email = ?, display_name = ? WHERE id = ?")
-                .bind(&identity.verified_email)
-                .bind(
-                    identity
-                        .display_name
-                        .as_deref()
-                        .unwrap_or(&identity.verified_email),
-                )
-                .bind(&user_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(storage_error)?;
-            transaction.commit().await.map_err(storage_error)?;
-            return UserId::new(user_id).map_err(|_| StorageError);
-        }
+        .map_err(storage_error)?;
+        let email_user: Option<String> = sqlx::query_scalar(
+            "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
+        )
+        .bind(EMAIL_IDENTITY_ISSUER)
+        .bind(&normalized_email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
 
-        let candidate = Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO users (id, email, profile_email, display_name) VALUES (?, ?, ?, ?)",
-        )
-        .bind(&candidate)
-        .bind(format!("oidc-{candidate}@identity.invalid"))
-        .bind(&identity.verified_email)
-        .bind(
-            identity
-                .display_name
-                .as_deref()
-                .unwrap_or(&identity.verified_email),
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        let inserted = sqlx::query(
-            "INSERT INTO auth_identities (issuer, subject, user_id, created_at)
-             VALUES (?, ?, ?, ?) ON CONFLICT(issuer, subject) DO NOTHING",
-        )
-        .bind(&identity.key.issuer)
-        .bind(&identity.key.subject)
-        .bind(&candidate)
-        .bind(Utc::now().timestamp())
-        .execute(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        let user_id = if inserted.rows_affected() == 1 {
-            candidate
-        } else {
-            sqlx::query("DELETE FROM users WHERE id = ?")
-                .bind(&candidate)
-                .execute(&mut *transaction)
-                .await
-                .map_err(storage_error)?;
-            sqlx::query_scalar(
-                "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
-            )
-            .bind(&identity.key.issuer)
-            .bind(&identity.key.subject)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(storage_error)?
+        let user_id = match (existing_google_user, email_user) {
+            (Some(google_user), Some(email_user)) if google_user != email_user => {
+                set_google_rejection(GoogleLoginRejection::SplitIdentity);
+                return Err(StorageError);
+            }
+            (Some(google_user), _) => google_user,
+            (None, Some(email_user)) if is_gmail_address(&normalized_email) => email_user,
+            (None, Some(_)) => {
+                set_google_rejection(GoogleLoginRejection::NonGmailEmailAccount);
+                return Err(StorageError);
+            }
+            (None, None) => Uuid::new_v4().to_string(),
         };
-        transaction.commit().await.map_err(storage_error)?;
+
+        GOOGLE_LOGIN_CONTEXT
+            .try_with(|context| {
+                let mut context = context.lock().map_err(|_| StorageError)?;
+                context.pending = Some(PendingGoogleCompletion {
+                    identity: identity.clone(),
+                    normalized_email,
+                    candidate_user_id: user_id.clone(),
+                });
+                Ok::<(), StorageError>(())
+            })
+            .map_err(|_| StorageError)??;
         UserId::new(user_id).map_err(|_| StorageError)
     }
 
@@ -299,6 +333,18 @@ impl IdentityMapper for SqliteAuthStore {
 #[async_trait]
 impl SessionStore for SqliteAuthStore {
     async fn create(&self, session: SessionRecord) -> Result<(), StorageError> {
+        let pending = GOOGLE_LOGIN_CONTEXT
+            .try_with(|context| {
+                context
+                    .lock()
+                    .ok()
+                    .and_then(|mut value| value.pending.take())
+            })
+            .ok()
+            .flatten();
+        if let Some(pending) = pending {
+            return self.create_google_session(session, pending).await;
+        }
         sqlx::query(
             "INSERT INTO auth_sessions
              (session_id, user_id, token_digest, created_at, last_activity_at, expires_at, revoked_at, version)
@@ -393,6 +439,177 @@ impl SessionStore for SqliteAuthStore {
     }
 }
 
+impl SqliteAuthStore {
+    async fn create_google_session(
+        &self,
+        session: SessionRecord,
+        pending: PendingGoogleCompletion,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let google_user: Option<String> = sqlx::query_scalar(
+            "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
+        )
+        .bind(&pending.identity.key.issuer)
+        .bind(&pending.identity.key.subject)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let email_user: Option<String> = sqlx::query_scalar(
+            "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
+        )
+        .bind(EMAIL_IDENTITY_ISSUER)
+        .bind(&pending.normalized_email)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+
+        let user_id = match (google_user, email_user) {
+            (Some(google_user), Some(email_user)) if google_user != email_user => {
+                set_google_rejection(GoogleLoginRejection::SplitIdentity);
+                return Err(StorageError);
+            }
+            (Some(google_user), _) => google_user,
+            (None, Some(email_user)) if is_gmail_address(&pending.normalized_email) => email_user,
+            (None, Some(_)) => {
+                set_google_rejection(GoogleLoginRejection::NonGmailEmailAccount);
+                return Err(StorageError);
+            }
+            (None, None) => {
+                sqlx::query(
+                    "INSERT INTO users (id, email, profile_email, display_name)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(&pending.candidate_user_id)
+                .bind(format!(
+                    "oidc-{}@identity.invalid",
+                    pending.candidate_user_id
+                ))
+                .bind(&pending.normalized_email)
+                .bind(
+                    pending
+                        .identity
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&pending.normalized_email),
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+                pending.candidate_user_id.clone()
+            }
+        };
+
+        sqlx::query(
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verified_email)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(issuer, subject) DO NOTHING",
+        )
+        .bind(&pending.identity.key.issuer)
+        .bind(&pending.identity.key.subject)
+        .bind(&user_id)
+        .bind(session.created_at.timestamp())
+        .bind(&pending.normalized_email)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let mapped_user: String = sqlx::query_scalar(
+            "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
+        )
+        .bind(&pending.identity.key.issuer)
+        .bind(&pending.identity.key.subject)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if mapped_user != user_id {
+            set_google_rejection(GoogleLoginRejection::SplitIdentity);
+            return Err(StorageError);
+        }
+        sqlx::query(
+            "UPDATE auth_identities SET verified_email = ?
+             WHERE issuer = ? AND subject = ? AND user_id = ?",
+        )
+        .bind(&pending.normalized_email)
+        .bind(&pending.identity.key.issuer)
+        .bind(&pending.identity.key.subject)
+        .bind(&user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query("UPDATE users SET profile_email = ?, display_name = ? WHERE id = ?")
+            .bind(&pending.normalized_email)
+            .bind(
+                pending
+                    .identity
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(&pending.normalized_email),
+            )
+            .bind(&user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        insert_session(&mut transaction, &session, &user_id).await?;
+        transaction.commit().await.map_err(storage_error)
+    }
+
+    async fn record_google_rejection(&self, rejection: GoogleLoginRejection) {
+        let event_type = rejection.event_type();
+        if sqlx::query(
+            "INSERT INTO auth_identity_audit_events (id, event_type, created_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event_type)
+        .bind(Utc::now().timestamp())
+        .execute(&self.pool)
+        .await
+        .is_err()
+        {
+            tracing::error!("failed to persist authentication identity audit event");
+        }
+        tracing::warn!(event_type, "Google identity linking was rejected");
+    }
+}
+
+async fn insert_session(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session: &SessionRecord,
+    user_id: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO auth_sessions
+         (session_id, user_id, token_digest, created_at, last_activity_at, expires_at, revoked_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session.session_id.to_string())
+    .bind(user_id)
+    .bind(session.token_digest.as_slice())
+    .bind(session.created_at.timestamp())
+    .bind(session.last_activity_at.timestamp())
+    .bind(session.expires_at.timestamp())
+    .bind(session.revoked_at.map(|value| value.timestamp()))
+    .bind(i64::try_from(session.version).map_err(|_| StorageError)?)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+fn set_google_rejection(rejection: GoogleLoginRejection) {
+    let _ = GOOGLE_LOGIN_CONTEXT.try_with(|context| {
+        if let Ok(mut context) = context.lock() {
+            context.rejection = Some(rejection);
+        }
+    });
+}
+
+fn is_gmail_address(normalized_email: &str) -> bool {
+    normalized_email
+        .rsplit_once('@')
+        .is_some_and(|(_, domain)| domain == "gmail.com")
+}
+
 #[async_trait]
 impl LoginRateLimiter for SqliteAuthStore {
     async fn check(
@@ -484,6 +701,55 @@ mod tests {
         }
     }
 
+    async fn complete_google_identity(
+        store: &SqliteAuthStore,
+        identity: VerifiedIdentity,
+    ) -> Result<UserId, StorageError> {
+        let sessions =
+            SessionService::new(SessionConfig::default(), Arc::new(store.clone()), [23; 32])
+                .unwrap();
+        let context = Arc::new(Mutex::new(GoogleLoginContext::default()));
+        GOOGLE_LOGIN_CONTEXT
+            .scope(context, async {
+                let user_id = store.resolve_user(&identity).await?;
+                sessions
+                    .issue(user_id, Utc::now())
+                    .await
+                    .map_err(|_| StorageError)?;
+                let mapped = store.find_user(&identity.key).await?.ok_or(StorageError)?;
+                Ok(mapped)
+            })
+            .await
+    }
+
+    async fn seed_email_user(store: &SqliteAuthStore, user_id: &str, email: &str) {
+        sqlx::query(
+            "INSERT INTO users (id, email, profile_email, display_name, passkey_user_handle)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(format!("{user_id}@identity.invalid"))
+        .bind(email)
+        .bind(user_id)
+        .bind(format!("handle-{user_id}"))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verified_email)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(EMAIL_IDENTITY_ISSUER)
+        .bind(email)
+        .bind(user_id)
+        .bind(Utc::now().timestamp())
+        .bind(email)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn attempt_is_consumed_exactly_once() {
         let store = store().await;
@@ -512,57 +778,263 @@ mod tests {
     #[tokio::test]
     async fn identity_mapping_uses_issuer_and_subject_not_email() {
         let store = store().await;
-        let first = store
-            .resolve_user(&VerifiedIdentity {
+        let first = complete_google_identity(
+            &store,
+            VerifiedIdentity {
                 key: IdentityKey {
                     issuer: "issuer-a".into(),
                     subject: "subject".into(),
                 },
                 verified_email: "first@example.test".into(),
                 display_name: Some("First".into()),
-            })
-            .await
-            .unwrap();
-        let updated = store
-            .resolve_user(&VerifiedIdentity {
+            },
+        )
+        .await
+        .unwrap();
+        let updated = complete_google_identity(
+            &store,
+            VerifiedIdentity {
                 key: IdentityKey {
                     issuer: "issuer-a".into(),
                     subject: "subject".into(),
                 },
                 verified_email: "updated@example.test".into(),
                 display_name: Some("Updated".into()),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(first, updated);
     }
 
     #[tokio::test]
     async fn distinct_identities_may_share_the_same_profile_email() {
         let store = store().await;
-        let first = store
-            .resolve_user(&VerifiedIdentity {
+        let first = complete_google_identity(
+            &store,
+            VerifiedIdentity {
                 key: IdentityKey {
                     issuer: "issuer-a".into(),
                     subject: "subject-a".into(),
                 },
                 verified_email: "shared@example.test".into(),
                 display_name: None,
-            })
-            .await
-            .unwrap();
-        let second = store
-            .resolve_user(&VerifiedIdentity {
+            },
+        )
+        .await
+        .unwrap();
+        let second = complete_google_identity(
+            &store,
+            VerifiedIdentity {
                 key: IdentityKey {
                     issuer: "issuer-a".into(),
                     subject: "subject-b".into(),
                 },
                 verified_email: "shared@example.test".into(),
                 display_name: None,
-            })
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn gmail_email_identity_is_atomically_reused_for_google_login() {
+        let store = store().await;
+        seed_email_user(&store, "email-user", "user@gmail.com").await;
+        sqlx::query(
+            "INSERT INTO passkey_credentials
+             (id, user_id, credential_id, credential_json, name, created_at)
+             VALUES ('existing-passkey', 'email-user', X'010203', '{}', 'Existing key', ?)",
+        )
+        .bind(Utc::now().timestamp())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let resolved = complete_google_identity(
+            &store,
+            VerifiedIdentity {
+                key: IdentityKey {
+                    issuer: "https://accounts.google.com".into(),
+                    subject: "google-subject".into(),
+                },
+                verified_email: " USER@GMAIL.COM ".into(),
+                display_name: Some("Google User".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.as_str(), "email-user");
+        let handle: String =
+            sqlx::query_scalar("SELECT passkey_user_handle FROM users WHERE id = 'email-user'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(handle, "handle-email-user");
+        let credential_owner: String = sqlx::query_scalar(
+            "SELECT user_id FROM passkey_credentials WHERE id = 'existing-passkey'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(credential_owner, "email-user");
+        let session_owner: String = sqlx::query_scalar("SELECT user_id FROM auth_sessions LIMIT 1")
+            .fetch_one(&store.pool)
             .await
             .unwrap();
-        assert_ne!(first, second);
+        assert_eq!(session_owner, "email-user");
+    }
+
+    #[tokio::test]
+    async fn non_gmail_email_identity_rejects_google_linking_without_creating_a_user() {
+        let store = store().await;
+        seed_email_user(&store, "email-user", "user@example.com").await;
+        let context = Arc::new(Mutex::new(GoogleLoginContext::default()));
+        let result = GOOGLE_LOGIN_CONTEXT
+            .scope(context.clone(), async {
+                store
+                    .resolve_user(&VerifiedIdentity {
+                        key: IdentityKey {
+                            issuer: "https://accounts.google.com".into(),
+                            subject: "google-subject".into(),
+                        },
+                        verified_email: "user@example.com".into(),
+                        display_name: None,
+                    })
+                    .await
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            context.lock().unwrap().rejection,
+            Some(GoogleLoginRejection::NonGmailEmailAccount)
+        ));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM auth_identities WHERE issuer != ?")
+                .bind(EMAIL_IDENTITY_ISSUER)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn gmail_dot_and_plus_variants_are_not_equivalent() {
+        let store = store().await;
+        seed_email_user(&store, "email-user", "username@gmail.com").await;
+        let dotted = complete_google_identity(
+            &store,
+            VerifiedIdentity {
+                key: IdentityKey {
+                    issuer: "https://accounts.google.com".into(),
+                    subject: "dotted".into(),
+                },
+                verified_email: "user.name@gmail.com".into(),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        let tagged = complete_google_identity(
+            &store,
+            VerifiedIdentity {
+                key: IdentityKey {
+                    issuer: "https://accounts.google.com".into(),
+                    subject: "tagged".into(),
+                },
+                verified_email: "username+tag@gmail.com".into(),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(dotted.as_str(), "email-user");
+        assert_ne!(tagged.as_str(), "email-user");
+        assert_ne!(dotted, tagged);
+    }
+
+    #[tokio::test]
+    async fn preexisting_split_identity_is_rejected_without_merging() {
+        let store = store().await;
+        seed_email_user(&store, "email-user", "user@gmail.com").await;
+        sqlx::query(
+            "INSERT INTO users (id, email, profile_email, display_name)
+             VALUES ('google-user', 'google@identity.invalid', 'user@gmail.com', 'Google')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verified_email)
+             VALUES (?, 'subject', 'google-user', ?, 'user@gmail.com')",
+        )
+        .bind(crate::passwordless::GOOGLE_IDENTITY_ISSUER)
+        .bind(Utc::now().timestamp())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let context = Arc::new(Mutex::new(GoogleLoginContext::default()));
+        let result = GOOGLE_LOGIN_CONTEXT
+            .scope(context.clone(), async {
+                store
+                    .resolve_user(&VerifiedIdentity {
+                        key: IdentityKey {
+                            issuer: "https://accounts.google.com".into(),
+                            subject: "subject".into(),
+                        },
+                        verified_email: "user@gmail.com".into(),
+                        display_name: None,
+                    })
+                    .await
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            context.lock().unwrap().rejection,
+            Some(GoogleLoginRejection::SplitIdentity)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_google_callbacks_converge_on_one_identity_and_user() {
+        let store = store().await;
+        seed_email_user(&store, "email-user", "user@gmail.com").await;
+        let identity = VerifiedIdentity {
+            key: IdentityKey {
+                issuer: "https://accounts.google.com".into(),
+                subject: "concurrent-subject".into(),
+            },
+            verified_email: "user@gmail.com".into(),
+            display_name: Some("Concurrent User".into()),
+        };
+        let first_store = store.clone();
+        let first_identity = identity.clone();
+        let second_store = store.clone();
+        let second_identity = identity.clone();
+        let (first, second) = tokio::join!(
+            complete_google_identity(&first_store, first_identity),
+            complete_google_identity(&second_store, second_identity)
+        );
+        assert_eq!(first.unwrap().as_str(), "email-user");
+        assert_eq!(second.unwrap().as_str(), "email-user");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auth_identities
+             WHERE issuer = ? AND subject = ? AND user_id = 'email-user'",
+        )
+        .bind(&identity.key.issuer)
+        .bind(&identity.key.subject)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions WHERE user_id = 'email-user'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(sessions, 2);
     }
 
     #[tokio::test]

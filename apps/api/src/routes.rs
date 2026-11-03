@@ -20,7 +20,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
-    auth::{load_user, upsert_development_user},
+    auth::{load_user, upsert_development_user, GoogleCompletionError},
     config::AuthMode,
     error::{AppError, AppResult},
     imports,
@@ -179,7 +179,18 @@ struct EmailOtpChallengeResponse {
 #[serde(rename_all = "camelCase")]
 struct SecuritySettings {
     linked_emails: Vec<String>,
+    google_email: Option<String>,
+    google_sign_in_status: GoogleSignInStatus,
     passkeys: Vec<PasskeySummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum GoogleSignInStatus {
+    Linked,
+    Eligible,
+    Unsupported,
+    Unavailable,
 }
 
 #[derive(Deserialize)]
@@ -289,10 +300,22 @@ async fn link_email_request(
     Extension(CurrentUser(user)): Extension<CurrentUser>,
     Json(input): Json<EmailOtpRequestInput>,
 ) -> AppResult<Json<EmailOtpChallengeResponse>> {
+    let normalized = normalize_email(&input.email).map_err(map_email_error)?;
+    let google_emails = state
+        .auth
+        .passwordless
+        .store
+        .google_verified_emails(&user.id)
+        .await?;
+    if !google_emails.is_empty() && !google_emails.iter().any(|value| value == &normalized) {
+        return Err(AppError::Validation(
+            "email must match the verified email on the linked Google identity".into(),
+        ));
+    }
     let challenge = request_email_otp(
         &state,
         &headers,
-        &input.email,
+        &normalized,
         EMAIL_LINK_PURPOSE,
         "/settings",
     )
@@ -583,9 +606,9 @@ async fn google_callback(
     jar: CookieJar,
     Query(query): Query<GoogleCallback>,
 ) -> AppResult<impl IntoResponse> {
-    let login = state.auth.login.as_ref().ok_or(AppError::NotFound)?;
-    let completion = login
-        .complete(
+    let completion = match state
+        .auth
+        .complete_google(
             LoginCallback {
                 state: query.state.as_deref(),
                 state_cookie: jar
@@ -597,7 +620,18 @@ async fn google_callback(
             Utc::now(),
         )
         .await
-        .map_err(map_login_error)?;
+    {
+        Ok(completion) => completion,
+        Err(GoogleCompletionError::UnsafeAccountLink) => {
+            let mut headers = HeaderMap::new();
+            headers.append(
+                SET_COOKIE,
+                expired_cookie(&state.auth.state_cookie).map_err(|_| AppError::AuthUnavailable)?,
+            );
+            return Ok((headers, Redirect::to("/?authError=google-account-conflict")));
+        }
+        Err(GoogleCompletionError::Login(error)) => return Err(map_login_error(error)),
+    };
     let mut headers = HeaderMap::new();
     headers.append(
         SET_COOKIE,
@@ -726,8 +760,30 @@ async fn issue_user_session_parts(
 }
 
 async fn load_security_settings(state: &AppState, user_id: &str) -> AppResult<SecuritySettings> {
+    let linked_emails = state.auth.passwordless.store.linked_emails(user_id).await?;
+    let google_emails = state
+        .auth
+        .passwordless
+        .store
+        .google_verified_emails(user_id)
+        .await?;
+    let google_sign_in_status = if !google_emails.is_empty() {
+        GoogleSignInStatus::Linked
+    } else if linked_emails.iter().any(|email| {
+        email
+            .rsplit_once('@')
+            .is_some_and(|(_, domain)| domain == "gmail.com")
+    }) {
+        GoogleSignInStatus::Eligible
+    } else if linked_emails.is_empty() {
+        GoogleSignInStatus::Unavailable
+    } else {
+        GoogleSignInStatus::Unsupported
+    };
     Ok(SecuritySettings {
-        linked_emails: state.auth.passwordless.store.linked_emails(user_id).await?,
+        linked_emails,
+        google_email: google_emails.into_iter().next(),
+        google_sign_in_status,
         passkeys: state.auth.passwordless.store.list_passkeys(user_id).await?,
     })
 }
@@ -1831,7 +1887,9 @@ mod tests {
         auth::{build_auth, AuthRuntime},
         build_app,
         config::{AppEnvironment, AuthMode, Config},
-        db, AppState,
+        db,
+        passwordless::GOOGLE_IDENTITY_ISSUER,
+        AppState,
     };
 
     async fn app_with_runtime() -> (axum::Router, AuthRuntime, SqlitePool) {
@@ -2265,6 +2323,87 @@ mod tests {
                 assert_eq!(verify.status(), StatusCode::CONFLICT);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn google_first_email_link_rejects_mismatch_before_sending_and_accepts_exact_email() {
+        let (app, auth, pool) = app_with_runtime().await;
+        let cookie = login(&app, "Google Owner").await;
+        let user_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE display_name = 'Google Owner'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verified_email)
+             VALUES (?, 'google-owner', ?, ?, 'owner@example.test')",
+        )
+        .bind(GOOGLE_IDENTITY_ISSUER)
+        .bind(&user_id)
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mismatch = app
+            .clone()
+            .oneshot(
+                Request::post("/api/settings/security/email/request")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-forwarded-for", "203.0.113.31")
+                    .body(Body::from(
+                        json!({"email": "other@example.test"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+        assert!(auth
+            .passwordless
+            .captured_code("other@example.test")
+            .is_none());
+
+        let request = app
+            .clone()
+            .oneshot(
+                Request::post("/api/settings/security/email/request")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-forwarded-for", "203.0.113.31")
+                    .body(Body::from(
+                        json!({"email": " OWNER@EXAMPLE.TEST "}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(request.status(), StatusCode::OK);
+        let challenge = response_json(request).await;
+        let code = auth
+            .passwordless
+            .captured_code("owner@example.test")
+            .unwrap();
+        let verify = app
+            .oneshot(
+                Request::post("/api/settings/security/email/verify")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .header("x-forwarded-for", "203.0.113.31")
+                    .body(Body::from(
+                        json!({"challengeId": challenge["challengeId"], "code": code}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify.status(), StatusCode::OK);
+        let security = response_json(verify).await;
+        assert_eq!(security["linkedEmails"], json!(["owner@example.test"]));
+        assert_eq!(security["googleEmail"], "owner@example.test");
+        assert_eq!(security["googleSignInStatus"], "linked");
     }
 
     #[tokio::test]

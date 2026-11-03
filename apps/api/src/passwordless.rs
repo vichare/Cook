@@ -35,6 +35,7 @@ use crate::{
 };
 
 pub const EMAIL_IDENTITY_ISSUER: &str = "urn:cook:email-otp";
+pub const GOOGLE_IDENTITY_ISSUER: &str = "https://accounts.google.com";
 pub const EMAIL_SIGN_IN_PURPOSE: &str = "sign-in";
 pub const EMAIL_LINK_PURPOSE: &str = "link-account";
 
@@ -268,6 +269,18 @@ impl SqlitePasswordlessStore {
         .await?)
     }
 
+    pub async fn google_verified_emails(&self, user_id: &str) -> AppResult<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT verified_email FROM auth_identities
+             WHERE issuer = ? AND user_id = ? AND verified_email IS NOT NULL
+             ORDER BY created_at, subject",
+        )
+        .bind(GOOGLE_IDENTITY_ISSUER)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn find_user_by_email(&self, normalized_email: &str) -> AppResult<Option<UserId>> {
         let value: Option<String> = sqlx::query_scalar(
             "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
@@ -307,6 +320,16 @@ impl SqlitePasswordlessStore {
     pub async fn resolve_email_sign_in(&self, normalized_email: &str) -> AppResult<UserId> {
         let mut transaction = self.pool.begin().await?;
         if let Some(existing) = identity_user(&mut transaction, normalized_email).await? {
+            sqlx::query(
+                "UPDATE auth_identities SET verified_email = ?
+                 WHERE issuer = ? AND subject = ? AND user_id = ?",
+            )
+            .bind(normalized_email)
+            .bind(EMAIL_IDENTITY_ISSUER)
+            .bind(normalized_email)
+            .bind(&existing)
+            .execute(&mut *transaction)
+            .await?;
             transaction.commit().await?;
             return UserId::new(existing).map_err(|_| AppError::AuthUnavailable);
         }
@@ -326,13 +349,15 @@ impl SqlitePasswordlessStore {
         .execute(&mut *transaction)
         .await?;
         let inserted = sqlx::query(
-            "INSERT INTO auth_identities (issuer, subject, user_id, created_at)
-             VALUES (?, ?, ?, ?) ON CONFLICT(issuer, subject) DO NOTHING",
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verified_email)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(issuer, subject) DO NOTHING",
         )
         .bind(EMAIL_IDENTITY_ISSUER)
         .bind(normalized_email)
         .bind(&user_id)
         .bind(Utc::now().timestamp())
+        .bind(normalized_email)
         .execute(&mut *transaction)
         .await?;
         let resolved = if inserted.rows_affected() == 1 {
@@ -352,14 +377,30 @@ impl SqlitePasswordlessStore {
 
     pub async fn link_email(&self, user_id: &str, normalized_email: &str) -> AppResult<()> {
         let mut transaction = self.pool.begin().await?;
+        let google_emails: Vec<String> = sqlx::query_scalar(
+            "SELECT verified_email FROM auth_identities
+             WHERE issuer = ? AND user_id = ? AND verified_email IS NOT NULL",
+        )
+        .bind(GOOGLE_IDENTITY_ISSUER)
+        .bind(user_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if !google_emails.is_empty() && !google_emails.iter().any(|value| value == normalized_email)
+        {
+            return Err(AppError::Validation(
+                "email must match the verified email on the linked Google identity".into(),
+            ));
+        }
         sqlx::query(
-            "INSERT INTO auth_identities (issuer, subject, user_id, created_at)
-             VALUES (?, ?, ?, ?) ON CONFLICT(issuer, subject) DO NOTHING",
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verified_email)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(issuer, subject) DO NOTHING",
         )
         .bind(EMAIL_IDENTITY_ISSUER)
         .bind(normalized_email)
         .bind(user_id)
         .bind(Utc::now().timestamp())
+        .bind(normalized_email)
         .execute(&mut *transaction)
         .await?;
         let mapped = identity_user(&mut transaction, normalized_email)
@@ -1407,5 +1448,43 @@ mod tests {
                 .await,
             Err(AppError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn google_first_email_link_requires_the_exact_normalized_google_email() {
+        let (pool, runtime) = runtime().await;
+        sqlx::query(
+            "INSERT INTO users (id, email, profile_email, display_name)
+             VALUES ('google-user', 'google@identity.invalid', 'owner@example.com', 'Owner')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verified_email)
+             VALUES ('https://accounts.google.com', 'subject', 'google-user', ?, 'owner@example.com')",
+        )
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        runtime
+            .store
+            .link_email("google-user", "owner@example.com")
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime
+                .store
+                .link_email("google-user", "other@example.com")
+                .await,
+            Err(AppError::Validation(_))
+        ));
+        assert_eq!(
+            runtime.store.linked_emails("google-user").await.unwrap(),
+            vec!["owner@example.com"]
+        );
     }
 }

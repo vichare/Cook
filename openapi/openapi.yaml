@@ -95,7 +95,7 @@ paths:
         "429": { description: Login start rate limited }
   /api/auth/google/callback:
     get:
-      description: Backend-only callback. Authorization codes and tokens are never returned to frontend JavaScript.
+      description: Backend-only callback. Authorization codes and tokens are never returned to frontend JavaScript. A new Google identity may attach to an existing Email OTP user only for the exact same normalized gmail.com address; non-Gmail matches and pre-existing split identities fail without merging.
       parameters:
         - name: state
           in: query
@@ -108,7 +108,7 @@ paths:
           schema: { type: string }
       responses:
         "303":
-          description: Cook session issued with a Host-only HttpOnly cookie and browser redirected home
+          description: Cook session issued with a Host-only HttpOnly cookie and browser redirected home, or unsafe identity linking rejected and redirected to a generic recovery message
         "401": { description: Invalid, expired, denied, or replayed login attempt }
         "503": { description: Google or authentication persistence unavailable }
   /api/auth/email/request:
@@ -208,12 +208,13 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/EmailOtpChallenge" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "400": { description: A Google-first account supplied an email other than its verified Google email }
         "429": { description: Email or client-address rate limit exceeded }
   /api/settings/security/email/verify:
     post:
       security:
         - sessionCookie: []
-      description: Consumes a link challenge only for the Cook user who started it. Existing ownership by another account returns conflict and never merges accounts.
+      description: Consumes a link challenge only for the Cook user who started it. Google-first accounts must verify the exact normalized email stored on their Google identity. Existing ownership by another account returns conflict and never merges accounts.
       requestBody:
         $ref: "#/components/requestBodies/EmailOtpVerify"
       responses:
@@ -666,11 +667,19 @@ components:
         lastUsedAt: { type: [string, "null"], format: date-time }
     SecuritySettings:
       type: object
-      required: [linkedEmails, passkeys]
+      required: [linkedEmails, googleEmail, googleSignInStatus, passkeys]
       properties:
         linkedEmails:
           type: array
           items: { type: string, format: email }
+        googleEmail:
+          type: [string, "null"]
+          format: email
+          description: Current user's private Google verified email, if linked. Never exposed in public author DTOs.
+        googleSignInStatus:
+          type: string
+          enum: [linked, eligible, unsupported, unavailable]
+          description: Whether Google is already linked, may be added by exact Gmail match, is unsupported for a non-Gmail email-first account, or lacks an email identity.
         passkeys:
           type: array
           items: { $ref: "#/components/schemas/Passkey" }

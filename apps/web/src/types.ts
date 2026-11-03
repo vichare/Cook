@@ -31,6 +31,8 @@ export interface PasskeySummary {
 
 export interface SecuritySettings {
   linkedEmails: string[]
+  googleEmail: string | null
+  googleSignInStatus: 'linked' | 'eligible' | 'unsupported' | 'unavailable'
   passkeys: PasskeySummary[]
 }
 

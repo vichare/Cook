@@ -88,7 +88,7 @@ Store off-host encrypted copies and regularly test restoration. Deployment autom
 
 - `test "$(curl -fsS https://cook.vichare.net/health)" = ok`
 - complete real Google and Email OTP login, passkey registration/login/revocation, and current/all-device logout
-- verify explicit email linking and same-email cross-provider account separation
+- verify Google-first exact-email OTP linking, Gmail email-first Google convergence, non-Gmail rejection, and pre-existing split-account recovery without account merging
 - verify private recipe and pantry isolation with two accounts
 - verify READY/VERIFY/SHOP/BLOCKED recommendations
 - inspect `docker compose -f compose.yaml ps` and bounded container logs

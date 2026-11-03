@@ -20,7 +20,7 @@ Host capacity, Google callback registration, SMTP deliverability, and production
 5. Run `docker compose build` and `docker compose up -d`.
 6. Install `deploy/nginx/cook.vichare.net.conf` in host nginx and validate with `nginx -t`.
 7. Confirm that only `127.0.0.1:18080` is published by Compose, then reload nginx.
-8. Smoke-test Google, Email OTP, passkey registration/login/revocation, explicit email linking and link conflicts, current/all-device logout, cross-account recipe isolation, recommendation explanations, and restore procedure.
+8. Smoke-test Google, Email OTP, passkey registration/login/revocation, Google-first exact-email OTP linking, Gmail email-first Google convergence, non-Gmail rejection, split-account recovery, current/all-device logout, cross-account recipe isolation, recommendation explanations, and restore procedure. Never create production test identities that intentionally collide with a real user.
 
 Production releases are normally installed by the tag-driven GitHub Actions workflow rather than by building on the VM. See `release-and-deployment.md`.
 

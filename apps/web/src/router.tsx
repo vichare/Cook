@@ -181,16 +181,25 @@ function NotFoundPage() {
 function Login({ onLogin }: { onLogin: () => void }) {
   const { t } = useI18n()
   const [name, setName] = useState('Demo Cook')
+  const googleConflict = new URLSearchParams(window.location.search).get('authError') === 'google-account-conflict'
   const config = useQuery({ queryKey: ['auth-config'], queryFn: api.authConfig })
   const login = useMutation({ mutationFn: api.devLogin, onSuccess: onLogin })
+  useEffect(() => {
+    if (!googleConflict) return
+    const url = new URL(window.location.href)
+    url.searchParams.delete('authError')
+    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+  }, [googleConflict])
   if (config.isLoading) return <StatePanel title={t('login.loading')} detail={t('login.checking')} />
   if (config.error) return <StatePanel title={t('login.unavailable')} detail={errorMessage(config.error, t)} />
   return (
     <main id="main" className="login">
       <section className="hero-card">
+        <GuestLanguageSelector />
         <p className="eyebrow">{t('login.eyebrow')}</p>
         <h1>{t('login.title')}</h1>
         <p>{t('login.intro')}</p>
+        {googleConflict && <p className="error-text" role="alert">{t('login.googleConflict')}</p>}
         {config.data?.mode === 'development' && (
           <form
             onSubmit={(event) => {
@@ -219,6 +228,19 @@ function Login({ onLogin }: { onLogin: () => void }) {
         </small>
       </section>
     </main>
+  )
+}
+
+export function GuestLanguageSelector() {
+  const { locale, setLocale, t } = useI18n()
+  return (
+    <label>
+      {t('locale.label')}
+      <select value={locale} onChange={(event) => setLocale(event.target.value as Locale)}>
+        <option value="en">English</option>
+        <option value="zh-CN">简体中文</option>
+      </select>
+    </label>
   )
 }
 
@@ -1121,6 +1143,11 @@ export function AccountSecuritySettings() {
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [challenge])
+  useEffect(() => {
+    if (!challenge && security.data?.googleEmail) {
+      setEmail(security.data.googleEmail)
+    }
+  }, [challenge, security.data?.googleEmail])
   const linkRequest = useMutation({
     mutationFn: () => api.requestEmailLink(email),
     onSuccess: (value) => {
@@ -1168,6 +1195,12 @@ export function AccountSecuritySettings() {
             ) : (
               <p>{t('security.linkBeforePasskey')}</p>
             )}
+            {security.data?.googleSignInStatus === 'linked' && security.data.googleEmail && (
+              <p>{t('security.googleEmail', { email: maskEmail(security.data.googleEmail) })}</p>
+            )}
+            {security.data?.googleSignInStatus === 'eligible' && <p>{t('security.googleEligible')}</p>}
+            {security.data?.googleSignInStatus === 'unsupported' && <p>{t('security.googleUnsupported')}</p>}
+            {security.data?.googleSignInStatus === 'unavailable' && <p>{t('security.googleUnavailable')}</p>}
           </div>
           <div>
             <h3>{t('security.passkeys')}</h3>
@@ -1206,8 +1239,15 @@ export function AccountSecuritySettings() {
           <h3>{t('security.linkEmail')}</h3>
           <label>
             {t('otp.email')}
-            <input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} />
+            <input
+              type="email"
+              autoComplete="email"
+              value={email}
+              readOnly={Boolean(security.data?.googleEmail)}
+              onChange={(event) => setEmail(event.target.value)}
+            />
           </label>
+          {security.data?.googleEmail && <p>{t('security.emailMustMatchGoogle')}</p>}
           {challenge && (
             <>
               <p role="status">{t('security.linkSent')}</p>
@@ -1265,6 +1305,12 @@ export function AccountSecuritySettings() {
       )}
     </section>
   )
+}
+
+function maskEmail(value: string) {
+  const [local, domain] = value.split('@')
+  if (!local || !domain) return value
+  return `${local.slice(0, Math.min(2, local.length))}${local.length > 2 ? '***' : '*'}@${domain}`
 }
 
 function ProfileSettings({ user }: { user: User }) {

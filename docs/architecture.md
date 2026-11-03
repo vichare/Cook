@@ -13,13 +13,15 @@ Cook consumes `rust-web-auth-core`, `rust-web-auth-google`, `rust-web-auth-http`
 Cook implements the consumer ports in SQLite:
 
 - login attempts use insert-if-absent and one-statement `DELETE … RETURNING` consumption;
-- identities map only by `(issuer, subject)`, while verified email and display name remain mutable profile data;
+- existing identities resolve by `(issuer, subject)` first; a narrowly scoped first-login policy may attach a new Google identity to an existing Email OTP user only for an exact normalized `gmail.com` address;
 - sessions persist only keyed token digests and use version-based CAS renewal/revocation;
 - Google login starts use a 10-attempt, 15-minute SQLite rate-limit window keyed by a digest of the trusted client address;
 - Email OTP stores one active challenge per purpose and normalized email, applies the shared ten-minute expiry, one-minute resend cooldown, five-attempt limit, atomic replace/verify/consume behavior, and persists separate email/IP and challenge/IP limiter buckets;
 - passkey user handles and credentials are persistent, credential IDs are globally unique, and signature counters, backup state, last-used timestamps, names, and revocation are owner-scoped.
 
-Cook owns its users, mappings, attempts, sessions, rate limits, database, keys, and Host-only production cookies. It does not accept or share SOP-Node cookies or databases. Email OTP identities use the issuer `urn:cook:email-otp`; an unauthenticated verified address creates or resolves only that identity. A signed-in user may link an address only by completing a fresh OTP challenge bound to that Cook user. Matching a Google profile email never causes automatic linking or account merging.
+Cook owns its users, mappings, attempts, sessions, rate limits, database, keys, and Host-only production cookies. It does not accept or share SOP-Node cookies or databases. Email OTP identities use the issuer `urn:cook:email-otp`; an unauthenticated verified address creates or resolves only that identity. A Google-first user may link Email OTP only by completing a fresh OTP challenge for the exact normalized email stored on that Google identity. An email-first user may gain Google sign-in automatically only when a previously unseen Google subject reports the exact same normalized `gmail.com` address. The mapper does not apply Gmail dot folding, remove `+tags`, treat `googlemail.com` as `gmail.com`, or link a matching non-Gmail email-first account.
+
+Google identity selection is rechecked inside the same SQLite transaction that creates or attaches the identity and inserts the Cook session. The `(issuer, subject)` primary key handles concurrent callbacks. If the Google subject and matching Email OTP identity already belong to different users, or if a matching non-Gmail email-first identity exists, Cook creates no user or session, records a PII-free audit event, and redirects to a generic recovery message. Existing accounts are never batch-merged or migrated; passkey handles and credentials stay on the canonical Cook user selected by the allowed linking rule.
 
 Passkey registration requires an authenticated account with an explicitly linked Email OTP identity. Login is username-first through that identity. WebAuthn uses exact RP ID/origin validation and requires user verification. Non-serializable five-minute ceremony state remains in process memory; only a random opaque token is placed in a short-lived HttpOnly cookie. Restarting the process safely invalidates in-flight ceremonies without affecting credentials.
 
