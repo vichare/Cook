@@ -38,7 +38,7 @@ use crate::{
         PasskeySummary, EMAIL_LINK_PURPOSE, EMAIL_SIGN_IN_PURPOSE,
     },
     recommendation::{recommend, Recommendation},
-    AppState,
+    shopping, AppState,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -98,6 +98,26 @@ pub fn router(state: AppState) -> Router {
             get(ai_recipes::get_revision_image),
         )
         .route("/api/pantry", get(list_pantry).put(upsert_pantry))
+        .route(
+            "/api/shopping-list",
+            get(shopping::list_shopping_items).post(shopping::create_manual_item),
+        )
+        .route(
+            "/api/shopping-list/{id}",
+            put(shopping::update_manual_item).delete(shopping::delete_manual_item),
+        )
+        .route(
+            "/api/shopping-list/{id}/complete",
+            post(shopping::complete_manual_item),
+        )
+        .route(
+            "/api/shopping-list/automatic/{id}/purchased",
+            post(shopping::mark_automatic_purchased),
+        )
+        .route(
+            "/api/recipes/{id}/shopping-list-items",
+            post(shopping::add_recipe_ingredient),
+        )
         .route("/api/ingredients/suggestions", get(ingredient_suggestions))
         .route(
             "/api/settings/recommendations",
@@ -1184,6 +1204,20 @@ async fn upsert_pantry(
             }
             crate::models::NullableUpdate::Missing => existing_expiry,
         };
+        let existing_auto_add: bool = if existing_ids.is_empty() {
+            false
+        } else {
+            sqlx::query_scalar(
+                "SELECT auto_add_to_shopping_list_when_out FROM pantry_items WHERE id = ?",
+            )
+            .bind(&item_id)
+            .fetch_one(&mut *transaction)
+            .await?
+        };
+        let auto_add_to_shopping_list_when_out = match item.auto_add_to_shopping_list_when_out {
+            crate::models::NullableUpdate::Value(value) => value.unwrap_or(false),
+            crate::models::NullableUpdate::Missing => existing_auto_add,
+        };
         for duplicate_id in existing_ids.iter().skip(1) {
             sqlx::query("DELETE FROM pantry_items WHERE id = ? AND owner_id = ?")
                 .bind(duplicate_id)
@@ -1194,13 +1228,14 @@ async fn upsert_pantry(
         sqlx::query(
             "INSERT INTO pantry_items
              (id, owner_id, name, normalized_name, status, quantity_note, confirmed_at,
-              expires_on, canonical_ingredient_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              expires_on, canonical_ingredient_id, auto_add_to_shopping_list_when_out)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name, normalized_name = excluded.normalized_name,
                status = excluded.status, quantity_note = excluded.quantity_note,
                confirmed_at = excluded.confirmed_at, expires_on = excluded.expires_on,
                canonical_ingredient_id = excluded.canonical_ingredient_id,
+               auto_add_to_shopping_list_when_out = excluded.auto_add_to_shopping_list_when_out,
                updated_at = CURRENT_TIMESTAMP",
         )
         .bind(item_id)
@@ -1212,6 +1247,7 @@ async fn upsert_pantry(
         .bind(Utc::now().to_rfc3339())
         .bind(expires_on)
         .bind(canonical_id)
+        .bind(auto_add_to_shopping_list_when_out)
         .execute(&mut *transaction)
         .await?;
     }
@@ -1428,6 +1464,9 @@ fn expand_pantry_inputs(items: Vec<PantryItemInput>) -> Vec<PantryItemInput> {
                     canonical_ingredient_id: single
                         .then(|| item.canonical_ingredient_id.clone())
                         .flatten(),
+                    auto_add_to_shopping_list_when_out: item
+                        .auto_add_to_shopping_list_when_out
+                        .clone(),
                 });
             }
         }
@@ -1954,10 +1993,11 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
         Option<String>,
         Option<String>,
         Option<String>,
+        bool,
     );
     let rows: Vec<PantryRow> = sqlx::query_as(
         "SELECT id, name, status, quantity_note, confirmed_at, expires_on,
-                canonical_ingredient_id
+                canonical_ingredient_id, auto_add_to_shopping_list_when_out
          FROM pantry_items WHERE owner_id = ? ORDER BY normalized_name",
     )
     .bind(user_id)
@@ -1974,6 +2014,7 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
                 confirmed_at,
                 expires_on,
                 canonical_ingredient_id,
+                auto_add_to_shopping_list_when_out,
             )| PantryItem {
                 id,
                 name,
@@ -1982,6 +2023,7 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
                 confirmed_at,
                 expires_on,
                 canonical_ingredient_id,
+                auto_add_to_shopping_list_when_out,
             },
         )
         .collect())
@@ -3848,6 +3890,232 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let pantry: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(pantry, json!([]));
+    }
+
+    #[tokio::test]
+    async fn automatic_shopping_items_follow_out_pantry_state_and_purchase_atomically() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Owner").await;
+        let other_cookie = login(&app, "Other").await;
+        let pantry = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!([
+                            {
+                                "name": "Milk",
+                                "status": "out",
+                                "quantityNote": "",
+                                "autoAddToShoppingListWhenOut": true
+                            },
+                            {
+                                "name": "Egg",
+                                "status": "unknown",
+                                "quantityNote": "",
+                                "autoAddToShoppingListWhenOut": true
+                            },
+                            {
+                                "name": "Rice",
+                                "status": "have",
+                                "quantityNote": "",
+                                "expiresOn": "2020-01-01",
+                                "autoAddToShoppingListWhenOut": true
+                            }
+                        ])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pantry.status(), StatusCode::OK);
+        let pantry = response_json(pantry).await;
+        let milk = pantry
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "Milk")
+            .unwrap();
+        let milk_id = milk["id"].as_str().unwrap().to_string();
+        let milk_canonical_id = milk["canonicalIngredientId"].as_str().unwrap();
+        let manual = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "name": "milk",
+                            "canonicalIngredientId": milk_canonical_id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manual.status(), StatusCode::CREATED);
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::get("/api/shopping-list")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list = response_json(list).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["name"], "milk");
+        assert_eq!(list[0]["automatic"], true);
+        assert_eq!(list[0]["pantryItemId"], milk_id);
+        assert_eq!(list[0]["sources"].as_array().unwrap().len(), 2);
+        assert!(list[0]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["kind"] == "automatic"));
+        assert!(list[0]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["kind"] == "manual"));
+
+        let other_list = app
+            .clone()
+            .oneshot(
+                Request::get("/api/shopping-list")
+                    .header("cookie", &other_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(other_list).await, json!([]));
+        let cross_account = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/automatic/{milk_id}/purchased"))
+                    .header("cookie", &other_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_account.status(), StatusCode::NOT_FOUND);
+
+        let purchased = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/automatic/{milk_id}/purchased"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(purchased.status(), StatusCode::OK);
+        let purchased = response_json(purchased).await;
+        assert_eq!(purchased.as_array().unwrap().len(), 1);
+        assert_eq!(purchased[0]["automatic"], false);
+        assert!(purchased[0]["completedAt"].is_string());
+        let pantry = app
+            .oneshot(
+                Request::get("/api/pantry")
+                    .header("cookie", owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pantry = response_json(pantry).await;
+        let milk = pantry
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == milk_id)
+            .unwrap();
+        assert_eq!(milk["status"], "have");
+        assert!(milk["confirmedAt"].is_string());
+        assert_eq!(milk["autoAddToShoppingListWhenOut"], true);
+    }
+
+    #[tokio::test]
+    async fn shopping_items_dedupe_sources_and_validate_recipe_membership() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let add_milk = || {
+            app.clone().oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(json!({"name": " Milk "}).to_string()))
+                    .unwrap(),
+            )
+        };
+        let (first, retry) = tokio::join!(add_milk(), add_milk());
+        assert_eq!(first.unwrap().status(), StatusCode::CREATED);
+        assert_eq!(retry.unwrap().status(), StatusCode::CREATED);
+        let recipe = create_recipe(&app, &cookie, "private").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        let added = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/shopping-list-items"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(json!({"name": "water"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(added.status(), StatusCode::CREATED);
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/shopping-list-items"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(json!({"name": "salt"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+
+        let list = app
+            .oneshot(
+                Request::get("/api/shopping-list")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list = response_json(list).await;
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        let milk = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "Milk")
+            .unwrap();
+        assert_eq!(milk["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(milk["sources"][0]["kind"], "manual");
+        let water = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "water")
+            .unwrap();
+        assert_eq!(water["sources"][0]["kind"], "recipe");
+        assert_eq!(water["sources"][0]["recipeId"], recipe_id);
     }
 
     #[tokio::test]

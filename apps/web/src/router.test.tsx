@@ -10,6 +10,7 @@ import {
   PantryConfirmation,
   ProfileSetup,
   RecipeCoverFields,
+  ShoppingListPage,
 } from './router'
 import { LocaleProvider, type Locale } from './i18n'
 
@@ -29,7 +30,7 @@ function Providers({ children, locale = 'en' }: { children: React.ReactNode; loc
   )
 }
 
-const { requestEmailLink, requestEmailOtp, saveLocale, saveProfile, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
+const { shoppingItems, markAutomaticShoppingPurchased, requestEmailLink, requestEmailOtp, saveLocale, saveProfile, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
   saveProfile: vi.fn().mockImplementation((nickname: string | null) =>
     Promise.resolve({
       id: 'user',
@@ -80,6 +81,27 @@ const { requestEmailLink, requestEmailOtp, saveLocale, saveProfile, securitySett
     googleSignInStatus: 'unsupported',
     passkeys: [],
   }),
+  shoppingItems: vi.fn().mockResolvedValue([
+    {
+      id: 'auto:pantry-1',
+      name: 'Milk',
+      canonicalIngredientId: null,
+      automatic: true,
+      completedAt: null,
+      pantryItemId: 'pantry-1',
+      sources: [{ kind: 'automatic', label: '', recipeId: null }],
+    },
+    {
+      id: 'manual-1',
+      name: 'Rice',
+      canonicalIngredientId: null,
+      automatic: false,
+      completedAt: null,
+      pantryItemId: null,
+      sources: [{ kind: 'manual', label: '', recipeId: null }],
+    },
+  ]),
+  markAutomaticShoppingPurchased: vi.fn().mockResolvedValue([]),
 }))
 
 vi.mock('./api', async () => {
@@ -89,6 +111,24 @@ vi.mock('./api', async () => {
     api: {
       ...actual.api,
       savePantry: vi.fn().mockResolvedValue([]),
+      pantry: vi.fn().mockResolvedValue([
+        {
+          id: 'pantry-1',
+          name: 'Milk',
+          status: 'out',
+          quantityNote: '',
+          confirmedAt: null,
+          expiresOn: null,
+          canonicalIngredientId: null,
+          autoAddToShoppingListWhenOut: true,
+        },
+      ]),
+      shoppingItems,
+      addShoppingItem: vi.fn().mockResolvedValue([]),
+      updateShoppingItem: vi.fn().mockResolvedValue([]),
+      completeShoppingItem: vi.fn().mockResolvedValue([]),
+      deleteShoppingItem: vi.fn().mockResolvedValue([]),
+      markAutomaticShoppingPurchased,
       saveProfile,
       saveLocale,
       requestEmailOtp,
@@ -104,6 +144,33 @@ vi.mock('./api', async () => {
 })
 
 afterEach(cleanup)
+
+describe('shopping list', () => {
+  it('separates automatic and manual items and confirms a pantry purchase', async () => {
+    shoppingItems.mockClear()
+    markAutomaticShoppingPurchased.mockClear()
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(
+      <Providers>
+        <ShoppingListPage />
+      </Providers>,
+    )
+    expect(await screen.findByRole('heading', { name: 'Automatic restock' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Manual and recipe items' })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Mark Milk purchased' }))
+    await waitFor(() => expect(markAutomaticShoppingPurchased).toHaveBeenCalledWith('pantry-1'))
+  })
+
+  it('renders shopping controls in Simplified Chinese', async () => {
+    render(
+      <Providers locale="zh-CN">
+        <ShoppingListPage />
+      </Providers>,
+    )
+    expect(await screen.findByRole('heading', { name: '自动补货' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Milk 已买到' })).toBeVisible()
+  })
+})
 
 describe('profile setup', () => {
   const user = {

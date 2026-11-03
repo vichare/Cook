@@ -4,7 +4,7 @@
 
 Cook is a same-origin web application: the browser loads React and calls `/api` on the same origin. Host nginx terminates TLS for `cook.vichare.net` and forwards only to `127.0.0.1:18080`. The Compose web container serves static assets and proxies `/api` to the private API container.
 
-SQLite is the single source of truth. WAL mode, foreign keys, a five-second busy timeout, and bounded connection pooling are enabled at startup. Every pantry query is scoped by `owner_id`. Private recipes are visible only to their owner; another account may read or favorite a recipe only when it is public. Update and delete statements always include the authenticated owner.
+SQLite is the single source of truth. WAL mode, foreign keys, a five-second busy timeout, and bounded connection pooling are enabled at startup. Every pantry and shopping-list query is scoped by `owner_id`. Automatic restock entries are derived from opted-in pantry items whose status is explicitly `out`; manual and recipe sources are persisted and merged by canonical identity or owner-normalized input. Marking an automatic item purchased updates pantry state and the merged persisted item in one transaction. Private recipes are visible only to their owner; another account may read or favorite a recipe only when it is public. Update and delete statements always include the authenticated owner.
 
 ## Authentication ports
 

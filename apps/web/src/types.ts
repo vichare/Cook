@@ -97,6 +97,23 @@ export interface PantryItem {
   confirmedAt: string | null
   expiresOn: string | null
   canonicalIngredientId: string | null
+  autoAddToShoppingListWhenOut: boolean
+}
+
+export interface ShoppingItemSource {
+  kind: 'automatic' | 'manual' | 'recipe'
+  label: string
+  recipeId: string | null
+}
+
+export interface ShoppingItem {
+  id: string
+  name: string
+  canonicalIngredientId: string | null
+  automatic: boolean
+  completedAt: string | null
+  pantryItemId: string | null
+  sources: ShoppingItemSource[]
 }
 
 export interface RecommendationSettings {

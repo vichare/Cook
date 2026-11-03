@@ -12,6 +12,7 @@ import type {
   IngredientSuggestion,
   PasskeySummary,
   SecuritySettings,
+  ShoppingItem,
   User,
 } from './types'
 
@@ -175,8 +176,39 @@ export const api = {
   savePantry: (items: Array<Pick<PantryItem, 'name' | 'status' | 'quantityNote'> & {
     expiresOn?: string | null
     canonicalIngredientId?: string | null
+    autoAddToShoppingListWhenOut?: boolean
   }>) =>
     request<PantryItem[]>('/api/pantry', { method: 'PUT', body: JSON.stringify(items) }),
+  shoppingItems: () => request<ShoppingItem[]>('/api/shopping-list'),
+  addShoppingItem: (value: { name: string; canonicalIngredientId: string | null }) =>
+    request<ShoppingItem[]>('/api/shopping-list', {
+      method: 'POST',
+      body: JSON.stringify(value),
+    }),
+  updateShoppingItem: (
+    id: string,
+    value: { name: string; canonicalIngredientId: string | null },
+  ) =>
+    request<ShoppingItem[]>(`/api/shopping-list/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(value),
+    }),
+  completeShoppingItem: (id: string) =>
+    request<ShoppingItem[]>(`/api/shopping-list/${id}/complete`, { method: 'POST' }),
+  deleteShoppingItem: (id: string) =>
+    request<ShoppingItem[]>(`/api/shopping-list/${id}`, { method: 'DELETE' }),
+  markAutomaticShoppingPurchased: (pantryItemId: string) =>
+    request<ShoppingItem[]>(`/api/shopping-list/automatic/${pantryItemId}/purchased`, {
+      method: 'POST',
+    }),
+  addRecipeIngredientToShopping: (
+    recipeId: string,
+    value: { name: string; canonicalIngredientId: string | null },
+  ) =>
+    request<ShoppingItem[]>(`/api/recipes/${recipeId}/shopping-list-items`, {
+      method: 'POST',
+      body: JSON.stringify(value),
+    }),
   ingredientSuggestions: (query: string) =>
     request<IngredientSuggestion[]>(`/api/ingredients/suggestions?q=${encodeURIComponent(query)}`),
   settings: () => request<RecommendationSettings>('/api/settings/recommendations'),

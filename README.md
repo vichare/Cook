@@ -2,7 +2,9 @@
 
 Cook is a deployable recipe and private-pantry recommendation MVP. It combines user-authored recipes, per-account pantry state, configurable recommendation sources, and deterministic explanations for what can be cooked now.
 
-Pantry items can carry one optional date-only expiration. Ingredient entry uses shared Unicode normalization, multilingual pasted-list splitting, explicit canonical selections, and accessible suggestions; fuzzy matches are advisory and never silently alter recommendation hard filters. Expired items are explained as verification concerns rather than being changed to “used up.”
+Pantry items can carry one optional date-only expiration and a default-off automatic-restock setting. Only an explicit `out` status derives a private shopping-list item; unknown or expired items are not silently changed to out. Manual, recipe, and automatic sources deduplicate by confirmed canonical identity or owner-normalized input and remain isolated per account.
+
+Ingredient entry uses shared Unicode normalization, multilingual pasted-list splitting, explicit canonical selections, and accessible suggestions; fuzzy matches are advisory and never silently alter recommendation hard filters. Expired items are explained as verification concerns rather than being changed to “used up.”
 
 ## Stack
 

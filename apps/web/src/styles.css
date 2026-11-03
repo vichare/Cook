@@ -101,6 +101,7 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: .75rem; }
 .byline { color: #53645a; font-size: .9rem; }
 .source-note, .settings-section, .secret-once { margin: 1.5rem 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: #f7f3e8; display: grid; gap: .65rem; }
+.status-banner { margin: 1rem 0; padding: 1rem; border: 2px solid var(--forest); border-radius: 1rem; background: #eef4e9; display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; justify-content: space-between; }
 .secret-once code { overflow-wrap: anywhere; padding: .8rem; background: white; border-radius: .5rem; }
 .secret-once section { min-width: 0; padding-top: .75rem; border-top: 1px solid var(--line); display: grid; gap: .65rem; }
 .secret-once a, .secret-once p, .secret-once input { overflow-wrap: anywhere; }

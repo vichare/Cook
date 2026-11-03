@@ -290,6 +290,7 @@ mod tests {
             confirmed_at: confirmed_at.map(str::to_string),
             expires_on: None,
             canonical_ingredient_id: None,
+            auto_add_to_shopping_list_when_out: false,
         }
     }
 

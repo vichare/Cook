@@ -30,6 +30,7 @@ import {
   expirationRelativeDays,
   expirationShortcut,
   localDateValue,
+  normalizeIngredient,
   splitIngredientList,
 } from './ingredients'
 import { createPasskey, getPasskey } from './webauthn'
@@ -79,6 +80,11 @@ const pantryRoute = createRoute({
   path: '/pantry',
   component: PantryPage,
 })
+const shoppingRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/shopping-list',
+  component: ShoppingListPage,
+})
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
@@ -103,6 +109,7 @@ const routeTree = rootRoute.addChildren([
   recipeRoute,
   editRecipeRoute,
   pantryRoute,
+  shoppingRoute,
   settingsRoute,
   importsRoute,
   importDraftRoute,
@@ -153,6 +160,7 @@ function Root() {
           <Link to="/recommendations">{t('app.recommend')}</Link>
           <Link to="/recipes">{t('app.recipes')}</Link>
           <Link to="/pantry">{t('app.pantry')}</Link>
+          <Link to="/shopping-list">{t('app.shopping')}</Link>
           <Link to="/imports">{t('app.imports')}</Link>
           <Link to="/settings">{t('app.settings')}</Link>
         </nav>
@@ -386,6 +394,7 @@ function HomePage() {
 
 function RecommendationsPage() {
   const { formatDate, formatNumber, t } = useI18n()
+  const queryClient = useQueryClient()
   const [filters, setFilters] = useState({
     preferred: [] as IngredientReference[],
     required: [] as IngredientReference[],
@@ -408,6 +417,16 @@ function RecommendationsPage() {
     [recommendations.data],
   )
   const [confirmOpen, setConfirmOpen] = useState(false)
+  const addShopping = useMutation({
+    mutationFn: ({
+      recipeId,
+      ingredient,
+    }: {
+      recipeId: string
+      ingredient: IngredientReference
+    }) => api.addRecipeIngredientToShopping(recipeId, ingredient),
+    onSuccess: (items) => queryClient.setQueryData(['shopping-list'], items),
+  })
 
   return (
     <Page title={t('recommend.title')} intro={t('recommend.intro')}>
@@ -472,6 +491,35 @@ function RecommendationsPage() {
               <IngredientSummary label={t('recommend.available')} items={result.available} />
               <IngredientSummary label={t('recommend.verify')} items={result.verify} />
               <IngredientSummary label={t('recommend.missing')} items={result.missing} />
+              {result.missing.length > 0 && (
+                <div className="form-actions" aria-label={t('shopping.addMissingGroup')}>
+                  {result.missing.map((name) => {
+                    const ingredient = result.recipe.ingredients.find(
+                      (candidate) => normalizeIngredient(candidate.name) === normalizeIngredient(name),
+                    )
+                    return (
+                      <button
+                        type="button"
+                        className="button ghost"
+                        key={name}
+                        disabled={addShopping.isPending}
+                        onClick={() => {
+                          if (!window.confirm(t('shopping.addMissingConfirm', { name }))) return
+                          addShopping.mutate({
+                            recipeId: result.recipe.id,
+                            ingredient: {
+                              name,
+                              canonicalIngredientId: ingredient?.canonicalIngredientId ?? null,
+                            },
+                          })
+                        }}
+                      >
+                        {t('shopping.addMissing', { name })}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
             </article>
           ))}
         </div>
@@ -1100,13 +1148,14 @@ function PantryPage() {
     quantityNote: '',
     expiresOn: null as string | null,
     canonicalIngredientId: null as string | null,
+    autoAddToShoppingListWhenOut: false,
   })
   const [editingName, setEditingName] = useState<string | null>(null)
   const save = useMutation({
     mutationFn: api.savePantry,
     onSuccess: (items) => {
       queryClient.setQueryData(['pantry'], items)
-      setDraft({ name: '', status: 'have', quantityNote: '', expiresOn: null, canonicalIngredientId: null })
+      setDraft({ name: '', status: 'have', quantityNote: '', expiresOn: null, canonicalIngredientId: null, autoAddToShoppingListWhenOut: false })
       setEditingName(null)
     },
   })
@@ -1147,6 +1196,19 @@ function PantryPage() {
           value={draft.expiresOn}
           onChange={(expiresOn) => setDraft({ ...draft, expiresOn })}
         />
+        <label className="choice-card">
+          <input
+            type="checkbox"
+            checked={draft.autoAddToShoppingListWhenOut}
+            onChange={(event) =>
+              setDraft({ ...draft, autoAddToShoppingListWhenOut: event.target.checked })
+            }
+          />
+          <span>
+            <strong>{t('pantry.autoShopping')}</strong>
+            <small>{t('pantry.autoShoppingDetail')}</small>
+          </span>
+        </label>
         <div className="form-actions">
           <button className="button primary" disabled={!draft.name.trim() || save.isPending}>
             {editingName
@@ -1158,7 +1220,7 @@ function PantryPage() {
               type="button"
               className="button ghost"
               onClick={() => {
-                setDraft({ name: '', status: 'have', quantityNote: '', expiresOn: null, canonicalIngredientId: null })
+                setDraft({ name: '', status: 'have', quantityNote: '', expiresOn: null, canonicalIngredientId: null, autoAddToShoppingListWhenOut: false })
                 setEditingName(null)
               }}
             >
@@ -1191,6 +1253,7 @@ function PantryPage() {
                     quantityNote: item.quantityNote,
                     expiresOn: item.expiresOn,
                     canonicalIngredientId: item.canonicalIngredientId,
+                    autoAddToShoppingListWhenOut: item.autoAddToShoppingListWhenOut,
                   })
                   setEditingName(item.name)
                 }}
@@ -1207,6 +1270,7 @@ function PantryPage() {
                       status: nextStatus(item.status),
                       expiresOn: item.expiresOn,
                       canonicalIngredientId: item.canonicalIngredientId,
+                      autoAddToShoppingListWhenOut: item.autoAddToShoppingListWhenOut,
                     },
                   ])
                 }
@@ -1216,6 +1280,217 @@ function PantryPage() {
             </div>
           ))}
         </div>
+      </QueryState>
+    </Page>
+  )
+}
+
+export function ShoppingListPage() {
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const shopping = useQuery({ queryKey: ['shopping-list'], queryFn: api.shoppingItems })
+  const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
+  const [draft, setDraft] = useState<IngredientReference>({
+    name: '',
+    canonicalIngredientId: null,
+  })
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [undoItem, setUndoItem] = useState<PantryItem | null>(null)
+  const listMutation = useMutation({
+    mutationFn: (operation: () => ReturnType<typeof api.addShoppingItem>) => operation(),
+    onSuccess: (items) => {
+      queryClient.setQueryData(['shopping-list'], items)
+      setDraft({ name: '', canonicalIngredientId: null })
+      setEditingId(null)
+    },
+  })
+  const pantryMutation = useMutation({
+    mutationFn: api.savePantry,
+    onSuccess: (items) => {
+      queryClient.setQueryData(['pantry'], items)
+      void queryClient.invalidateQueries({ queryKey: ['shopping-list'] })
+    },
+  })
+  const items = shopping.data ?? []
+  const automatic = items.filter((item) => item.automatic && !item.completedAt)
+  const manual = items.filter((item) => !item.automatic && !item.completedAt)
+  const completed = items.filter((item) => item.completedAt && !item.automatic)
+  function sourceLabel(kind: string, label: string) {
+    if (kind === 'automatic') return t('shopping.sourceAutomatic')
+    if (kind === 'manual') return t('shopping.sourceManual')
+    return t('shopping.sourceRecipe', { recipe: label })
+  }
+  function pantryPayload(item: PantryItem, overrides: Partial<PantryItem>) {
+    return {
+      name: item.name,
+      status: overrides.status ?? item.status,
+      quantityNote: item.quantityNote,
+      expiresOn: item.expiresOn,
+      canonicalIngredientId: item.canonicalIngredientId,
+      autoAddToShoppingListWhenOut:
+        overrides.autoAddToShoppingListWhenOut ?? item.autoAddToShoppingListWhenOut,
+    }
+  }
+  function renderItems(sectionItems: typeof items, automaticSection: boolean) {
+    return (
+      <div className="card-list">
+        {sectionItems.map((item) => {
+          const pantryItem = item.pantryItemId
+            ? pantry.data?.find((candidate) => candidate.id === item.pantryItemId)
+            : undefined
+          const canEdit = item.sources.some((source) => source.kind === 'manual')
+          return (
+            <article className="recipe-card" key={item.id}>
+              <strong>{item.name}</strong>
+              <span>{item.sources.map((source) => sourceLabel(source.kind, source.label)).join(' · ')}</span>
+              <div className="form-actions">
+                {automaticSection && pantryItem && (
+                  <>
+                    <button
+                      type="button"
+                      className="button primary"
+                      aria-label={t('shopping.purchasedLabel', { name: item.name })}
+                      onClick={() => {
+                        if (!window.confirm(t('shopping.purchasedConfirm', { name: item.name }))) return
+                        setUndoItem(pantryItem)
+                        listMutation.mutate(async () => {
+                          const items = await api.markAutomaticShoppingPurchased(pantryItem.id)
+                          await queryClient.invalidateQueries({ queryKey: ['pantry'] })
+                          return items
+                        })
+                      }}
+                    >
+                      {t('shopping.purchased')}
+                    </button>
+                    <button
+                      type="button"
+                      className="button ghost"
+                      onClick={() =>
+                        pantryMutation.mutate([
+                          pantryPayload(pantryItem, {
+                            autoAddToShoppingListWhenOut: false,
+                          }),
+                        ])
+                      }
+                    >
+                      {t('shopping.disableAutomatic')}
+                    </button>
+                  </>
+                )}
+                {!automaticSection && !item.completedAt && (
+                  <button
+                    type="button"
+                    className="button primary"
+                    onClick={() => listMutation.mutate(() => api.completeShoppingItem(item.id))}
+                  >
+                    {t('shopping.complete')}
+                  </button>
+                )}
+                {canEdit && !item.completedAt && (
+                  <button
+                    type="button"
+                    className="button ghost"
+                    onClick={() => {
+                      setEditingId(item.id)
+                      setDraft({
+                        name: item.name,
+                        canonicalIngredientId: item.canonicalIngredientId,
+                      })
+                    }}
+                  >
+                    {t('shopping.edit')}
+                  </button>
+                )}
+                {canEdit && (
+                  <button
+                    type="button"
+                    className="button ghost"
+                    onClick={() => {
+                      if (window.confirm(t('shopping.deleteConfirm', { name: item.name }))) {
+                        listMutation.mutate(() => api.deleteShoppingItem(item.id))
+                      }
+                    }}
+                  >
+                    {t('shopping.delete')}
+                  </button>
+                )}
+              </div>
+            </article>
+          )
+        })}
+      </div>
+    )
+  }
+  return (
+    <Page title={t('shopping.title')} intro={t('shopping.intro')}>
+      <form
+        className="inline-form"
+        onSubmit={(event) => {
+          event.preventDefault()
+          if (!draft.name.trim()) return
+          listMutation.mutate(() =>
+            editingId
+              ? api.updateShoppingItem(editingId, draft)
+              : api.addShoppingItem(draft),
+          )
+        }}
+      >
+        <IngredientCombobox
+          label={t('shopping.item')}
+          value={draft}
+          onChange={setDraft}
+          placeholder={t('shopping.placeholder')}
+        />
+        <button className="button primary" disabled={!draft.name.trim() || listMutation.isPending}>
+          {editingId ? t('shopping.saveEdit') : t('shopping.add')}
+        </button>
+        {editingId && (
+          <button
+            type="button"
+            className="button ghost"
+            onClick={() => {
+              setEditingId(null)
+              setDraft({ name: '', canonicalIngredientId: null })
+            }}
+          >
+            {t('common.cancel')}
+          </button>
+        )}
+      </form>
+      {undoItem && (
+        <div className="status-banner" role="status">
+          <span>{t('shopping.purchasedSaved', { name: undoItem.name })}</span>
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => {
+              pantryMutation.mutate([pantryPayload(undoItem, { status: 'out' })])
+              setUndoItem(null)
+            }}
+          >
+            {t('common.undo')}
+          </button>
+        </div>
+      )}
+      {(listMutation.error || pantryMutation.error) && (
+        <ErrorText error={listMutation.error ?? pantryMutation.error} />
+      )}
+      <QueryState query={shopping} empty={t('shopping.empty')}>
+        <section>
+          <h2>{t('shopping.automaticTitle')}</h2>
+          <p>{t('shopping.automaticDetail')}</p>
+          {automatic.length ? renderItems(automatic, true) : <p>{t('shopping.automaticEmpty')}</p>}
+        </section>
+        <section>
+          <h2>{t('shopping.manualTitle')}</h2>
+          {manual.length ? renderItems(manual, false) : <p>{t('shopping.manualEmpty')}</p>}
+        </section>
+        {completed.length > 0 && (
+          <section>
+            <h2>{t('shopping.completedTitle')}</h2>
+            {renderItems(completed, false)}
+          </section>
+        )}
       </QueryState>
     </Page>
   )

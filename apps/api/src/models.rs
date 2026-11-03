@@ -104,6 +104,8 @@ pub struct PantryItemInput {
     pub expires_on: NullableUpdate<String>,
     #[serde(default)]
     pub canonical_ingredient_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_update")]
+    pub auto_add_to_shopping_list_when_out: NullableUpdate<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -131,6 +133,35 @@ pub struct PantryItem {
     pub confirmed_at: Option<String>,
     pub expires_on: Option<String>,
     pub canonical_ingredient_id: Option<String>,
+    pub auto_add_to_shopping_list_when_out: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShoppingItemInput {
+    pub name: String,
+    #[serde(default)]
+    pub canonical_ingredient_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShoppingItemSource {
+    pub kind: String,
+    pub label: String,
+    pub recipe_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShoppingItem {
+    pub id: String,
+    pub name: String,
+    pub canonical_ingredient_id: Option<String>,
+    pub automatic: bool,
+    pub completed_at: Option<String>,
+    pub pantry_item_id: Option<String>,
+    pub sources: Vec<ShoppingItemSource>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

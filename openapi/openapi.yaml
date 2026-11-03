@@ -351,6 +351,82 @@ paths:
               items: { $ref: "#/components/schemas/PantryItemInput" }
       responses:
         "200": { description: Updated account pantry }
+  /api/shopping-list:
+    get:
+      responses:
+        "200":
+          description: Current account shopping list, including derived automatic restock items
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ShoppingItem" }
+    post:
+      description: Add or reactivate a private manual shopping item. Canonical and normalized duplicates merge.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ShoppingItemInput" }
+      responses:
+        "201": { description: Updated private shopping list }
+  /api/shopping-list/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string }
+    put:
+      description: Edit an item that has a manual source
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ShoppingItemInput" }
+      responses:
+        "200": { description: Updated private shopping list }
+        "404": { description: Missing, cross-account, or not manually editable }
+    delete:
+      description: Remove only the manual source. Recipe and automatic sources remain.
+      responses:
+        "200": { description: Updated private shopping list }
+        "404": { description: Missing, cross-account, or no manual source }
+  /api/shopping-list/{id}/complete:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string }
+    post:
+      description: Complete a manual item. Active automatic restock items must use the purchased action instead.
+      responses:
+        "200": { description: Updated private shopping list }
+        "400": { description: Item is still derived from an out-of-stock opted-in pantry item }
+        "404": { description: Missing, cross-account, or no manual source }
+  /api/shopping-list/automatic/{pantryItemId}/purchased:
+    parameters:
+      - in: path
+        name: pantryItemId
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      description: Transactionally mark the owned pantry item available, refresh confirmation time, complete a merged persisted shopping item, and remove the derived automatic item.
+      responses:
+        "200": { description: Updated private shopping list }
+        "404": { description: Pantry item is missing, cross-account, not out, or not opted into automatic restock }
+  /api/recipes/{id}/shopping-list-items:
+    parameters:
+      - $ref: "#/components/parameters/RecipeId"
+    post:
+      description: Add a verified ingredient from an owned or public visible recipe to the current account's private shopping list.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ShoppingItemInput" }
+      responses:
+        "201": { description: Updated private shopping list }
+        "404": { description: Recipe or ingredient is not visible or does not match the recipe }
   /api/ingredients/suggestions:
     get:
       description: Returns ranked ingredient candidates visible to the current account. Fuzzy results are advisory and are never applied to hard recommendation matching without explicit selection.
@@ -1045,14 +1121,47 @@ components:
         canonicalIngredientId:
           type: [string, "null"]
           description: Canonical identity selected explicitly by the user.
+        autoAddToShoppingListWhenOut:
+          type: boolean
+          description: Omit to preserve the current value. When true, only an explicit out status derives an automatic shopping item.
     PantryItem:
       allOf:
         - $ref: "#/components/schemas/PantryItemInput"
         - type: object
-          required: [id, expiresOn, canonicalIngredientId]
+          required: [id, expiresOn, canonicalIngredientId, autoAddToShoppingListWhenOut]
           properties:
             id: { type: string, format: uuid }
             confirmedAt: { type: [string, "null"], format: date-time }
+    ShoppingItemInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        canonicalIngredientId:
+          type: [string, "null"]
+          description: Canonical identity selected explicitly by the user. Similar or fuzzy candidates are not inferred.
+    ShoppingItemSource:
+      type: object
+      required: [kind, label, recipeId]
+      properties:
+        kind: { type: string, enum: [automatic, manual, recipe] }
+        label: { type: string }
+        recipeId: { type: [string, "null"], format: uuid }
+    ShoppingItem:
+      type: object
+      required: [id, name, canonicalIngredientId, automatic, completedAt, pantryItemId, sources]
+      properties:
+        id:
+          type: string
+          description: UUID for persisted items or an opaque auto-prefixed identifier for a purely derived item.
+        name: { type: string }
+        canonicalIngredientId: { type: [string, "null"] }
+        automatic: { type: boolean }
+        completedAt: { type: [string, "null"], format: date-time }
+        pantryItemId: { type: [string, "null"], format: uuid }
+        sources:
+          type: array
+          items: { $ref: "#/components/schemas/ShoppingItemSource" }
     IngredientReference:
       oneOf:
         - type: string

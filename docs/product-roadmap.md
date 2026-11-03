@@ -16,6 +16,12 @@ All ingredient entry points use a shared server-authoritative normalization pipe
 
 Ingredient suggestions are ranked as exact normalized match, owner-confirmed alias, prefix, substring, then bounded typo similarity. Suggestions may use the current account's pantry, owned recipes, visible public recipes, and owner-scoped aliases. A similar spelling or possible synonym is advisory only: Cook never silently changes an ingredient or uses a fuzzy match for recommendation hard filters. The user must explicitly select a canonical candidate, and “keep as entered” always remains available. Cook does not ship an unreviewed large synonym table.
 
+### Private shopping list and automatic restock
+
+Each pantry item has an optional, default-off automatic-restock setting. Only an explicit `out` status derives an automatic shopping item; `unknown` and expiration alone do not. Derived items are computed from current pantry state instead of synchronized into a second table, so changing the pantry item to `have` or disabling automatic restock removes the entry immediately. Marking an automatic item purchased transactionally changes the pantry status to `have`, refreshes confirmation time, and removes the derived entry, with a web undo action.
+
+Manual and recipe-added shopping sources persist privately per account. Canonical identities deduplicate by canonical ID, unresolved input deduplicates by the account's normalized key, and overlapping automatic, manual, and recipe sources appear as one item with all provenance shown. Automatic items cannot be deleted or completed like ordinary manual entries; the user must mark them purchased or disable automatic restock. Recommendation results provide an explicit, confirmed action for adding individual missing ingredients. AI recipe tokens receive no pantry or shopping-list access.
+
 ### Older-adult accessibility baseline
 
 Cook targets WCAG 2.2 AA, supports 200% text zoom and reflow, uses at least 16px default body text and 44-by-44 CSS-pixel controls, provides visible keyboard focus and high contrast, and never communicates status only by color. Important forms retain entered values on recoverable errors, use plain-language recovery guidance, and do not impose short automatic timeouts. Destructive credential, token, and import-draft actions require confirmation.
