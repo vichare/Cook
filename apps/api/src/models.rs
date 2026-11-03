@@ -61,6 +61,7 @@ pub struct Recipe {
     #[serde(skip_serializing)]
     pub owner_id: String,
     pub is_owner: bool,
+    pub author_handle: String,
     pub author_nickname: Option<String>,
     pub title: String,
     pub description: String,
@@ -71,6 +72,7 @@ pub struct Recipe {
     pub version: i64,
     pub ingredients: Vec<IngredientInput>,
     pub is_favorite: bool,
+    pub is_favorite_author: bool,
     pub source: Option<RecipeSource>,
     pub cover_image: Option<RecipeImage>,
 }
@@ -199,18 +201,22 @@ impl PantryStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendationSettings {
-    pub include_favorites: bool,
+    #[serde(alias = "includeFavorites")]
+    pub include_favorite_recipes: bool,
     pub include_own: bool,
-    pub include_public: bool,
+    pub include_favorite_accounts: bool,
+    #[serde(alias = "includePublic")]
+    pub include_other_public: bool,
     pub verification_days: i64,
 }
 
 impl Default for RecommendationSettings {
     fn default() -> Self {
         Self {
-            include_favorites: true,
+            include_favorite_recipes: true,
             include_own: true,
-            include_public: true,
+            include_favorite_accounts: true,
+            include_other_public: true,
             verification_days: 14,
         }
     }

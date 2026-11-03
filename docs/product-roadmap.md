@@ -48,6 +48,14 @@ Google email, display name, issuer, and subject remain private authentication da
 
 First-login profile setup defaults to anonymous, offers the Google display name only as a private suggestion that must be selected explicitly, and supports a custom nickname. Skipping completes onboarding anonymously. Public recipe responses expose only the nullable nickname and whether the current viewer owns the recipe; they do not expose another account's internal owner ID or authentication profile. Nickname changes apply immediately to historical public recipes.
 
+### Public authors, favorite accounts, and deterministic recommendation ranking
+
+**Shipped on `main`.** Every account has an immutable random 128-bit URL-safe public handle. `/authors/{handle}` exposes only the nullable opt-in nickname and stable keyset-paginated public recipes; it never returns email, Google identity fields, internal user IDs, pantry data, private recipes, account age, or private counts.
+
+Favorite-account relationships are private, reject self-favorites, and dynamically include that author's current and future public recipes. Unpublished recipes disappear immediately. Saved-recipe and favorite-author overlap appears once while preserving both matched source labels and awarding the shared 75-point favorite source contribution only once.
+
+Recommendation source controls separately cover owned recipes, saved recipes, favorite accounts, and other public recipes. Hard source/visibility, excluded-ingredient, and required-ingredient filters run before status and score. Status bases absolutely dominate bounded extras on the documented 0–999 scale, and responses include primary/matched sources, structured ingredient reasons, applied controls, and a collapsible score breakdown. Production-sized 10,000-public-recipe / 500-favorite-author warm p95 under 250 ms remains an explicit release gate because this development environment does not provide representative production data.
+
 ### AI-client recipe import and management
 
 The official Cook skill performs extraction in the user's AI client and submits only a private import draft for review. The Cook server does not fetch arbitrary source URLs, which avoids creating an SSRF-capable fetch service. Web extraction prefers `schema.org/Recipe` JSON-LD and then visible content. Video extraction uses legitimately available captions or transcripts and asks the user for a transcript when tools cannot obtain one. The skill must not bypass login, paywalls, access controls, or DRM.

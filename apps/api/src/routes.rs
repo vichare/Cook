@@ -7,6 +7,7 @@ use axum::{
     Extension, Json, Router,
 };
 use axum_extra::extract::cookie::CookieJar;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{NaiveDate, Utc};
 use rust_web_auth_core::{AuthenticatedContext, LoginCallback, LoginError, UserId};
 use rust_web_auth_email_otp::{EmailOtpRequest, EmailOtpVerification};
@@ -76,6 +77,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/recipes/{id}/favorite",
             put(favorite_recipe).delete(unfavorite_recipe),
+        )
+        .route("/api/favorite-accounts", get(list_favorite_accounts))
+        .route(
+            "/api/authors/{handle}/favorite",
+            put(favorite_account).delete(unfavorite_account),
         )
         .route(
             "/api/recipes/{id}/cover",
@@ -164,6 +170,7 @@ pub fn router(state: AppState) -> Router {
             post(passkey_authentication_finish),
         )
         .route("/api/auth/logout", post(logout))
+        .route("/api/authors/{handle}", get(public_author_profile))
         .route("/api/import/drafts", post(imports::create_import_draft))
         .route(
             "/api/ai/recipes",
@@ -182,6 +189,221 @@ pub fn router(state: AppState) -> Router {
         .route("/api/recipe-images/{id}", get(images::get_recipe_image))
         .merge(protected)
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorPageQuery {
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicAuthorProfile {
+    handle: String,
+    nickname: Option<String>,
+    recipes: Vec<Recipe>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoriteAuthor {
+    handle: String,
+    nickname: Option<String>,
+}
+
+async fn public_author_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Query(query): Query<AuthorPageQuery>,
+) -> AppResult<Json<PublicAuthorProfile>> {
+    enforce_public_api_rate_limit(
+        &state.pool,
+        &format!(
+            "author-profile:{}",
+            rate_limit_key(&headers, &state.config.oauth_state_digest_key)
+        ),
+        120,
+    )
+    .await?;
+    let author: (String, Option<String>) =
+        sqlx::query_as("SELECT id, public_nickname FROM users WHERE public_handle = ?")
+            .bind(&handle)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or(AppError::NotFound)?;
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_author_cursor)
+        .transpose()?;
+    let rows: Vec<(String, String)> = if let Some((created_at, recipe_id)) = cursor {
+        sqlx::query_as(
+            "SELECT id, created_at FROM recipes
+             WHERE owner_id = ? AND visibility = 'public'
+               AND (created_at < ? OR (created_at = ? AND id < ?))
+             ORDER BY created_at DESC, id DESC LIMIT 21",
+        )
+        .bind(&author.0)
+        .bind(&created_at)
+        .bind(&created_at)
+        .bind(&recipe_id)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, created_at FROM recipes
+             WHERE owner_id = ? AND visibility = 'public'
+             ORDER BY created_at DESC, id DESC LIMIT 21",
+        )
+        .bind(&author.0)
+        .fetch_all(&state.pool)
+        .await?
+    };
+    let has_more = rows.len() > 20;
+    let page_rows = rows.into_iter().take(20).collect::<Vec<_>>();
+    let next_cursor = has_more
+        .then(|| {
+            page_rows
+                .last()
+                .map(|(id, created)| encode_author_cursor(created, id))
+        })
+        .flatten();
+    let mut recipes = Vec::with_capacity(page_rows.len());
+    for (recipe_id, _) in page_rows {
+        let recipe = load_visible_recipes(&state.pool, "", Some(&recipe_id))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)?;
+        recipes.push(recipe);
+    }
+    Ok(Json(PublicAuthorProfile {
+        handle,
+        nickname: author.1,
+        recipes,
+        next_cursor,
+    }))
+}
+
+async fn list_favorite_accounts(
+    State(state): State<AppState>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+) -> AppResult<Json<Vec<FavoriteAuthor>>> {
+    let rows = sqlx::query_as(
+        "SELECT u.public_handle, u.public_nickname
+         FROM favorite_accounts fa
+         JOIN users u ON u.id = fa.author_id
+         WHERE fa.viewer_id = ?
+         ORDER BY lower(COALESCE(u.public_nickname, '')), u.public_handle",
+    )
+    .bind(&user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(handle, nickname)| FavoriteAuthor { handle, nickname })
+            .collect(),
+    ))
+}
+
+async fn favorite_account(
+    State(state): State<AppState>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Path(handle): Path<String>,
+) -> AppResult<StatusCode> {
+    enforce_public_api_rate_limit(&state.pool, &format!("favorite-account:{}", user.id), 30)
+        .await?;
+    let author_id: String = sqlx::query_scalar("SELECT id FROM users WHERE public_handle = ?")
+        .bind(handle)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if author_id == user.id {
+        return Err(AppError::Validation(
+            "you cannot favorite your own account".into(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO favorite_accounts (viewer_id, author_id, created_at)
+         VALUES (?, ?, ?) ON CONFLICT(viewer_id, author_id) DO NOTHING",
+    )
+    .bind(user.id)
+    .bind(author_id)
+    .bind(Utc::now().timestamp())
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unfavorite_account(
+    State(state): State<AppState>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Path(handle): Path<String>,
+) -> AppResult<StatusCode> {
+    enforce_public_api_rate_limit(&state.pool, &format!("favorite-account:{}", user.id), 30)
+        .await?;
+    let author_id: String = sqlx::query_scalar("SELECT id FROM users WHERE public_handle = ?")
+        .bind(handle)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    sqlx::query("DELETE FROM favorite_accounts WHERE viewer_id = ? AND author_id = ?")
+        .bind(user.id)
+        .bind(author_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn enforce_public_api_rate_limit(
+    pool: &SqlitePool,
+    rate_key: &str,
+    limit: i64,
+) -> AppResult<()> {
+    let now = Utc::now().timestamp();
+    let window_started_at = now - now.rem_euclid(60);
+    let request_count: i64 = sqlx::query_scalar(
+        "INSERT INTO public_api_rate_limits (rate_key, window_started_at, request_count)
+         VALUES (?, ?, 1)
+         ON CONFLICT(rate_key) DO UPDATE SET
+           window_started_at = CASE
+             WHEN public_api_rate_limits.window_started_at < excluded.window_started_at
+             THEN excluded.window_started_at ELSE public_api_rate_limits.window_started_at END,
+           request_count = CASE
+             WHEN public_api_rate_limits.window_started_at < excluded.window_started_at
+             THEN 1 ELSE public_api_rate_limits.request_count + 1 END
+         RETURNING request_count",
+    )
+    .bind(rate_key)
+    .bind(window_started_at)
+    .fetch_one(pool)
+    .await?;
+    if request_count > limit {
+        return Err(AppError::RateLimited);
+    }
+    Ok(())
+}
+
+fn encode_author_cursor(created_at: &str, recipe_id: &str) -> String {
+    URL_SAFE_NO_PAD.encode(format!("{created_at}\n{recipe_id}"))
+}
+
+fn decode_author_cursor(cursor: &str) -> AppResult<(String, String)> {
+    let value = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| AppError::Validation("invalid author page cursor".into()))?;
+    let (created_at, recipe_id) = value
+        .split_once('\n')
+        .ok_or_else(|| AppError::Validation("invalid author page cursor".into()))?;
+    if created_at.is_empty() || recipe_id.is_empty() {
+        return Err(AppError::Validation("invalid author page cursor".into()));
+    }
+    Ok((created_at.to_string(), recipe_id.to_string()))
 }
 
 async fn health() -> &'static str {
@@ -1277,16 +1499,19 @@ async fn update_settings(
     }
     sqlx::query(
         "INSERT INTO recommendation_settings
-         (owner_id, include_favorites, include_own, include_public, verification_days)
-         VALUES (?, ?, ?, ?, ?)
+         (owner_id, include_favorites, include_own, include_public,
+          include_favorite_accounts, verification_days)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(owner_id) DO UPDATE SET include_favorites = excluded.include_favorites,
            include_own = excluded.include_own, include_public = excluded.include_public,
+           include_favorite_accounts = excluded.include_favorite_accounts,
            verification_days = excluded.verification_days",
     )
     .bind(&user.id)
-    .bind(settings.include_favorites)
+    .bind(settings.include_favorite_recipes)
     .bind(settings.include_own)
-    .bind(settings.include_public)
+    .bind(settings.include_other_public)
+    .bind(settings.include_favorite_accounts)
     .bind(settings.verification_days)
     .execute(&state.pool)
     .await?;
@@ -1329,7 +1554,7 @@ async fn get_recommendations(
         candidates,
         &pantry,
         &request,
-        settings.verification_days,
+        &settings,
         recommendation_time,
     )))
 }
@@ -1861,12 +2086,15 @@ pub(crate) async fn load_visible_recipes(
         sqlx::query(
             "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
                r.difficulty, r.estimated_calories, r.version,
-               u.public_nickname, r.source_url, r.source_title, r.source_author,
+               u.public_handle, u.public_nickname, r.source_url, r.source_title, r.source_author,
                r.source_warnings, r.source_confidence,
-               EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite
+               EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite,
+               EXISTS(SELECT 1 FROM favorite_accounts fa
+                      WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id) AS is_favorite_author
              FROM recipes r JOIN users u ON u.id = r.owner_id
              WHERE r.id = ? AND (r.owner_id = ? OR r.visibility = 'public')",
         )
+        .bind(user_id)
         .bind(user_id)
         .bind(id)
         .bind(user_id)
@@ -1876,12 +2104,15 @@ pub(crate) async fn load_visible_recipes(
         sqlx::query(
             "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
                r.difficulty, r.estimated_calories, r.version,
-               u.public_nickname, r.source_url, r.source_title, r.source_author,
+               u.public_handle, u.public_nickname, r.source_url, r.source_title, r.source_author,
                r.source_warnings, r.source_confidence,
-               EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite
+               EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite,
+               EXISTS(SELECT 1 FROM favorite_accounts fa
+                      WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id) AS is_favorite_author
              FROM recipes r JOIN users u ON u.id = r.owner_id
              WHERE r.owner_id = ? OR r.visibility = 'public' ORDER BY r.updated_at DESC",
         )
+        .bind(user_id)
         .bind(user_id)
         .bind(user_id)
         .fetch_all(pool)
@@ -1915,6 +2146,7 @@ pub(crate) async fn load_visible_recipes(
             id: recipe_id,
             is_owner: owner_id == user_id,
             owner_id,
+            author_handle: row.get("public_handle"),
             author_nickname: row.get("public_nickname"),
             title: row.get("title"),
             description: row.get("description"),
@@ -1924,6 +2156,7 @@ pub(crate) async fn load_visible_recipes(
             estimated_calories: row.get("estimated_calories"),
             version: row.get("version"),
             is_favorite: row.get::<i64, _>("is_favorite") != 0,
+            is_favorite_author: row.get::<i64, _>("is_favorite_author") != 0,
             source,
         });
     }
@@ -1969,10 +2202,11 @@ async fn load_candidate_recipes(
         .into_iter()
         .filter(|recipe| {
             (settings.include_own && recipe.owner_id == user_id)
-                || (settings.include_public
+                || (settings.include_favorite_recipes && recipe.is_favorite)
+                || (settings.include_favorite_accounts && recipe.is_favorite_author)
+                || (settings.include_other_public
                     && recipe.owner_id != user_id
                     && recipe.visibility == "public")
-                || (settings.include_favorites && recipe.is_favorite)
         })
         .collect())
 }
@@ -2057,8 +2291,9 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
 }
 
 async fn load_settings(pool: &SqlitePool, user_id: &str) -> AppResult<RecommendationSettings> {
-    let row: Option<(bool, bool, bool, i64)> = sqlx::query_as(
-        "SELECT include_favorites, include_own, include_public, verification_days
+    let row: Option<(bool, bool, bool, bool, i64)> = sqlx::query_as(
+        "SELECT include_favorites, include_own, include_public,
+                include_favorite_accounts, verification_days
          FROM recommendation_settings WHERE owner_id = ?",
     )
     .bind(user_id)
@@ -2066,11 +2301,18 @@ async fn load_settings(pool: &SqlitePool, user_id: &str) -> AppResult<Recommenda
     .await?;
     Ok(row
         .map(
-            |(include_favorites, include_own, include_public, verification_days)| {
+            |(
+                include_favorite_recipes,
+                include_own,
+                include_other_public,
+                include_favorite_accounts,
+                verification_days,
+            )| {
                 RecommendationSettings {
-                    include_favorites,
+                    include_favorite_recipes,
                     include_own,
-                    include_public,
+                    include_favorite_accounts,
+                    include_other_public,
                     verification_days,
                 }
             },
@@ -2369,6 +2611,205 @@ mod tests {
             .unwrap();
         let public_recipe = response_json(response).await;
         assert_eq!(public_recipe["authorNickname"], "厨师 🌶️");
+    }
+
+    #[tokio::test]
+    async fn public_author_profiles_and_favorites_preserve_privacy_and_account_isolation() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Private auth name").await;
+        let viewer_cookie = login(&app, "Viewer").await;
+        let other_cookie = login(&app, "Other viewer").await;
+        save_profile(&app, &owner_cookie, Some("Public cook")).await;
+        let private_recipe = create_recipe(&app, &owner_cookie, "private").await;
+        let public_recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let handle = public_recipe["authorHandle"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/authors/{handle}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let profile = response_json(response).await;
+        assert_eq!(profile["handle"], handle);
+        assert_eq!(profile["nickname"], "Public cook");
+        assert_eq!(profile["recipes"].as_array().unwrap().len(), 1);
+        assert_eq!(profile["recipes"][0]["id"], public_recipe["id"]);
+        let serialized = profile.to_string();
+        assert!(!serialized.contains("Private auth name"));
+        assert!(!serialized.contains(private_recipe["id"].as_str().unwrap()));
+        for forbidden in [
+            "ownerId",
+            "email",
+            "displayName",
+            "google",
+            "subject",
+            "pantry",
+            "createdAt",
+        ] {
+            assert!(!profile.as_object().unwrap().contains_key(forbidden));
+        }
+
+        let self_favorite = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/authors/{handle}/favorite"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(self_favorite.status(), StatusCode::BAD_REQUEST);
+
+        let favorite = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/authors/{handle}/favorite"))
+                    .header("cookie", &viewer_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(favorite.status(), StatusCode::NO_CONTENT);
+        let viewer_favorites = response_json(
+            app.clone()
+                .oneshot(
+                    Request::get("/api/favorite-accounts")
+                        .header("cookie", &viewer_cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(viewer_favorites.as_array().unwrap().len(), 1);
+        assert_eq!(viewer_favorites[0]["handle"], handle);
+
+        let other_favorites = response_json(
+            app.oneshot(
+                Request::get("/api/favorite-accounts")
+                    .header("cookie", other_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(other_favorites.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn favorite_accounts_dynamically_supply_current_public_recipes() {
+        let (app, _, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Owner").await;
+        let viewer_cookie = login(&app, "Viewer").await;
+        let first = create_recipe(&app, &owner_cookie, "public").await;
+        let handle = first["authorHandle"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/authors/{handle}/favorite"))
+                    .header("cookie", &viewer_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let second = create_recipe(&app, &owner_cookie, "public").await;
+
+        let recommendations = response_json(
+            app.clone()
+                .oneshot(
+                    Request::post("/api/recommendations")
+                        .header("content-type", "application/json")
+                        .header("cookie", &viewer_cookie)
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let results = recommendations.as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| {
+            result["matchedSources"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("FAVORITE_ACCOUNT"))
+        }));
+
+        sqlx::query("UPDATE recipes SET visibility = 'private' WHERE id = ?")
+            .bind(second["id"].as_str().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let recommendations = response_json(
+            app.oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", viewer_cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(recommendations.as_array().unwrap().len(), 1);
+        assert_eq!(recommendations[0]["recipe"]["id"], first["id"]);
+    }
+
+    #[tokio::test]
+    async fn public_author_pagination_is_stable_and_has_no_duplicates() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Author").await;
+        let mut handle = String::new();
+        for _ in 0..21 {
+            let recipe = create_recipe(&app, &owner_cookie, "public").await;
+            handle = recipe["authorHandle"].as_str().unwrap().to_string();
+        }
+        let first = response_json(
+            app.clone()
+                .oneshot(
+                    Request::get(format!("/api/authors/{handle}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first["recipes"].as_array().unwrap().len(), 20);
+        let cursor = first["nextCursor"].as_str().unwrap();
+        let second = response_json(
+            app.oneshot(
+                Request::get(format!("/api/authors/{handle}?cursor={cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(second["recipes"].as_array().unwrap().len(), 1);
+        assert_eq!(second["nextCursor"], Value::Null);
+        let first_ids = first["recipes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|recipe| recipe["id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(!first_ids.contains(second["recipes"][0]["id"].as_str().unwrap()));
     }
 
     #[tokio::test]

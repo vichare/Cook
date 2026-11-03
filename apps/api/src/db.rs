@@ -195,7 +195,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied.0, 10);
+        assert_eq!(applied.0, 11);
         pool.close().await;
 
         let reopened = connect(&url).await.unwrap();

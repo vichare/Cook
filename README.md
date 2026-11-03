@@ -10,6 +10,8 @@ Recipes may optionally include a 1–5 difficulty and an estimated total kcal va
 
 Recipe descriptions and instructions remain Markdown source. The web editor provides text-labeled formatting controls and a live preview; rendering disables raw HTML and embedded images, allows only a small standard/GFM element set, and accepts only HTTP/HTTPS links.
 
+Public recipes use immutable random author handles and optional public nicknames without exposing authentication identities or internal account IDs. Users can privately favorite authors, and recommendations deterministically combine owned recipes, saved recipes, favorite authors' current public recipes, and other public recipes with structured explanations and a bounded 0–999 score.
+
 ## Stack
 
 - React 19, TypeScript strict, Vite, TanStack Router and Query

@@ -10,7 +10,7 @@ Use this skill to turn an authorized source into a private Cook review draft, ma
 - Do not copy the token into skill installation instructions or a general-AI prompt. Prompts must reference the secret/environment variable name `COOK_IMPORT_TOKEN` only.
 - The recommended token has only `recipes:import`. The optional management preset has `recipes:read`, `recipes:write`, and `recipes:images:write`.
 - The high-risk publish preset has those management scopes plus `recipes:publish`. Check the token's returned scope list; never infer or request public visibility without that exact scope.
-- No preset grants recipe deletion, pantry, account, another user's recipes, or ordinary Cook session access.
+- No preset grants recipe deletion, pantry, shopping-list, account/profile, favorite-account, another user's recipes, or ordinary Cook session access.
 
 ## Extraction rules
 

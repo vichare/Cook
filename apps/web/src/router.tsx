@@ -20,6 +20,8 @@ import type {
   PantryItem,
   PantryStatus,
   Recipe,
+  Recommendation,
+  RecommendationSource,
   RecommendationSettings,
   RecommendationReason,
   SecuritySettings as SecuritySettingsData,
@@ -71,6 +73,11 @@ const recipeRoute = createRoute({
   path: '/recipes/$recipeId',
   component: RecipeDetailPage,
 })
+const authorRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/authors/$handle',
+  component: AuthorProfilePage,
+})
 const editRecipeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/recipes/$recipeId/edit',
@@ -108,6 +115,7 @@ const routeTree = rootRoute.addChildren([
   recipesRoute,
   newRecipeRoute,
   recipeRoute,
+  authorRoute,
   editRecipeRoute,
   pantryRoute,
   shoppingRoute,
@@ -144,6 +152,17 @@ function Root() {
   }, [initializeLocale, locale, me.data, setLocale])
   if (me.isLoading) return <StatePanel title={t('app.openingKitchen')} detail={t('app.loadingWorkspace')} />
   if (me.error instanceof ApiError && me.error.status === 401) {
+    if (window.location.pathname.startsWith('/authors/')) {
+      return (
+        <div className="app-shell">
+          <header className="site-header">
+            <Link to="/" className="brand">Cook</Link>
+            <GuestLanguageSelector />
+          </header>
+          <main id="main"><Outlet /></main>
+        </div>
+      )
+    }
     return <Login onLogin={() => void queryClient.invalidateQueries({ queryKey: ['me'] })} />
   }
   if (me.error) return <StatePanel title={t('app.startFailed')} detail={errorMessage(me.error, t)} />
@@ -472,8 +491,14 @@ function RecommendationsPage() {
         </div>
       )}
       <QueryState query={recommendations} empty={t('recommend.noMatches')}>
-        <div className="card-list">
-          {recommendations.data?.map((result) => (
+        <div>
+          {(['READY', 'VERIFY', 'SHOP', 'BLOCKED'] as const).map((status) => {
+            const results = recommendations.data?.filter((result) => result.status === status) ?? []
+            if (results.length === 0) return null
+            return <section key={status} aria-labelledby={`recommend-${status}`}>
+              <h2 id={`recommend-${status}`}>{t(`recommend.group.${status}`)}</h2>
+              <div className="card-list">
+              {results.map((result) => (
             <article className="recommendation-card" key={result.recipe.id}>
               <div className="card-heading">
                 <div>
@@ -495,9 +520,19 @@ function RecommendationsPage() {
                   .map((reason) => recommendationReasonLabel(reason, t, formatDate, formatNumber))
                   .join(' · ')}
               </p>
+              <p>{t('recommend.sourceSummary', {
+                source: recommendationSourceLabel(result.primarySource, t),
+              })}</p>
               <IngredientSummary label={t('recommend.available')} items={result.available} />
               <IngredientSummary label={t('recommend.verify')} items={result.verify} />
               <IngredientSummary label={t('recommend.missing')} items={result.missing} />
+              <ul className="plain-list" aria-label={t('recommend.ingredientReasons')}>
+                {result.ingredientReasons.map((reason) => (
+                  <li key={`${reason.ingredient}-${reason.code}`}>
+                    {recommendationIngredientReasonLabel(reason, t, formatDate)}
+                  </li>
+                ))}
+              </ul>
               {result.missing.length > 0 && (
                 <div className="form-actions" aria-label={t('shopping.addMissingGroup')}>
                   {result.missing.map((name) => {
@@ -527,8 +562,18 @@ function RecommendationsPage() {
                   })}
                 </div>
               )}
+              <details>
+                <summary>{t('recommend.scoreDetails')}</summary>
+                <p>{t('recommend.matchedSources', {
+                  sources: result.matchedSources.map((source) => recommendationSourceLabel(source, t)).join(', '),
+                })}</p>
+                <p>{recommendationScoreLabel(result, t, formatNumber)}</p>
+              </details>
             </article>
-          ))}
+              ))}
+              </div>
+            </section>
+          })}
         </div>
       </QueryState>
       <PantryConfirmation open={confirmOpen} onOpenChange={setConfirmOpen} names={verifyNames} />
@@ -647,9 +692,7 @@ function RecipesPage() {
                 formatNumber={formatNumber}
                 t={t}
               />
-              <p className="byline">
-                {t('common.byAuthor', { author: recipe.authorNickname ?? t('common.anonymousUser') })}
-              </p>
+              <AuthorByline recipe={recipe} />
               <Link to="/recipes/$recipeId" params={{ recipeId: recipe.id }}>
                 {t('recipes.open')}
               </Link>
@@ -657,6 +700,123 @@ function RecipesPage() {
           ))}
         </div>
       </QueryState>
+    </Page>
+  )
+}
+
+function AuthorByline({ recipe }: { recipe: Recipe }) {
+  const { t } = useI18n()
+  const name = recipe.authorNickname ?? t('common.anonymousUser')
+  return (
+    <p className="byline">
+      {recipe.authorHandle ? (
+        <Link to="/authors/$handle" params={{ handle: recipe.authorHandle }}>
+          {t('common.byAuthor', { author: name })}
+        </Link>
+      ) : (
+        t('common.byAuthor', { author: name })
+      )}
+    </p>
+  )
+}
+
+function AuthorProfilePage() {
+  const { handle } = authorRoute.useParams()
+  const { formatNumber, t } = useI18n()
+  const queryClient = useQueryClient()
+  const [additionalRecipes, setAdditionalRecipes] = useState<Recipe[]>([])
+  const [nextCursor, setNextCursor] = useState<string | null | undefined>(undefined)
+  const me = useQuery({ queryKey: ['me'], queryFn: api.me, retry: false })
+  const profile = useQuery({
+    queryKey: ['author', handle],
+    queryFn: () => api.authorProfile(handle),
+  })
+  useEffect(() => {
+    setAdditionalRecipes([])
+    setNextCursor(undefined)
+  }, [handle])
+  const favorites = useQuery({
+    queryKey: ['favorite-accounts'],
+    queryFn: api.favoriteAccounts,
+    enabled: Boolean(me.data),
+  })
+  const visibleRecipes = useQuery({
+    queryKey: ['recipes'],
+    queryFn: api.recipes,
+    enabled: Boolean(me.data),
+  })
+  const isFavorite = favorites.data?.some((author) => author.handle === handle) ?? false
+  const isSelf = visibleRecipes.data?.some(
+    (recipe) => recipe.isOwner && recipe.authorHandle === handle,
+  ) ?? false
+  const favorite = useMutation({
+    mutationFn: (next: boolean) => api.favoriteAccount(handle, next),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['favorite-accounts'] }),
+        queryClient.invalidateQueries({ queryKey: ['recipes'] }),
+        queryClient.invalidateQueries({ queryKey: ['recommendations'] }),
+      ])
+    },
+  })
+  const loadMore = useMutation({
+    mutationFn: (cursor: string) => api.authorProfile(handle, cursor),
+    onSuccess: (page) => {
+      setAdditionalRecipes((current) => [...current, ...page.recipes])
+      setNextCursor(page.nextCursor)
+    },
+  })
+  const recipes = [...(profile.data?.recipes ?? []), ...additionalRecipes]
+  const pageCursor = nextCursor === undefined ? profile.data?.nextCursor : nextCursor
+  return (
+    <Page
+      title={profile.data?.nickname ?? t('common.anonymousUser')}
+      intro={t('author.intro')}
+      action={me.data && !isSelf ? (
+        <button
+          type="button"
+          className="button secondary"
+          aria-pressed={isFavorite}
+          disabled={favorite.isPending}
+          onClick={() => favorite.mutate(!isFavorite)}
+        >
+          {isFavorite ? t('author.unfavorite') : t('author.favorite')}
+        </button>
+      ) : undefined}
+    >
+      <QueryState query={profile} empty={t('author.empty')}>
+        <div className="card-list">
+          {recipes.map((recipe) => (
+            <article className="recipe-card" key={recipe.id}>
+              <h2>{recipe.title}</h2>
+              <p>{recipe.description || t('recipes.noDescription')}</p>
+              <RecipeMetadata
+                difficulty={recipe.difficulty}
+                estimatedCalories={recipe.estimatedCalories}
+                formatNumber={formatNumber}
+                t={t}
+              />
+              {me.data && (
+                <Link to="/recipes/$recipeId" params={{ recipeId: recipe.id }}>
+                  {t('recipes.open')}
+                </Link>
+              )}
+            </article>
+          ))}
+        </div>
+      </QueryState>
+      {pageCursor && (
+        <button
+          type="button"
+          className="button secondary"
+          disabled={loadMore.isPending}
+          onClick={() => loadMore.mutate(pageCursor)}
+        >
+          {loadMore.isPending ? t('author.loadingMore') : t('author.loadMore')}
+        </button>
+      )}
+      {favorite.error && <ErrorText error={favorite.error} />}
+      {loadMore.error && <ErrorText error={loadMore.error} />}
     </Page>
   )
 }
@@ -680,9 +840,7 @@ function RecipeDetailPage() {
                 </Link>
               )}
             </div>
-            <p className="byline">
-              {t('common.byAuthor', { author: recipe.data.authorNickname ?? t('common.anonymousUser') })}
-            </p>
+            <AuthorByline recipe={recipe.data} />
             <RecipeMetadata
               difficulty={recipe.data.difficulty}
               estimatedCalories={recipe.data.estimatedCalories}
@@ -745,6 +903,46 @@ function RecipeDetailPage() {
         )}
       </QueryState>
     </Page>
+  )
+}
+
+function FavoriteAccountsSettings() {
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const favorites = useQuery({ queryKey: ['favorite-accounts'], queryFn: api.favoriteAccounts })
+  const remove = useMutation({
+    mutationFn: (handle: string) => api.favoriteAccount(handle, false),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['favorite-accounts'] }),
+        queryClient.invalidateQueries({ queryKey: ['recommendations'] }),
+      ])
+    },
+  })
+  return (
+    <section className="settings-section">
+      <h2>{t('author.favoriteAccounts')}</h2>
+      <QueryState query={favorites} empty={t('author.noFavorites')}>
+        <ul className="plain-list">
+          {favorites.data?.map((author) => (
+            <li key={author.handle} className="card-heading">
+              <Link to="/authors/$handle" params={{ handle: author.handle }}>
+                {author.nickname ?? t('common.anonymousUser')}
+              </Link>
+              <button
+                type="button"
+                className="button ghost"
+                disabled={remove.isPending}
+                onClick={() => remove.mutate(author.handle)}
+              >
+                {t('author.unfavorite')}
+              </button>
+            </li>
+          ))}
+        </ul>
+      </QueryState>
+      {remove.error && <ErrorText error={remove.error} />}
+    </section>
   )
 }
 
@@ -1755,6 +1953,7 @@ function SettingsPage() {
       {me.data && <LanguageSettings user={me.data} />}
       {me.data && <ProfileSettings user={me.data} />}
       <AccountSecuritySettings />
+      <FavoriteAccountsSettings />
       <QueryState query={settings} empty={t('settings.unavailable')}>
         {settings.data && <SettingsForm initial={settings.data} />}
       </QueryState>
@@ -2537,13 +2736,16 @@ function SettingsForm({ initial }: { initial: RecommendationSettings }) {
   return (
     <form className="settings-form" onSubmit={form.handleSubmit((value) => save.mutate(value))}>
       <label className="check-row">
-        <input type="checkbox" {...form.register('includeFavorites')} /> {t('sources.favorites')}
+        <input type="checkbox" {...form.register('includeFavoriteRecipes')} /> {t('sources.favoriteRecipes')}
       </label>
       <label className="check-row">
         <input type="checkbox" {...form.register('includeOwn')} /> {t('sources.own')}
       </label>
       <label className="check-row">
-        <input type="checkbox" {...form.register('includePublic')} /> {t('sources.public')}
+        <input type="checkbox" {...form.register('includeFavoriteAccounts')} /> {t('sources.favoriteAccounts')}
+      </label>
+      <label className="check-row">
+        <input type="checkbox" {...form.register('includeOtherPublic')} /> {t('sources.otherPublic')}
       </label>
       <label>
         {t('sources.recheck')}
@@ -2773,6 +2975,50 @@ function recommendationReasonLabel(
     case 'pantryOnlyBlocked':
       return t('recommend.reason.pantryOnly')
   }
+}
+
+function recommendationSourceLabel(source: RecommendationSource, t: Translate): string {
+  switch (source) {
+    case 'OWN':
+      return t('recommend.source.own')
+    case 'FAVORITE_RECIPE':
+      return t('recommend.source.favoriteRecipe')
+    case 'FAVORITE_ACCOUNT':
+      return t('recommend.source.favoriteAccount')
+    case 'OTHER_PUBLIC':
+      return t('recommend.source.otherPublic')
+  }
+}
+
+function recommendationIngredientReasonLabel(
+  reason: Recommendation['ingredientReasons'][number],
+  t: Translate,
+  formatDate: (value: string | Date) => string,
+): string {
+  if ((reason.code === 'EXPIRED' || reason.code === 'EXPIRES_TODAY') && reason.expiresOn) {
+    return t(`recommend.ingredient.${reason.code}`, {
+      ingredient: reason.ingredient,
+      date: formatDate(reason.expiresOn),
+    })
+  }
+  return t(`recommend.ingredient.${reason.code}`, { ingredient: reason.ingredient })
+}
+
+function recommendationScoreLabel(
+  recommendation: Recommendation,
+  t: Translate,
+  formatNumber: (value: number) => string,
+): string {
+  const score = recommendation.scoreBreakdown
+  return t('recommend.scoreSummary', {
+    total: formatNumber(recommendation.score),
+    status: formatNumber(score.statusBase),
+    source: formatNumber(score.source),
+    availability: formatNumber(score.availability),
+    desired: formatNumber(score.desired),
+    certainty: formatNumber(score.certainty),
+    simplicity: formatNumber(score.simplicity),
+  })
 }
 
 function importStatusLabel(status: ImportDraft['status'], t: Translate): string {

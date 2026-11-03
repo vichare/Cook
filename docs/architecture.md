@@ -33,7 +33,7 @@ Development login is selectable only with `AUTH_MODE=dev` and a loopback bind. P
 
 The recommendation engine is deterministic:
 
-1. Select candidates from enabled sources: favorites, owned recipes, and other users' public recipes.
+1. Select candidates from enabled sources: saved recipes, owned recipes, favorite accounts' current public recipes, and other users' public recipes.
 2. Apply hard filters before scoring: excluded ingredients remove a recipe; every required ingredient must be present in the recipe.
 3. Classify each ingredient from the current user's pantry:
    - recently confirmed, unexpired `have`: available;
@@ -41,9 +41,12 @@ The recommendation engine is deterministic:
    - stale `have` or `unknown`: verify;
    - absent or `out`: missing.
 4. Classify recipes as `READY`, `VERIFY`, `SHOP`, or `BLOCKED`. Pantry-only mode marks recipes with any missing or not-yet-confirmed ingredient as `BLOCKED`.
-5. Sort by status, preferred-ingredient matches, confirmed ingredient count, then title.
+5. Score on a fixed 0–999 scale. Status bases (`READY` 750, `VERIFY` 500, `SHOP` 250, `BLOCKED` 0) dominate all extras. Source contributes at most 100, availability 80, desired ingredients 40, certainty 20, and simplicity 9.
+6. Sort by status, score descending, normalized title, then stable recipe ID.
 
-Responses include available, verification, and missing lists plus human-readable reasons.
+Responses include available, verification, and missing lists, structured ingredient reason codes, matched sources, applied controls, and a localized-client score breakdown. Saved-recipe and favorite-account overlap preserves both source labels but contributes only one 75-point favorite source score.
+
+Each account has an immutable random 128-bit public handle unrelated to its internal ID, email, or authentication identities. Public author profiles expose only that handle, the opt-in nullable nickname, and keyset-paginated public recipes. Favorite-account relationships are private and dynamically include the author's current and future public recipes; unpublishing immediately removes a recipe from that source.
 
 Ingredient matching uses canonical identities selected by the user, with normalized-name fallback for existing or unbound entries. The authoritative normalization pipeline performs Unicode NFKC, Unicode lowercasing where applicable, whitespace normalization, trimming, and collapse. It also splits pasted comma, full-width comma, Chinese enumeration comma, semicolon, full-width semicolon, and newline lists. Owner-confirmed aliases may participate in hard matching; bounded fuzzy matching is limited to input suggestions and is never applied automatically.
 

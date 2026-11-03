@@ -10,9 +10,11 @@ import type {
   AuthConfig,
   EmailOtpChallenge,
   IngredientSuggestion,
+  FavoriteAuthor,
   PasskeySummary,
   SecuritySettings,
   ShoppingItem,
+  PublicAuthorProfile,
   User,
 } from './types'
 
@@ -111,6 +113,15 @@ export const api = {
     request<void>(`/api/settings/security/passkeys/${id}`, { method: 'DELETE' }),
   recipes: () => request<Recipe[]>('/api/recipes'),
   recipe: (id: string) => request<Recipe>(`/api/recipes/${id}`),
+  authorProfile: (handle: string, cursor?: string) =>
+    request<PublicAuthorProfile>(
+      `/api/authors/${encodeURIComponent(handle)}${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`,
+    ),
+  favoriteAccounts: () => request<FavoriteAuthor[]>('/api/favorite-accounts'),
+  favoriteAccount: (handle: string, favorite: boolean) =>
+    request<void>(`/api/authors/${encodeURIComponent(handle)}/favorite`, {
+      method: favorite ? 'PUT' : 'DELETE',
+    }),
   saveRecipe: (
     value: Pick<
       Recipe,

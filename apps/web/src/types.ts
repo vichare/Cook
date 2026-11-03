@@ -58,6 +58,7 @@ export interface Recipe {
   id: string
   version: number
   isOwner: boolean
+  authorHandle: string
   authorNickname: string | null
   title: string
   description: string
@@ -67,6 +68,7 @@ export interface Recipe {
   estimatedCalories: number | null
   ingredients: Ingredient[]
   isFavorite: boolean
+  isFavoriteAuthor: boolean
   coverImage: RecipeImage | null
   source: RecipeSource | null
 }
@@ -119,9 +121,10 @@ export interface ShoppingItem {
 }
 
 export interface RecommendationSettings {
-  includeFavorites: boolean
+  includeFavoriteRecipes: boolean
   includeOwn: boolean
-  includePublic: boolean
+  includeFavoriteAccounts: boolean
+  includeOtherPublic: boolean
   verificationDays: number
 }
 
@@ -134,6 +137,46 @@ export interface Recommendation {
   reasons: string[]
   reasonDetails: RecommendationReason[]
   score: number
+  scoreBreakdown: {
+    statusBase: number
+    source: number
+    availability: number
+    desired: number
+    certainty: number
+    simplicity: number
+  }
+  primarySource: RecommendationSource
+  matchedSources: RecommendationSource[]
+  desiredMatches: string[]
+  ingredientReasons: Array<{
+    ingredient: string
+    code: 'AVAILABLE' | 'UNKNOWN' | 'STALE' | 'EXPIRES_TODAY' | 'EXPIRED' | 'OUT' | 'MISSING'
+    expiresOn: string | null
+  }>
+  appliedControls: {
+    preferred: string[]
+    required: string[]
+    excluded: string[]
+    pantryOnly: boolean
+    includeOwn: boolean
+    includeFavoriteRecipes: boolean
+    includeFavoriteAccounts: boolean
+    includeOtherPublic: boolean
+  }
+}
+
+export type RecommendationSource = 'OWN' | 'FAVORITE_RECIPE' | 'FAVORITE_ACCOUNT' | 'OTHER_PUBLIC'
+
+export interface PublicAuthorProfile {
+  handle: string
+  nickname: string | null
+  recipes: Recipe[]
+  nextCursor: string | null
+}
+
+export interface FavoriteAuthor {
+  handle: string
+  nickname: string | null
 }
 
 export type RecommendationReason =

@@ -427,6 +427,59 @@ paths:
       responses:
         "201": { description: Updated private shopping list }
         "404": { description: Recipe or ingredient is not visible or does not match the recipe }
+  /api/authors/{handle}:
+    parameters:
+      - in: path
+        name: handle
+        required: true
+        schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+    get:
+      description: Public author profile containing only the immutable random handle, optional public nickname, and public recipes. Authentication identities and internal user IDs are never returned.
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        "200":
+          description: Stable keyset-paginated public profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicAuthorProfile" }
+        "404": { description: Unknown author handle }
+  /api/authors/{handle}/favorite:
+    parameters:
+      - in: path
+        name: handle
+        required: true
+        schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+    put:
+      description: Privately favorite another account. Self-favorites are rejected.
+      security:
+        - sessionCookie: []
+      responses:
+        "204": { description: Favorite relationship exists }
+        "400": { description: Self-favorite rejected }
+        "404": { description: Unknown author handle }
+    delete:
+      description: Remove the current account's private favorite relationship.
+      security:
+        - sessionCookie: []
+      responses:
+        "204": { description: Favorite relationship removed or absent }
+        "404": { description: Unknown author handle }
+  /api/favorite-accounts:
+    get:
+      description: Lists only the current account's favorite public authors.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Favorite authors
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FavoriteAuthor" }
   /api/ingredients/suggestions:
     get:
       description: Returns ranked ingredient candidates visible to the current account. Fuzzy results are advisory and are never applied to hard recommendation matching without explicit selection.
@@ -1053,15 +1106,20 @@ components:
       allOf:
         - $ref: "#/components/schemas/RecipeInput"
         - type: object
-          required: [id, version, isOwner, authorNickname, difficulty, estimatedCalories, isFavorite, source, coverImage]
+          required: [id, version, isOwner, authorHandle, authorNickname, difficulty, estimatedCalories, isFavorite, isFavoriteAuthor, source, coverImage]
           properties:
             id: { type: string, format: uuid }
             version: { type: integer, minimum: 1 }
             isOwner: { type: boolean }
+            authorHandle:
+              type: string
+              pattern: "^[0-9a-f]{32}$"
+              description: Immutable random public handle unrelated to internal IDs or authentication identities.
             authorNickname:
               type: [string, "null"]
               description: Opt-in public nickname. Null must be rendered as the locale's anonymous label.
             isFavorite: { type: boolean }
+            isFavoriteAuthor: { type: boolean }
             source:
               oneOf:
                 - $ref: "#/components/schemas/RecipeSource"
@@ -1200,11 +1258,12 @@ components:
         reason: { type: string, enum: [exact, alias, prefix, substring, similar] }
     RecommendationSettings:
       type: object
-      required: [includeFavorites, includeOwn, includePublic, verificationDays]
+      required: [includeFavoriteRecipes, includeOwn, includeFavoriteAccounts, includeOtherPublic, verificationDays]
       properties:
-        includeFavorites: { type: boolean }
+        includeFavoriteRecipes: { type: boolean }
         includeOwn: { type: boolean }
-        includePublic: { type: boolean }
+        includeFavoriteAccounts: { type: boolean, default: true }
+        includeOtherPublic: { type: boolean }
         verificationDays: { type: integer, minimum: 1, maximum: 90 }
     RecommendationRequest:
       type: object
@@ -1219,7 +1278,7 @@ components:
           description: User-local calendar date used for date-only expiration classification. The server UTC date is used when omitted.
     Recommendation:
       type: object
-      required: [recipe, status, available, verify, missing, reasons, reasonDetails, score]
+      required: [recipe, status, available, verify, missing, reasons, reasonDetails, score, scoreBreakdown, primarySource, matchedSources, desiredMatches, ingredientReasons, appliedControls]
       properties:
         recipe: { $ref: "#/components/schemas/Recipe" }
         status: { type: string, enum: [READY, VERIFY, SHOP, BLOCKED] }
@@ -1262,6 +1321,65 @@ components:
                 properties:
                   code: { const: pantryOnlyBlocked }
         score: { type: integer }
+        scoreBreakdown:
+          type: object
+          required: [statusBase, source, availability, desired, certainty, simplicity]
+          properties:
+            statusBase: { type: integer, enum: [0, 250, 500, 750] }
+            source: { type: integer, minimum: 0, maximum: 100 }
+            availability: { type: integer, minimum: 0, maximum: 80 }
+            desired: { type: integer, minimum: 0, maximum: 40 }
+            certainty: { type: integer, minimum: 0, maximum: 20 }
+            simplicity: { type: integer, minimum: 0, maximum: 9 }
+        primarySource: { $ref: "#/components/schemas/RecommendationSource" }
+        matchedSources:
+          type: array
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/RecommendationSource" }
+        desiredMatches: { type: array, items: { type: string } }
+        ingredientReasons:
+          type: array
+          items:
+            type: object
+            required: [ingredient, code, expiresOn]
+            properties:
+              ingredient: { type: string }
+              code: { type: string, enum: [AVAILABLE, UNKNOWN, STALE, EXPIRES_TODAY, EXPIRED, OUT, MISSING] }
+              expiresOn: { type: [string, "null"], format: date }
+        appliedControls:
+          type: object
+          required: [preferred, required, excluded, pantryOnly, includeOwn, includeFavoriteRecipes, includeFavoriteAccounts, includeOtherPublic]
+          properties:
+            preferred: { type: array, items: { type: string } }
+            required: { type: array, items: { type: string } }
+            excluded: { type: array, items: { type: string } }
+            pantryOnly: { type: boolean }
+            includeOwn: { type: boolean }
+            includeFavoriteRecipes: { type: boolean }
+            includeFavoriteAccounts: { type: boolean }
+            includeOtherPublic: { type: boolean }
+    RecommendationSource:
+      type: string
+      enum: [OWN, FAVORITE_RECIPE, FAVORITE_ACCOUNT, OTHER_PUBLIC]
+    PublicAuthorProfile:
+      type: object
+      required: [handle, nickname, recipes, nextCursor]
+      properties:
+        handle: { type: string, pattern: "^[0-9a-f]{32}$" }
+        nickname:
+          type: [string, "null"]
+          description: Opt-in public nickname. Null is rendered as the viewer locale's anonymous label.
+        recipes:
+          type: array
+          maxItems: 20
+          items: { $ref: "#/components/schemas/Recipe" }
+        nextCursor: { type: [string, "null"] }
+    FavoriteAuthor:
+      type: object
+      required: [handle, nickname]
+      properties:
+        handle: { type: string, pattern: "^[0-9a-f]{32}$" }
+        nickname: { type: [string, "null"] }
     CreateImportTokenInput:
       type: object
       additionalProperties: false
