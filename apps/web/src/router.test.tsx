@@ -5,11 +5,29 @@ import {
   AccountSecuritySettings,
   EmailOtpLogin,
   ExpirationEditor,
+  LanguageSettings,
   PantryConfirmation,
   ProfileSetup,
 } from './router'
+import { LocaleProvider, type Locale } from './i18n'
 
-const { requestEmailLink, requestEmailOtp, saveProfile, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
+const storedLocale = { value: null as string | null }
+const testStorage = {
+  getItem: () => storedLocale.value,
+  setItem: (_key: string, value: string) => {
+    storedLocale.value = value
+  },
+}
+
+function Providers({ children, locale = 'en' }: { children: React.ReactNode; locale?: Locale }) {
+  return (
+    <LocaleProvider initialLocale={locale} storage={testStorage}>
+      <QueryClientProvider client={new QueryClient()}>{children}</QueryClientProvider>
+    </LocaleProvider>
+  )
+}
+
+const { requestEmailLink, requestEmailOtp, saveLocale, saveProfile, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
   saveProfile: vi.fn().mockImplementation((nickname: string | null) =>
     Promise.resolve({
       id: 'user',
@@ -17,6 +35,17 @@ const { requestEmailLink, requestEmailOtp, saveProfile, securitySettings, verify
       displayName: 'Google Name',
       nickname,
       onboardingCompleted: true,
+      locale: 'en',
+    }),
+  ),
+  saveLocale: vi.fn().mockImplementation((locale: 'en' | 'zh-CN') =>
+    Promise.resolve({
+      id: 'user',
+      email: 'private@example.test',
+      displayName: 'Google Name',
+      nickname: null,
+      onboardingCompleted: true,
+      locale,
     }),
   ),
   requestEmailOtp: vi.fn().mockResolvedValue({
@@ -30,6 +59,7 @@ const { requestEmailLink, requestEmailOtp, saveProfile, securitySettings, verify
     displayName: 'Private',
     nickname: null,
     onboardingCompleted: false,
+    locale: 'en' as const,
   }),
   securitySettings: vi.fn().mockResolvedValue({ linkedEmails: [], passkeys: [] }),
   requestEmailLink: vi.fn().mockResolvedValue({
@@ -51,6 +81,7 @@ vi.mock('./api', async () => {
       ...actual.api,
       savePantry: vi.fn().mockResolvedValue([]),
       saveProfile,
+      saveLocale,
       requestEmailOtp,
       verifyEmailOtp,
       securitySettings,
@@ -72,39 +103,77 @@ describe('profile setup', () => {
     displayName: 'Google Name',
     nickname: null,
     onboardingCompleted: false,
+    locale: 'en' as const,
   }
 
   it('defaults to locale-rendered anonymous state without publishing the Google name', async () => {
     saveProfile.mockClear()
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <Providers>
         <ProfileSetup user={user} />
-      </QueryClientProvider>,
+      </Providers>,
     )
     expect(screen.getByLabelText('Anonymous user (default)')).toBeChecked()
     fireEvent.click(screen.getByRole('button', { name: 'Save public profile' }))
     await waitFor(() => expect(saveProfile).toHaveBeenCalledWith(null))
   })
 
+  describe('language settings', () => {
+    it('switches immediately and persists the account locale', async () => {
+      saveLocale.mockClear()
+      const user = {
+        id: 'user',
+        email: 'private@example.test',
+        displayName: 'Google Name',
+        nickname: null,
+        onboardingCompleted: true,
+        locale: 'en' as const,
+      }
+      render(
+        <Providers>
+          <LanguageSettings user={user} />
+        </Providers>,
+      )
+      fireEvent.change(screen.getByLabelText('Interface language'), { target: { value: 'zh-CN' } })
+      expect(await screen.findByText('语言已保存。')).toBeVisible()
+      expect(document.documentElement.lang).toBe('zh-CN')
+      expect(saveLocale).toHaveBeenCalledWith('zh-CN')
+      expect(storedLocale.value).toBe('zh-CN')
+    })
+  })
+
   it('copies the Google display name only after explicit selection', async () => {
     saveProfile.mockClear()
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <Providers>
         <ProfileSetup user={user} />
-      </QueryClientProvider>,
+      </Providers>,
     )
     fireEvent.click(screen.getByLabelText('Use “Google Name” publicly'))
     fireEvent.click(screen.getByRole('button', { name: 'Save public profile' }))
     await waitFor(() => expect(saveProfile).toHaveBeenCalledWith('Google Name'))
+  })
+
+  it('renders the semantic anonymous choice in Simplified Chinese without changing its stored value', async () => {
+    saveProfile.mockClear()
+    render(
+      <Providers locale="zh-CN">
+        <ProfileSetup user={user} />
+      </Providers>,
+    )
+    expect(screen.getByLabelText('匿名用户（默认）')).toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: '保存公开资料' }))
+    await waitFor(() => expect(saveProfile).toHaveBeenCalledWith(null))
+    expect(document.documentElement.lang).toBe('zh-CN')
   })
 })
 
 describe('pantry confirmation', () => {
   it('supports skipping and clears skipped answers', () => {
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <Providers>
         <PantryConfirmation open onOpenChange={() => undefined} names={['Egg', 'Milk', 'Rice']} />
-      </QueryClientProvider>,
+      </Providers>,
     )
     expect(screen.getByRole('heading', { name: 'Quick pantry check' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Skip for now' })).toBeVisible()
@@ -119,7 +188,9 @@ describe('pantry confirmation', () => {
     it('offers large explicit shortcuts and can clear the date', () => {
       const onChange = vi.fn()
       render(
-        <ExpirationEditor value="2026-01-31" onChange={onChange} now={new Date(2026, 0, 31, 12)} />,
+        <Providers>
+          <ExpirationEditor value="2026-01-31" onChange={onChange} now={new Date(2026, 0, 31, 12)} />
+        </Providers>,
       )
       expect(screen.getByRole('button', { name: 'Today' })).toHaveAttribute('aria-pressed', 'true')
       fireEvent.click(screen.getByRole('button', { name: 'One month' }))
@@ -130,7 +201,9 @@ describe('pantry confirmation', () => {
 
     it('warns before saving a past date without clearing or changing pantry status', () => {
       render(
-        <ExpirationEditor value="2026-01-30" onChange={() => undefined} now={new Date(2026, 0, 31, 12)} />,
+        <Providers>
+          <ExpirationEditor value="2026-01-30" onChange={() => undefined} now={new Date(2026, 0, 31, 12)} />
+        </Providers>,
       )
       expect(screen.getByRole('alert')).toHaveTextContent(
         'This date is in the past. You can still save it',
@@ -146,9 +219,9 @@ describe('email OTP sign-in', () => {
     verifyEmailOtp.mockClear()
     const onLogin = vi.fn()
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <Providers>
         <EmailOtpLogin onLogin={onLogin} passkeyEnabled={false} />
-      </QueryClientProvider>,
+      </Providers>,
     )
     fireEvent.change(screen.getByLabelText('Email address'), { target: { value: 'user@example.test' } })
     fireEvent.click(screen.getByRole('button', { name: 'Email me a code' }))
@@ -166,9 +239,9 @@ describe('account security', () => {
   it('links email explicitly and keeps passkey registration disabled until linked', async () => {
     securitySettings.mockResolvedValueOnce({ linkedEmails: [], passkeys: [] })
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <Providers>
         <AccountSecuritySettings />
-      </QueryClientProvider>,
+      </Providers>,
     )
     expect(await screen.findByRole('button', { name: 'Register passkey' })).toBeDisabled()
     fireEvent.change(screen.getByLabelText('Email address'), { target: { value: 'linked@example.test' } })

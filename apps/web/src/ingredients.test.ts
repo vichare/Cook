@@ -6,6 +6,13 @@ import {
   oneMonthAfter,
   splitIngredientList,
 } from './ingredients'
+import { formatDateValue, translateMessage } from './i18n'
+
+const i18n = {
+  t: (key: Parameters<typeof translateMessage>[1], variables?: Parameters<typeof translateMessage>[2]) =>
+    translateMessage('en', key, variables),
+  formatDate: (value: string | Date) => formatDateValue('en', value),
+}
 
 describe('ingredient input helpers', () => {
   it('mirrors server NFKC normalization and delimiter splitting', () => {
@@ -24,10 +31,10 @@ describe('ingredient input helpers', () => {
   })
 
   it('describes expiration status with text rather than color alone', () => {
-    expect(expirationLabel(null, '2026-11-04')).toBe('No expiration date')
-    expect(expirationLabel('2026-11-03', '2026-11-04')).toContain('Expired')
-    expect(expirationLabel('2026-11-04', '2026-11-04')).toContain('Expires today')
-    expect(expirationLabel('2026-11-05', '2026-11-04')).toContain('Expires in 1 day')
-    expect(expirationLabel('2026-12-01', '2026-11-04')).toContain('2026-12-01')
+    expect(expirationLabel(null, i18n, '2026-11-04')).toBe('No expiration date')
+    expect(expirationLabel('2026-11-03', i18n, '2026-11-04')).toContain('Expired')
+    expect(expirationLabel('2026-11-04', i18n, '2026-11-04')).toContain('Expires today')
+    expect(expirationLabel('2026-11-05', i18n, '2026-11-04')).toContain('1 day')
+    expect(expirationLabel('2026-12-01', i18n, '2026-11-04')).toContain('Dec 1, 2026')
   })
 })

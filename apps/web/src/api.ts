@@ -18,6 +18,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public readonly status: number,
+    public readonly code: string,
   ) {
     super(message)
   }
@@ -33,8 +34,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { message?: string } | null
-    throw new ApiError(body?.message ?? `Request failed (${response.status})`, response.status)
+    const body = (await response.json().catch(() => null)) as { error?: string; message?: string } | null
+    throw new ApiError(
+      body?.message ?? `Request failed (${response.status})`,
+      response.status,
+      body?.error ?? 'unknown_error',
+    )
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
@@ -73,6 +78,11 @@ export const api = {
     request<User>('/api/settings/profile', {
       method: 'PUT',
       body: JSON.stringify({ nickname }),
+    }),
+  saveLocale: (locale: 'en' | 'zh-CN') =>
+    request<User>('/api/settings/locale', {
+      method: 'PUT',
+      body: JSON.stringify({ locale }),
     }),
   securitySettings: () => request<SecuritySettings>('/api/settings/security'),
   requestEmailLink: (email: string) =>

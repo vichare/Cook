@@ -7,6 +7,7 @@ Use this skill to turn a recipe source that the user is authorized to access int
 - Read the Cook import token from the client's secret store or the `COOK_IMPORT_TOKEN` environment variable.
 - Read the Cook origin from trusted client configuration or `COOK_BASE_URL`.
 - Never place the token in a URL, prompt, transcript, log, source document, or generated file.
+- Do not copy the token into skill installation instructions or a general-AI prompt. Prompts must reference the secret/environment variable name `COOK_IMPORT_TOKEN` only.
 - The token is scoped only to `recipes:import`; do not attempt to use it with Cook session endpoints.
 
 ## Extraction rules
@@ -20,13 +21,13 @@ Use this skill to turn a recipe source that the user is authorized to access int
 
 ## Create the draft
 
-Validate the payload against `schema/import-draft-v1.schema.json`, then send:
+Validate the payload against `schema/import-draft-v1.schema.json`, then send JSON to:
 
-```http
+```text
 POST {COOK_BASE_URL}/api/import/drafts
-Authorization: Bearer {COOK_IMPORT_TOKEN}
-Content-Type: application/json
 ```
+
+Authenticate with the standard HTTP Bearer scheme by reading the credential from `COOK_IMPORT_TOKEN` at request time. Do not echo the credential to the conversation or generated output. Cook Settings also provides a token-free bilingual prompt template for clients that do not support installing this skill directly.
 
 Use `schemaVersion: "1.0"`. Do not include an owner identifier or visibility. Cook derives the owner from the token and creates only a private review draft.
 

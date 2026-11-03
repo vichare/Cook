@@ -1,4 +1,5 @@
 import type { IngredientReference } from './types'
+import type { Translate } from './i18n'
 
 export function normalizeIngredient(value: string): string {
   return value
@@ -47,10 +48,14 @@ export function oneMonthAfter(from = new Date()): string {
   return localDateValue(date)
 }
 
-export function expirationLabel(expiresOn: string | null, today = localDateValue(new Date())): string {
-  if (!expiresOn) return 'No expiration date'
-  if (expiresOn < today) return `⚠ Expired ${expiresOn}`
-  if (expiresOn === today) return '⚠ Expires today'
+export function expirationLabel(
+  expiresOn: string | null,
+  i18n: { t: Translate; formatDate: (value: string | Date) => string },
+  today = localDateValue(new Date()),
+): string {
+  if (!expiresOn) return i18n.t('expiry.none')
+  if (expiresOn < today) return i18n.t('expiry.expired', { date: i18n.formatDate(expiresOn) })
+  if (expiresOn === today) return i18n.t('expiry.expiresToday')
   const [todayYear, todayMonth, todayDay] = today.split('-').map(Number)
   const [expiryYear, expiryMonth, expiryDay] = expiresOn.split('-').map(Number)
   const days = Math.round(
@@ -58,6 +63,11 @@ export function expirationLabel(expiresOn: string | null, today = localDateValue
       Date.UTC(todayYear, todayMonth - 1, todayDay)) /
       86_400_000,
   )
-  if (days <= 7) return `◷ Expires in ${days} day${days === 1 ? '' : 's'} (${expiresOn})`
-  return `◷ Expires on ${expiresOn}`
+  if (days <= 7) {
+    return i18n.t('expiry.expiresIn', {
+      days: days === 1 ? i18n.t('common.day') : i18n.t('common.days', { count: days }),
+      date: i18n.formatDate(expiresOn),
+    })
+  }
+  return i18n.t('expiry.expiresOn', { date: i18n.formatDate(expiresOn) })
 }

@@ -20,6 +20,7 @@ import type {
   PantryStatus,
   Recipe,
   RecommendationSettings,
+  RecommendationReason,
   SecuritySettings as SecuritySettingsData,
   User,
 } from './types'
@@ -32,6 +33,7 @@ import {
   splitIngredientList,
 } from './ingredients'
 import { createPasskey, getPasskey } from './webauthn'
+import { useI18n, type Locale, type Translate } from './i18n'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -39,7 +41,7 @@ interface RouterContext {
 
 const rootRoute = createRootRouteWithContext<RouterContext>()({
   component: Root,
-  notFoundComponent: () => <StatePanel title="Page not found" detail="Choose a page from the navigation." />,
+  notFoundComponent: NotFoundPage,
 })
 
 const indexRoute = createRoute({
@@ -116,12 +118,30 @@ declare module '@tanstack/react-router' {
 
 function Root() {
   const queryClient = useQueryClient()
+  const { locale, setLocale, t } = useI18n()
   const me = useQuery({ queryKey: ['me'], queryFn: api.me })
-  if (me.isLoading) return <StatePanel title="Opening your kitchen…" detail="Loading your private workspace." />
+  const initializeLocale = useMutation({
+    mutationFn: api.saveLocale,
+    onSuccess: (user) => queryClient.setQueryData(['me'], user),
+  })
+  useEffect(() => {
+    if (!me.data) return
+    if (me.data.locale) {
+      if (me.data.locale !== locale) setLocale(me.data.locale)
+      return
+    }
+    if (!initializeLocale.isPending && !initializeLocale.isSuccess && !initializeLocale.error) {
+      initializeLocale.mutate(locale)
+    }
+  }, [initializeLocale, locale, me.data, setLocale])
+  if (me.isLoading) return <StatePanel title={t('app.openingKitchen')} detail={t('app.loadingWorkspace')} />
   if (me.error instanceof ApiError && me.error.status === 401) {
     return <Login onLogin={() => void queryClient.invalidateQueries({ queryKey: ['me'] })} />
   }
-  if (me.error) return <StatePanel title="Cook could not start" detail={errorMessage(me.error)} />
+  if (me.error) return <StatePanel title={t('app.startFailed')} detail={errorMessage(me.error, t)} />
+  if (initializeLocale.error) {
+    return <StatePanel title={t('app.startFailed')} detail={errorMessage(initializeLocale.error, t)} />
+  }
 
   return (
     <div className="app-shell">
@@ -129,12 +149,12 @@ function Root() {
         <Link to="/" className="brand">
           Cook
         </Link>
-        <nav aria-label="Primary">
-          <Link to="/recommendations">Recommend</Link>
-          <Link to="/recipes">Recipes</Link>
-          <Link to="/pantry">Pantry</Link>
-          <Link to="/imports">Imports</Link>
-          <Link to="/settings">Settings</Link>
+        <nav aria-label={t('app.primaryNavigation')}>
+          <Link to="/recommendations">{t('app.recommend')}</Link>
+          <Link to="/recipes">{t('app.recipes')}</Link>
+          <Link to="/pantry">{t('app.pantry')}</Link>
+          <Link to="/imports">{t('app.imports')}</Link>
+          <Link to="/settings">{t('app.settings')}</Link>
         </nav>
         <button
           className="button ghost"
@@ -142,7 +162,7 @@ function Root() {
             void api.logout().then(() => queryClient.setQueryData(['me'], undefined)).finally(() => location.reload())
           }
         >
-          Sign out
+          {t('app.signOut')}
         </button>
       </header>
       <main id="main">
@@ -153,18 +173,24 @@ function Root() {
   )
 }
 
+function NotFoundPage() {
+  const { t } = useI18n()
+  return <StatePanel title={t('app.pageNotFound')} detail={t('app.pageNotFoundDetail')} />
+}
+
 function Login({ onLogin }: { onLogin: () => void }) {
+  const { t } = useI18n()
   const [name, setName] = useState('Demo Cook')
   const config = useQuery({ queryKey: ['auth-config'], queryFn: api.authConfig })
   const login = useMutation({ mutationFn: api.devLogin, onSuccess: onLogin })
-  if (config.isLoading) return <StatePanel title="Loading sign-in…" detail="Checking the available sign-in method." />
-  if (config.error) return <StatePanel title="Sign-in unavailable" detail={errorMessage(config.error)} />
+  if (config.isLoading) return <StatePanel title={t('login.loading')} detail={t('login.checking')} />
+  if (config.error) return <StatePanel title={t('login.unavailable')} detail={errorMessage(config.error, t)} />
   return (
     <main id="main" className="login">
       <section className="hero-card">
-        <p className="eyebrow">Private pantry, practical dinner</p>
-        <h1>Cook with what you already have.</h1>
-        <p>Save recipes, track pantry confidence, and get deterministic recommendations with reasons.</p>
+        <p className="eyebrow">{t('login.eyebrow')}</p>
+        <h1>{t('login.title')}</h1>
+        <p>{t('login.intro')}</p>
         {config.data?.mode === 'development' && (
           <form
             onSubmit={(event) => {
@@ -173,11 +199,11 @@ function Login({ onLogin }: { onLogin: () => void }) {
             }}
           >
             <label>
-              Development display name
+              {t('login.devName')}
               <input value={name} onChange={(event) => setName(event.target.value)} required />
             </label>
             <button className="button primary" disabled={login.isPending}>
-              {login.isPending ? 'Signing in…' : 'Enter development kitchen'}
+              {login.isPending ? t('login.signingIn') : t('login.enterDev')}
             </button>
             {login.error && <ErrorText error={login.error} />}
           </form>
@@ -185,11 +211,11 @@ function Login({ onLogin }: { onLogin: () => void }) {
         {config.data?.emailOtp && <EmailOtpLogin onLogin={onLogin} passkeyEnabled={config.data.passkey} />}
         {config.data?.google && (
           <a className="button secondary" href="/api/auth/google/start">
-            Continue with Google
+            {t('login.google')}
           </a>
         )}
         <small>
-          Email codes and passkeys use Cook's Host-only session. Google authorization codes and provider tokens never reach JavaScript.
+          {t('login.securityNote')}
         </small>
       </section>
     </main>
@@ -203,6 +229,7 @@ export function EmailOtpLogin({
   onLogin: () => void
   passkeyEnabled: boolean
 }) {
+  const { formatNumber, t } = useI18n()
   const [email, setEmail] = useState('')
   const [code, setCode] = useState('')
   const [challenge, setChallenge] = useState<Awaited<ReturnType<typeof api.requestEmailOtp>> | null>(null)
@@ -236,9 +263,9 @@ export function EmailOtpLogin({
     : 0
   return (
     <section className="auth-method">
-      <h2>Sign in with email</h2>
+      <h2>{t('otp.title')}</h2>
       <label>
-        Email address
+        {t('otp.email')}
         <input
           type="email"
           autoComplete="email"
@@ -250,19 +277,19 @@ export function EmailOtpLogin({
       {!challenge ? (
         <div className="auth-actions">
           <button className="button primary" disabled={!email || request.isPending} onClick={() => request.mutate()}>
-            Email me a code
+            {t('otp.sendCode')}
           </button>
           {passkeyEnabled && (
             <button className="button secondary" disabled={!email || passkey.isPending} onClick={() => passkey.mutate()}>
-              Sign in with a passkey
+              {t('otp.passkey')}
             </button>
           )}
         </div>
       ) : (
         <>
-          <p role="status">If delivery is available, a six-digit code has been sent. Enter it below.</p>
+          <p role="status">{t('otp.genericSent')}</p>
           <label>
-            Verification code
+            {t('otp.code')}
             <input
               value={code}
               onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
@@ -279,17 +306,19 @@ export function EmailOtpLogin({
               disabled={code.length !== 6 || verify.isPending}
               onClick={() => verify.mutate()}
             >
-              Verify and sign in
+              {t('otp.verify')}
             </button>
             <button
               className="button ghost"
               disabled={resendSeconds > 0 || request.isPending}
               onClick={() => request.mutate()}
             >
-              {resendSeconds > 0 ? `Resend in ${resendSeconds}s` : 'Resend code'}
+              {resendSeconds > 0
+                ? t('otp.resendIn', { seconds: formatNumber(resendSeconds) })
+                : t('otp.resend')}
             </button>
             <button className="button ghost" onClick={() => setChallenge(null)}>
-              Use another email
+              {t('otp.otherEmail')}
             </button>
           </div>
         </>
@@ -302,27 +331,31 @@ export function EmailOtpLogin({
 }
 
 function HomePage() {
+  const { formatNumber, t } = useI18n()
   const recipes = useQuery({ queryKey: ['recipes'], queryFn: api.recipes })
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
   return (
-    <Page title="Your kitchen" intro="Move from uncertain pantry notes to an explainable meal choice.">
+    <Page title={t('home.title')} intro={t('home.intro')}>
       <div className="metric-grid">
-        <Metric label="Visible recipes" value={recipes.data?.length ?? '—'} />
-        <Metric label="Pantry items" value={pantry.data?.length ?? '—'} />
-        <Metric label="Confirmed available" value={pantry.data?.filter((item) => item.status === 'have').length ?? '—'} />
+        <Metric label={t('home.visibleRecipes')} value={recipes.data ? formatNumber(recipes.data.length) : '—'} />
+        <Metric label={t('home.pantryItems')} value={pantry.data ? formatNumber(pantry.data.length) : '—'} />
+        <Metric
+          label={t('home.confirmedAvailable')}
+          value={pantry.data ? formatNumber(pantry.data.filter((item) => item.status === 'have').length) : '—'}
+        />
       </div>
       <div className="action-grid">
         <Link className="action-card" to="/recommendations">
-          <strong>Find something to cook</strong>
-          <span>Filter by ingredients and see READY, VERIFY, SHOP, or BLOCKED.</span>
+          <strong>{t('home.findMeal')}</strong>
+          <span>{t('home.findMealDetail')}</span>
         </Link>
         <Link className="action-card" to="/pantry">
-          <strong>Update pantry confidence</strong>
-          <span>Mark items as available, used up, or uncertain.</span>
+          <strong>{t('home.updatePantry')}</strong>
+          <span>{t('home.updatePantryDetail')}</span>
         </Link>
         <Link className="action-card" to="/recipes/new">
-          <strong>Add a recipe</strong>
-          <span>Recipes are private until you explicitly publish them.</span>
+          <strong>{t('home.addRecipe')}</strong>
+          <span>{t('home.addRecipeDetail')}</span>
         </Link>
       </div>
     </Page>
@@ -330,6 +363,7 @@ function HomePage() {
 }
 
 function RecommendationsPage() {
+  const { formatDate, formatNumber, t } = useI18n()
   const [filters, setFilters] = useState({
     preferred: [] as IngredientReference[],
     required: [] as IngredientReference[],
@@ -354,7 +388,7 @@ function RecommendationsPage() {
   const [confirmOpen, setConfirmOpen] = useState(false)
 
   return (
-    <Page title="Recommendation workbench" intro="Hard filters run before deterministic scoring; every result explains itself.">
+    <Page title={t('recommend.title')} intro={t('recommend.intro')}>
       <form
         className="filter-panel"
         onSubmit={(event) => {
@@ -363,17 +397,17 @@ function RecommendationsPage() {
         }}
       >
         <IngredientFilterInput
-          label="Hope to use"
+          label={t('recommend.hopeToUse')}
           values={filters.preferred}
           onChange={(preferred) => setFilters({ ...filters, preferred })}
         />
         <IngredientFilterInput
-          label="Must use"
+          label={t('recommend.mustUse')}
           values={filters.required}
           onChange={(required) => setFilters({ ...filters, required })}
         />
         <IngredientFilterInput
-          label="Do not use"
+          label={t('recommend.doNotUse')}
           values={filters.excluded}
           onChange={(excluded) => setFilters({ ...filters, excluded })}
         />
@@ -383,35 +417,39 @@ function RecommendationsPage() {
             checked={filters.pantryOnly}
             onChange={(event) => setFilters({ ...filters, pantryOnly: event.target.checked })}
           />
-          Only use pantry ingredients
+          {t('recommend.pantryOnly')}
         </label>
-        <button className="button primary">Refresh recommendations</button>
+        <button className="button primary">{t('recommend.refresh')}</button>
       </form>
       {verifyNames.length > 0 && (
         <div className="notice">
-          <span>{verifyNames.length} ingredient(s) need a quick check.</span>
+          <span>{t('recommend.checkCount', { count: formatNumber(verifyNames.length) })}</span>
           <button className="button secondary" onClick={() => setConfirmOpen(true)}>
-            Check pantry
+            {t('recommend.checkPantry')}
           </button>
         </div>
       )}
-      <QueryState query={recommendations} empty="No recipes match these hard filters.">
+      <QueryState query={recommendations} empty={t('recommend.noMatches')}>
         <div className="card-list">
           {recommendations.data?.map((result) => (
             <article className="recommendation-card" key={result.recipe.id}>
               <div className="card-heading">
                 <div>
-                  <span className={`status ${result.status.toLowerCase()}`}>{result.status}</span>
+                  <span className={`status ${result.status.toLowerCase()}`}>{t(`status.${result.status}`)}</span>
                   <h2>{result.recipe.title}</h2>
                 </div>
                 <Link to="/recipes/$recipeId" params={{ recipeId: result.recipe.id }}>
-                  Details
+                  {t('recommend.details')}
                 </Link>
               </div>
-              <p>{result.reasons.join(' · ')}</p>
-              <IngredientSummary label="Available" items={result.available} />
-              <IngredientSummary label="Verify" items={result.verify} />
-              <IngredientSummary label="Missing" items={result.missing} />
+              <p>
+                {result.reasonDetails
+                  .map((reason) => recommendationReasonLabel(reason, t, formatDate, formatNumber))
+                  .join(' · ')}
+              </p>
+              <IngredientSummary label={t('recommend.available')} items={result.available} />
+              <IngredientSummary label={t('recommend.verify')} items={result.verify} />
+              <IngredientSummary label={t('recommend.missing')} items={result.missing} />
             </article>
           ))}
         </div>
@@ -430,6 +468,7 @@ function IngredientFilterInput({
   values: IngredientReference[]
   onChange: (values: IngredientReference[]) => void
 }) {
+  const { t } = useI18n()
   const [draft, setDraft] = useState<IngredientReference>({ name: '', canonicalIngredientId: null })
   function add(next: IngredientReference) {
     const additions = splitIngredientList(next.name).map((name, index) => ({
@@ -447,7 +486,7 @@ function IngredientFilterInput({
     <fieldset className="ingredient-filter">
       <legend>{label}</legend>
       <IngredientCombobox
-        label={`Add ingredient to ${label.toLowerCase()}`}
+        label={t('recommend.addToFilter', { label })}
         value={draft}
         onChange={setDraft}
         onCommit={add}
@@ -455,20 +494,20 @@ function IngredientFilterInput({
           onChange([...values, ...names.map((name) => ({ name, canonicalIngredientId: null }))])
           setDraft({ name: '', canonicalIngredientId: null })
         }}
-        placeholder="Type or paste ingredients"
+        placeholder={t('recommend.filterPlaceholder')}
       />
       {values.length > 0 && (
-        <ul className="ingredient-chips" aria-label={`${label} ingredients`}>
+        <ul className="ingredient-chips" aria-label={t('recommend.filterList', { label })}>
           {values.map((value, index) => (
             <li key={`${value.name}-${index}`}>
               <span>{value.name}</span>
               <button
                 type="button"
                 className="button ghost"
-                aria-label={`Remove ${value.name} from ${label.toLowerCase()}`}
+                aria-label={t('recommend.removeFromFilter', { name: value.name, label })}
                 onClick={() => onChange(values.filter((_, itemIndex) => itemIndex !== index))}
               >
-                Remove
+                {t('common.remove')}
               </button>
             </li>
           ))}
@@ -479,6 +518,7 @@ function IngredientFilterInput({
 }
 
 function RecipesPage() {
+  const { t } = useI18n()
   const recipes = useQuery({ queryKey: ['recipes'], queryFn: api.recipes })
   const queryClient = useQueryClient()
   const favorite = useMutation({
@@ -487,21 +527,23 @@ function RecipesPage() {
   })
   return (
     <Page
-      title="Recipes"
-      intro="Your private recipes and public recipes shared by other cooks."
+      title={t('recipes.title')}
+      intro={t('recipes.intro')}
       action={
         <Link className="button primary" to="/recipes/new">
-          New recipe
+          {t('recipes.new')}
         </Link>
       }
     >
-      <QueryState query={recipes} empty="No recipes yet. Add your first recipe.">
+      <QueryState query={recipes} empty={t('recipes.empty')}>
         <div className="card-list">
           {recipes.data?.map((recipe) => (
             <article className="recipe-card" key={recipe.id}>
               <div className="card-heading">
                 <div>
-                  <span className="eyebrow">{recipe.visibility}</span>
+                  <span className="eyebrow">
+                    {recipe.visibility === 'public' ? t('common.public') : t('common.private')}
+                  </span>
                   <h2>{recipe.title}</h2>
                 </div>
                 <button
@@ -509,13 +551,15 @@ function RecipesPage() {
                   aria-pressed={recipe.isFavorite}
                   onClick={() => favorite.mutate({ id: recipe.id, next: !recipe.isFavorite })}
                 >
-                  {recipe.isFavorite ? '★ Saved' : '☆ Save'}
+                  {recipe.isFavorite ? t('recipes.saved') : t('recipes.save')}
                 </button>
               </div>
-              <p>{recipe.description || 'No description.'}</p>
-              <p className="byline">By {recipe.authorNickname ?? 'Anonymous user'}</p>
+              <p>{recipe.description || t('recipes.noDescription')}</p>
+              <p className="byline">
+                {t('common.byAuthor', { author: recipe.authorNickname ?? t('common.anonymousUser') })}
+              </p>
               <Link to="/recipes/$recipeId" params={{ recipeId: recipe.id }}>
-                Open recipe
+                {t('recipes.open')}
               </Link>
             </article>
           ))}
@@ -526,35 +570,42 @@ function RecipesPage() {
 }
 
 function RecipeDetailPage() {
+  const { t } = useI18n()
   const { recipeId } = recipeRoute.useParams()
   const recipe = useQuery({ queryKey: ['recipe', recipeId], queryFn: () => api.recipe(recipeId) })
   return (
-    <Page title={recipe.data?.title ?? 'Recipe'} intro={recipe.data?.description ?? ''}>
-      <QueryState query={recipe} empty="Recipe not found.">
+    <Page title={recipe.data?.title ?? t('recipe.fallbackTitle')} intro={recipe.data?.description ?? ''}>
+      <QueryState query={recipe} empty={t('recipe.notFound')}>
         {recipe.data && (
           <article className="detail-card">
             <div className="card-heading">
-              <span className="status verify">{recipe.data.visibility}</span>
+              <span className="status verify">
+                {recipe.data.visibility === 'public' ? t('common.public') : t('common.private')}
+              </span>
               {recipe.data.isOwner && (
                 <Link className="button secondary" to="/recipes/$recipeId/edit" params={{ recipeId }}>
-                  Edit
+                  {t('common.edit')}
                 </Link>
               )}
             </div>
-            <p className="byline">By {recipe.data.authorNickname ?? 'Anonymous user'}</p>
+            <p className="byline">
+              {t('common.byAuthor', { author: recipe.data.authorNickname ?? t('common.anonymousUser') })}
+            </p>
             {recipe.data.source && (
               <aside className="source-note">
-                <strong>Imported source</strong>
+                <strong>{t('recipe.importedSource')}</strong>
                 <a href={recipe.data.source.url} rel="noreferrer">
                   {recipe.data.source.title ?? recipe.data.source.url}
                 </a>
-                {recipe.data.source.author && <span> by {recipe.data.source.author}</span>}
+                {recipe.data.source.author && (
+                  <span>{t('recipe.sourceBy', { author: recipe.data.source.author })}</span>
+                )}
                 {recipe.data.source.warnings.map((warning) => (
                   <p key={warning}>{warning}</p>
                 ))}
               </aside>
             )}
-            <h2>Ingredients</h2>
+            <h2>{t('recipe.ingredients')}</h2>
             <ul>
               {recipe.data.ingredients.map((ingredient, index) => (
                 <li key={`${ingredient.name}-${index}`}>
@@ -562,8 +613,8 @@ function RecipeDetailPage() {
                 </li>
               ))}
             </ul>
-            <h2>Method</h2>
-            <p className="pre-line">{recipe.data.instructions || 'No instructions yet.'}</p>
+            <h2>{t('recipe.method')}</h2>
+            <p className="pre-line">{recipe.data.instructions || t('recipe.noInstructions')}</p>
           </article>
         )}
       </QueryState>
@@ -572,40 +623,44 @@ function RecipeDetailPage() {
 }
 
 function EditRecipePage() {
+  const { t } = useI18n()
   const { recipeId } = editRecipeRoute.useParams()
   const recipe = useQuery({ queryKey: ['recipe', recipeId], queryFn: () => api.recipe(recipeId) })
   return (
-    <Page title="Edit recipe" intro="Changes are only allowed for the recipe owner.">
-      <QueryState query={recipe} empty="Recipe not found.">
+    <Page title={t('recipe.editTitle')} intro={t('recipe.editIntro')}>
+      <QueryState query={recipe} empty={t('recipe.notFound')}>
         {recipe.data && recipe.data.isOwner ? (
           <RecipeEditor recipe={recipe.data} />
         ) : recipe.data ? (
-          <StatePanel title="Owner access required" detail="Only the recipe owner can edit this recipe." />
+          <StatePanel title={t('recipe.ownerRequired')} detail={t('recipe.ownerRequiredDetail')} />
         ) : null}
       </QueryState>
     </Page>
   )
 }
 
-const recipeSchema = z.object({
-  title: z.string().trim().min(1, 'Title is required'),
+function recipeSchema(t: Translate) {
+  return z.object({
+  title: z.string().trim().min(1, t('recipe.titleRequired')),
   description: z.string(),
   instructions: z.string(),
   visibility: z.enum(['private', 'public']),
   ingredients: z.array(z.object({
-    name: z.string().trim().min(1, 'Ingredient name is required'),
+    name: z.string().trim().min(1, t('recipe.ingredientRequired')),
     quantityNote: z.string(),
     canonicalIngredientId: z.string().nullable(),
   })).min(1),
-})
-type RecipeForm = z.infer<typeof recipeSchema>
+  })
+}
+type RecipeForm = z.infer<ReturnType<typeof recipeSchema>>
 
 function RecipeEditor({ recipe }: { recipe?: Recipe }) {
+  const { t } = useI18n()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const errorSummaryRef = useRef<HTMLDivElement>(null)
   const form = useForm<RecipeForm>({
-    resolver: zodResolver(recipeSchema),
+    resolver: zodResolver(recipeSchema(t)),
     defaultValues: recipe ?? {
       title: '',
       description: '',
@@ -628,7 +683,9 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
   const validationMessages = [
     form.formState.errors.title?.message,
     ...ingredientErrors.map((error, index) =>
-      error?.name?.message ? `Ingredient ${index + 1}: ${error.name.message}` : undefined,
+      error?.name?.message
+        ? t('recipe.ingredientError', { number: index + 1, message: error.name.message })
+        : undefined,
     ),
   ].filter((message): message is string => Boolean(message))
   return (
@@ -641,14 +698,14 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
     >
       {validationMessages.length > 0 && (
         <div className="error-summary" role="alert" tabIndex={-1} ref={errorSummaryRef}>
-          <strong>Check the highlighted fields.</strong>
+          <strong>{t('recipe.checkFields')}</strong>
           <ul>
             {validationMessages.map((message) => <li key={message}>{message}</li>)}
           </ul>
         </div>
       )}
       <label>
-        Title
+        {t('recipe.title')}
         <input
           {...form.register('title')}
           aria-invalid={Boolean(form.formState.errors.title)}
@@ -657,27 +714,27 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
         <FieldError id="recipe-title-error" message={form.formState.errors.title?.message} />
       </label>
       <label>
-        Description
+        {t('recipe.description')}
         <textarea {...form.register('description')} rows={3} />
       </label>
       <label>
-        Instructions
+        {t('recipe.instructions')}
         <textarea {...form.register('instructions')} rows={8} />
       </label>
       <label>
-        Visibility
+        {t('recipe.visibility')}
         <select {...form.register('visibility')}>
-          <option value="private">Private (default)</option>
-          <option value="public">Public</option>
+          <option value="private">{t('recipe.privateDefault')}</option>
+          <option value="public">{t('recipe.public')}</option>
         </select>
       </label>
       <fieldset>
-        <legend>Ingredients</legend>
+        <legend>{t('recipe.ingredients')}</legend>
         {fields.fields.map((field, index) => (
           <div className="ingredient-row" key={field.id}>
             <div>
               <IngredientCombobox
-                label={`Ingredient ${index + 1}`}
+                label={t('recipe.ingredientNumber', { number: index + 1 })}
                 value={{
                   name: form.watch(`ingredients.${index}.name`),
                   canonicalIngredientId: form.watch(`ingredients.${index}.canonicalIngredientId`),
@@ -693,7 +750,7 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
                     fields.append({ name, quantityNote: '', canonicalIngredientId: null })
                   }
                 }}
-                placeholder="Type or paste ingredients"
+                placeholder={t('recommend.filterPlaceholder')}
                 invalid={Boolean(form.formState.errors.ingredients?.[index]?.name)}
                 describedBy={
                   form.formState.errors.ingredients?.[index]?.name
@@ -707,22 +764,25 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
               />
             </div>
             <label>
-              <span className="sr-only">Quantity note for ingredient {index + 1}</span>
-              <input {...form.register(`ingredients.${index}.quantityNote`)} placeholder="Quantity note" />
+              <span className="sr-only">{t('recipe.quantityFor', { number: index + 1 })}</span>
+              <input
+                {...form.register(`ingredients.${index}.quantityNote`)}
+                placeholder={t('recipe.quantityNote')}
+              />
             </label>
             {fields.fields.length > 1 && (
               <button type="button" className="button ghost" onClick={() => fields.remove(index)}>
-                Remove
+                {t('common.remove')}
               </button>
             )}
           </div>
         ))}
         <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '', canonicalIngredientId: null })}>
-          Add ingredient
+          {t('recipe.addIngredient')}
         </button>
       </fieldset>
       <button className="button primary" disabled={save.isPending}>
-        {save.isPending ? 'Saving…' : 'Save recipe'}
+        {save.isPending ? t('recipe.saving') : t('recipe.saveRecipe')}
       </button>
       {save.error && <ErrorText error={save.error} />}
     </form>
@@ -730,6 +790,7 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
 }
 
 function PantryPage() {
+  const { formatDate, t } = useI18n()
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
   const queryClient = useQueryClient()
   const [draft, setDraft] = useState({
@@ -749,7 +810,7 @@ function PantryPage() {
     },
   })
   return (
-    <Page title="Private pantry" intro="Track availability and an optional calendar expiration date for each ingredient.">
+    <Page title={t('pantry.title')} intro={t('pantry.intro')}>
       <form
         className="inline-form pantry-form"
         onSubmit={(event) => {
@@ -758,27 +819,27 @@ function PantryPage() {
         }}
       >
         <IngredientCombobox
-          label="Ingredient"
+          label={t('pantry.ingredient')}
           value={{ name: draft.name, canonicalIngredientId: draft.canonicalIngredientId }}
           onChange={(value) => setDraft({ ...draft, ...value })}
           onPasteList={(names) =>
             setDraft({ ...draft, name: names.join(', '), canonicalIngredientId: null })
           }
-          placeholder="Type or paste one or more ingredients"
+          placeholder={t('pantry.placeholder')}
         />
         <label>
-          Status
+          {t('pantry.status')}
           <select
             value={draft.status}
             onChange={(event) => setDraft({ ...draft, status: event.target.value as PantryStatus })}
           >
-            <option value="have">Have</option>
-            <option value="out">Used up</option>
-            <option value="unknown">Uncertain</option>
+            <option value="have">{t('pantry.have')}</option>
+            <option value="out">{t('pantry.out')}</option>
+            <option value="unknown">{t('pantry.unknown')}</option>
           </select>
         </label>
         <label>
-          Quantity note
+          {t('pantry.quantityNote')}
           <input value={draft.quantityNote} onChange={(event) => setDraft({ ...draft, quantityNote: event.target.value })} />
         </label>
         <ExpirationEditor
@@ -787,7 +848,9 @@ function PantryPage() {
         />
         <div className="form-actions">
           <button className="button primary" disabled={!draft.name.trim() || save.isPending}>
-            {editingName ? `Save changes to ${editingName}` : 'Save pantry item'}
+            {editingName
+              ? t('pantry.saveChanges', { name: editingName })
+              : t('pantry.saveItem')}
           </button>
           {editingName && (
             <button
@@ -798,24 +861,24 @@ function PantryPage() {
                 setEditingName(null)
               }}
             >
-              Cancel editing
+              {t('pantry.cancelEditing')}
             </button>
           )}
         </div>
       </form>
-      {editingName && <p role="status">Editing {editingName}. Change any field, then save.</p>}
+      {editingName && <p role="status">{t('pantry.editing', { name: editingName })}</p>}
       {save.error && <ErrorText error={save.error} />}
-      <QueryState query={pantry} empty="Your pantry is empty. Add an ingredient above.">
-        <div className="pantry-table" role="table" aria-label="Pantry items">
+      <QueryState query={pantry} empty={t('pantry.empty')}>
+        <div className="pantry-table" role="table" aria-label={t('pantry.itemsLabel')}>
           {pantry.data?.map((item) => (
             <div className="pantry-row" role="row" key={item.id}>
               <strong role="cell">{item.name}</strong>
               <span role="cell" className={`status ${item.status === 'have' ? 'ready' : item.status === 'out' ? 'shop' : 'verify'}`}>
-                {pantryStatusLabel(item.status)}
+                {pantryStatusLabel(item.status, t)}
               </span>
-              <span role="cell">{item.quantityNote || 'No quantity note'}</span>
+              <span role="cell">{item.quantityNote || t('pantry.noQuantity')}</span>
               <span role="cell" className={item.expiresOn && item.expiresOn <= localDateValue(new Date()) ? 'expiry-warning' : ''}>
-                {expirationLabel(item.expiresOn)}
+                {expirationLabel(item.expiresOn, { t, formatDate })}
               </span>
               <button
                 type="button"
@@ -831,7 +894,7 @@ function PantryPage() {
                   setEditingName(item.name)
                 }}
               >
-                Edit item
+                {t('pantry.editItem')}
               </button>
               <button
                 className="button ghost"
@@ -847,7 +910,7 @@ function PantryPage() {
                   ])
                 }
               >
-                Change status
+                {t('pantry.changeStatus')}
               </button>
             </div>
           ))}
@@ -866,23 +929,24 @@ export function ExpirationEditor({
   onChange: (value: string | null) => void
   now?: Date
 }) {
+  const { t } = useI18n()
   const today = localDateValue(now)
   const isPast = value !== null && value < today
   const options = [
-    ['No expiration date', null],
-    ['Today', today],
-    ['Tomorrow', expirationShortcut(1, now)],
-    ['One week', expirationShortcut(7, now)],
-    ['One month', oneMonthAfter(now)],
+    [t('expiry.none'), null],
+    [t('expiry.today'), today],
+    [t('expiry.tomorrow'), expirationShortcut(1, now)],
+    [t('expiry.oneWeek'), expirationShortcut(7, now)],
+    [t('expiry.oneMonth'), oneMonthAfter(now)],
   ] as const
   return (
     <fieldset className="expiration-editor">
-      <legend>Expiration date (optional)</legend>
+      <legend>{t('expiry.optional')}</legend>
       <label>
-        Choose a calendar date
+        {t('expiry.chooseDate')}
         <input type="date" value={value ?? ''} onChange={(event) => onChange(event.target.value || null)} />
       </label>
-      <div className="date-shortcuts" role="group" aria-label="Expiration date shortcuts">
+      <div className="date-shortcuts" role="group" aria-label={t('expiry.shortcuts')}>
         {options.map(([label, date]) => (
           <button
             type="button"
@@ -895,10 +959,10 @@ export function ExpirationEditor({
           </button>
         ))}
       </div>
-      <p className="field-help">Dates use your calendar day and do not include a time zone.</p>
+      <p className="field-help">{t('expiry.dateOnlyHelp')}</p>
       {isPast && (
         <p className="expiry-warning" role="alert">
-          This date is in the past. You can still save it, but Cook will require verification before recommending this ingredient.
+          {t('expiry.pastWarning')}
         </p>
       )}
     </fieldset>
@@ -906,13 +970,15 @@ export function ExpirationEditor({
 }
 
 function SettingsPage() {
+  const { t } = useI18n()
   const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings })
   const me = useQuery({ queryKey: ['me'], queryFn: api.me })
   return (
-    <Page title="Settings" intro="Manage your public profile, recommendation sources, and import access.">
+    <Page title={t('settings.title')} intro={t('settings.intro')}>
+      {me.data && <LanguageSettings user={me.data} />}
       {me.data && <ProfileSettings user={me.data} />}
       <AccountSecuritySettings />
-      <QueryState query={settings} empty="Settings unavailable.">
+      <QueryState query={settings} empty={t('settings.unavailable')}>
         {settings.data && <SettingsForm initial={settings.data} />}
       </QueryState>
       <ImportTokenSettings />
@@ -920,7 +986,46 @@ function SettingsPage() {
   )
 }
 
+export function LanguageSettings({ user }: { user: User }) {
+  const queryClient = useQueryClient()
+  const { locale, setLocale, t } = useI18n()
+  const save = useMutation({
+    mutationFn: (next: Locale) => api.saveLocale(next),
+    onSuccess: (value) => {
+      queryClient.setQueryData(['me'], value)
+    },
+    onError: () => {
+      const previous = user.locale ?? locale
+      queryClient.setQueryData(['me'], user)
+      setLocale(previous)
+    },
+  })
+  return (
+    <section className="settings-section">
+      <h2>{t('locale.title')}</h2>
+      <label>
+        {t('locale.label')}
+        <select
+          value={user.locale ?? locale}
+          onChange={(event) => {
+            const next = event.target.value as Locale
+            queryClient.setQueryData(['me'], { ...user, locale: next })
+            setLocale(next)
+            save.mutate(next)
+          }}
+        >
+          <option value="en">{t('locale.en')}</option>
+          <option value="zh-CN">{t('locale.zhCN')}</option>
+        </select>
+      </label>
+      {save.isSuccess && <p role="status">{t('locale.saved')}</p>}
+      {save.error && <ErrorText error={save.error} />}
+    </section>
+  )
+}
+
 export function ProfileSetup({ user }: { user: User }) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const [choice, setChoice] = useState<'anonymous' | 'suggested' | 'custom'>('anonymous')
   const [custom, setCustom] = useState('')
@@ -940,9 +1045,9 @@ export function ProfileSetup({ user }: { user: User }) {
       <Dialog.Portal>
         <Dialog.Overlay className="dialog-overlay" />
         <Dialog.Content className="confirmation-sheet">
-          <Dialog.Title>Choose your public recipe name</Dialog.Title>
+          <Dialog.Title>{t('profile.setupTitle')}</Dialog.Title>
           <Dialog.Description>
-            Your Google profile stays private. Only the nickname you explicitly choose is shown on public recipes.
+            {t('profile.setupDescription')}
           </Dialog.Description>
           <fieldset className="choice-list">
             <label className="radio-pill">
@@ -952,7 +1057,7 @@ export function ProfileSetup({ user }: { user: User }) {
                 checked={choice === 'anonymous'}
                 onChange={() => setChoice('anonymous')}
               />
-              Anonymous user (default)
+              {t('profile.anonymousDefault')}
             </label>
             <label className="radio-pill">
               <input
@@ -961,7 +1066,7 @@ export function ProfileSetup({ user }: { user: User }) {
                 checked={choice === 'suggested'}
                 onChange={() => setChoice('suggested')}
               />
-              Use “{user.displayName}” publicly
+              {t('profile.useSuggested', { name: user.displayName })}
             </label>
             <label className="radio-pill">
               <input
@@ -970,11 +1075,11 @@ export function ProfileSetup({ user }: { user: User }) {
                 checked={choice === 'custom'}
                 onChange={() => setChoice('custom')}
               />
-              Choose a custom nickname
+              {t('profile.custom')}
             </label>
             {choice === 'custom' && (
               <input
-                aria-label="Custom public nickname"
+                aria-label={t('profile.customLabel')}
                 value={custom}
                 maxLength={40}
                 onChange={(event) => setCustom(event.target.value)}
@@ -983,7 +1088,7 @@ export function ProfileSetup({ user }: { user: User }) {
           </fieldset>
           <div className="dialog-actions">
             <button className="button ghost" onClick={() => save.mutate(null)}>
-              Skip and stay anonymous
+              {t('profile.skip')}
             </button>
             <button
               className="button primary"
@@ -992,7 +1097,7 @@ export function ProfileSetup({ user }: { user: User }) {
                 save.mutate(choice === 'suggested' ? user.displayName : choice === 'custom' ? custom : null)
               }
             >
-              Save public profile
+              {t('profile.save')}
             </button>
           </div>
           {save.error && <ErrorText error={save.error} />}
@@ -1003,13 +1108,14 @@ export function ProfileSetup({ user }: { user: User }) {
 }
 
 export function AccountSecuritySettings() {
+  const { formatDate, formatDateTime, formatNumber, t } = useI18n()
   const queryClient = useQueryClient()
   const security = useQuery({ queryKey: ['security-settings'], queryFn: api.securitySettings })
   const [email, setEmail] = useState('')
   const [code, setCode] = useState('')
   const [challenge, setChallenge] = useState<Awaited<ReturnType<typeof api.requestEmailLink>> | null>(null)
   const [now, setNow] = useState(() => Date.now())
-  const [passkeyName, setPasskeyName] = useState('My passkey')
+  const [passkeyName, setPasskeyName] = useState(() => t('security.defaultPasskeyName'))
   useEffect(() => {
     if (!challenge) return
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
@@ -1038,7 +1144,7 @@ export function AccountSecuritySettings() {
       return api.finishPasskeyRegistration(await createPasskey(options))
     },
     onSuccess: async () => {
-      setPasskeyName('My passkey')
+      setPasskeyName(t('security.defaultPasskeyName'))
       await queryClient.invalidateQueries({ queryKey: ['security-settings'] })
     },
   })
@@ -1051,58 +1157,62 @@ export function AccountSecuritySettings() {
     : 0
   return (
     <section className="settings-section">
-      <h2>Sign-in security</h2>
-      <p>Email identities are linked only after verification. Cook never merges accounts merely because Google reports the same email.</p>
-      <QueryState query={security} empty="No email identity or passkey is linked yet.">
+      <h2>{t('security.title')}</h2>
+      <p>{t('security.accountNote')}</p>
+      <QueryState query={security} empty={t('security.empty')}>
         <>
           <div>
-            <h3>Linked email</h3>
+            <h3>{t('security.linkedEmail')}</h3>
             {security.data?.linkedEmails.length ? (
               <ul>{security.data.linkedEmails.map((value) => <li key={value}>{value}</li>)}</ul>
             ) : (
-              <p>Link an email before registering a passkey.</p>
+              <p>{t('security.linkBeforePasskey')}</p>
             )}
           </div>
           <div>
-            <h3>Passkeys</h3>
+            <h3>{t('security.passkeys')}</h3>
             {security.data?.passkeys.length ? (
               <div className="card-list">
                 {security.data.passkeys.map((passkey) => (
                   <article className="recipe-card" key={passkey.id}>
                     <strong>{passkey.name}</strong>
-                    <span>Added {new Date(passkey.createdAt).toLocaleDateString()}</span>
-                    <span>{passkey.lastUsedAt ? `Last used ${new Date(passkey.lastUsedAt).toLocaleString()}` : 'Not used yet'}</span>
+                    <span>{t('security.added', { date: formatDate(passkey.createdAt) })}</span>
+                    <span>
+                      {passkey.lastUsedAt
+                        ? t('security.lastUsed', { date: formatDateTime(passkey.lastUsedAt) })
+                        : t('security.notUsed')}
+                    </span>
                     <button
                       className="button ghost"
                       onClick={() => {
-                        if (window.confirm(`Revoke passkey “${passkey.name}”? You cannot undo this action.`)) {
+                        if (window.confirm(t('security.revokeConfirm', { name: passkey.name }))) {
                           revoke.mutate(passkey.id)
                         }
                       }}
                     >
-                      Revoke passkey
+                      {t('security.revoke')}
                     </button>
                   </article>
                 ))}
               </div>
             ) : (
-              <p>No passkeys registered.</p>
+              <p>{t('security.noPasskeys')}</p>
             )}
           </div>
         </>
       </QueryState>
       <div className="security-grid">
         <div>
-          <h3>Link email sign-in</h3>
+          <h3>{t('security.linkEmail')}</h3>
           <label>
-            Email address
+            {t('otp.email')}
             <input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} />
           </label>
           {challenge && (
             <>
-              <p role="status">If delivery is available, a six-digit linking code has been sent.</p>
+              <p role="status">{t('security.linkSent')}</p>
               <label>
-                Verification code
+                {t('otp.code')}
                 <input
                   autoComplete="one-time-code"
                   inputMode="numeric"
@@ -1120,7 +1230,7 @@ export function AccountSecuritySettings() {
               disabled={!email || linkRequest.isPending || (challenge !== null && code.length !== 6)}
               onClick={() => (challenge ? linkVerify.mutate() : linkRequest.mutate())}
             >
-              {challenge ? 'Verify and link email' : 'Send linking code'}
+              {challenge ? t('security.verifyLink') : t('security.sendLink')}
             </button>
             {challenge && (
               <button
@@ -1128,15 +1238,17 @@ export function AccountSecuritySettings() {
                 disabled={resendSeconds > 0 || linkRequest.isPending}
                 onClick={() => linkRequest.mutate()}
               >
-                {resendSeconds > 0 ? `Resend in ${resendSeconds}s` : 'Resend code'}
+                {resendSeconds > 0
+                  ? t('otp.resendIn', { seconds: formatNumber(resendSeconds) })
+                  : t('otp.resend')}
               </button>
             )}
           </div>
         </div>
         <div>
-          <h3>Add a passkey</h3>
+          <h3>{t('security.addPasskey')}</h3>
           <label>
-            Passkey name
+            {t('security.passkeyName')}
             <input maxLength={80} value={passkeyName} onChange={(event) => setPasskeyName(event.target.value)} />
           </label>
           <button
@@ -1144,7 +1256,7 @@ export function AccountSecuritySettings() {
             disabled={!passkeyName.trim() || !security.data?.linkedEmails.length || register.isPending}
             onClick={() => register.mutate()}
           >
-            Register passkey
+            {t('security.register')}
           </button>
         </div>
       </div>
@@ -1156,6 +1268,7 @@ export function AccountSecuritySettings() {
 }
 
 function ProfileSettings({ user }: { user: User }) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const [nickname, setNickname] = useState(user.nickname ?? '')
   const save = useMutation({
@@ -1171,8 +1284,8 @@ function ProfileSettings({ user }: { user: User }) {
   })
   return (
     <section className="settings-section">
-      <h2>Public profile</h2>
-      <p>Your sign-in email and Google display name are private. Empty nickname means Anonymous user.</p>
+      <h2>{t('profile.title')}</h2>
+      <p>{t('profile.privacy')}</p>
       <form
         className="settings-form"
         onSubmit={(event) => {
@@ -1181,26 +1294,43 @@ function ProfileSettings({ user }: { user: User }) {
         }}
       >
         <label>
-          Public nickname
+          {t('profile.nickname')}
           <input value={nickname} maxLength={40} onChange={(event) => setNickname(event.target.value)} />
         </label>
-        <button className="button primary" disabled={save.isPending}>Save profile</button>
-        {save.isSuccess && <p role="status">Profile saved.</p>}
+        <button className="button primary" disabled={save.isPending}>{t('profile.saveProfile')}</button>
+        {save.isSuccess && <p role="status">{t('profile.saved')}</p>}
         {save.error && <ErrorText error={save.error} />}
       </form>
     </section>
   )
 }
 
-function ImportTokenSettings() {
+export const COOK_SKILL_URL =
+  'https://github.com/vichare/Cook/blob/main/skills/cook-recipe-import/SKILL.md'
+export const COOK_SKILL_INSTALL_INSTRUCTIONS = `Install the official Cook recipe import skill from:
+${COOK_SKILL_URL}
+
+Use your AI client's documented “install skill from GitHub URL” flow. Client commands differ, so follow that client's instructions. Configure COOK_IMPORT_TOKEN in the client's secret store or environment and COOK_BASE_URL=https://cook.vichare.net separately. Never paste the token into a prompt or chat.`
+export const COOK_IMPORT_PROMPT_TEMPLATE = `English:
+Use your browser tools to extract a recipe from a webpage I am authorized to access, preferring schema.org Recipe/JSON-LD. For video, use only legitimately available captions/transcripts; if unavailable, ask me for a transcript. Do not bypass login, paywalls, robots restrictions, access controls, or DRM. Rewrite concise structured ingredients and steps, preserve source URL/title/author, and record uncertainty as warnings. Validate against the Cook import draft schema, then create a private review draft at COOK_BASE_URL using the recipes:import credential from the COOK_IMPORT_TOKEN secret/environment variable. Never print, quote, log, download, or place that token in a URL or prompt. Do not publish or finalize the recipe; tell me to review the private draft in Cook.
+
+简体中文：
+请使用浏览器工具，从我有权访问的网页提取菜谱，优先使用 schema.org Recipe/JSON-LD。视频只能使用合法可用的字幕或 transcript；若无法取得，请要求我提供 transcript。不得绕过登录、付费墙、robots 限制、访问控制或 DRM。请将食材和步骤简洁结构化并改写，保留来源 URL、标题和作者，把不确定内容记录为 warnings。按 Cook 导入草稿 schema 验证后，使用 secret store/环境变量中的 COOK_IMPORT_TOKEN（recipes:import 权限）调用 COOK_BASE_URL，创建私密待审核草稿。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。不要发布或完成菜谱；请提醒我在 Cook 中人工审核私密草稿。`
+
+export function ImportTokenSettings() {
+  const { formatDateTime, t } = useI18n()
   const queryClient = useQueryClient()
   const tokens = useQuery({ queryKey: ['import-tokens'], queryFn: api.importTokens })
-  const [name, setName] = useState('My AI client')
+  const [name, setName] = useState(() => t('token.defaultName'))
   const [secret, setSecret] = useState<string | null>(null)
+  const [copyStatus, setCopyStatus] = useState<string | null>(null)
+  const [copyError, setCopyError] = useState<string | null>(null)
   const create = useMutation({
     mutationFn: () => api.createImportToken(name, 90),
     onSuccess: async (created) => {
       setSecret(created.secret)
+      setCopyStatus(null)
+      setCopyError(null)
       await queryClient.invalidateQueries({ queryKey: ['import-tokens'] })
     },
   })
@@ -1208,10 +1338,19 @@ function ImportTokenSettings() {
     mutationFn: api.revokeImportToken,
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['import-tokens'] }),
   })
+  function copyOutput(value: string, success: string) {
+    setCopyError(null)
+    void copyText(value)
+      .then(() => setCopyStatus(success))
+      .catch(() => {
+        setCopyStatus(null)
+        setCopyError(t('token.copyFailed'))
+      })
+  }
   return (
     <section className="settings-section">
-      <h2>AI recipe import tokens</h2>
-      <p>Tokens have only the recipes:import scope. Store the secret in your AI client secret store; it is shown once.</p>
+      <h2>{t('token.title')}</h2>
+      <p>{t('token.securityNote')}</p>
       <form
         className="inline-form compact"
         onSubmit={(event) => {
@@ -1220,35 +1359,84 @@ function ImportTokenSettings() {
         }}
       >
         <label>
-          Token name
+          {t('token.name')}
           <input value={name} onChange={(event) => setName(event.target.value)} required maxLength={80} />
         </label>
-        <button className="button primary" disabled={create.isPending}>Create 90-day token</button>
+        <button className="button primary" disabled={create.isPending}>{t('token.create')}</button>
       </form>
       {secret && (
-        <div className="secret-once" role="status">
-          <strong>Copy this secret now. It cannot be retrieved later.</strong>
+        <div className="secret-once">
+          <strong role="status">{t('token.copyNow')}</strong>
           <code>{secret}</code>
-          <button className="button ghost" onClick={() => setSecret(null)}>I saved it</button>
+          <button
+            className="button secondary"
+            aria-label={t('token.copyToken')}
+            onClick={() => copyOutput(secret, t('token.tokenCopied'))}
+          >
+            {t('token.copyToken')}
+          </button>
+          <section>
+            <h3>{t('token.installSkill')}</h3>
+            <p>{t('token.installSkillDetail')}</p>
+            <p>{t('token.skillMainNote')}</p>
+            <label>
+              {t('token.skillUrlLabel')}
+              <input readOnly value={COOK_SKILL_URL} />
+            </label>
+            <a className="button secondary" href={COOK_SKILL_URL} rel="noreferrer" target="_blank">
+              {t('token.installSkill')}
+            </a>
+            <button
+              className="button ghost"
+              onClick={() => copyOutput(COOK_SKILL_INSTALL_INSTRUCTIONS, t('token.installCopied'))}
+            >
+              {t('token.copyInstall')}
+            </button>
+          </section>
+          <section>
+            <h3>{t('token.copyPrompt')}</h3>
+            <p>{t('token.promptDetail')}</p>
+            <button
+              className="button ghost"
+              onClick={() => copyOutput(COOK_IMPORT_PROMPT_TEMPLATE, t('token.promptCopied'))}
+            >
+              {t('token.copyPrompt')}
+            </button>
+          </section>
+          {copyStatus && <p role="status">{copyStatus}</p>}
+          {copyError && <p className="error" role="alert">{copyError}</p>}
+          <button className="button primary" onClick={() => {
+            setSecret(null)
+            setCopyStatus(null)
+            setCopyError(null)
+          }}>
+            {t('token.savedClose')}
+          </button>
         </div>
       )}
-      <QueryState query={tokens} empty="No import tokens.">
+      <QueryState query={tokens} empty={t('token.empty')}>
         <div className="card-list">
           {tokens.data?.map((token) => (
             <article className="recipe-card" key={token.id}>
               <strong>{token.name}</strong>
               <span>{token.prefix}… · {token.scope}</span>
-              <span>{token.revokedAt ? 'Revoked' : `Expires ${token.expiresAt ?? 'never'}`}</span>
+              <span>
+                {token.revokedAt
+                  ? t('token.revoked')
+                  : t('token.expires', {
+                      date: token.expiresAt ? formatDateTime(token.expiresAt) : t('common.never'),
+                    })}
+              </span>
               {!token.revokedAt && (
                 <button
                   className="button ghost"
                   onClick={() => {
-                    if (window.confirm(`Revoke import token “${token.name}”? You cannot undo this action.`)) {
+                    if (window.confirm(t('token.revokeConfirm', { name: token.name }))) {
                       revoke.mutate(token.id)
                     }
                   }}
                 >
-                  Revoke token
+                  {t('token.revoke')}
                 </button>
               )}
             </article>
@@ -1262,17 +1450,18 @@ function ImportTokenSettings() {
 }
 
 function ImportsPage() {
+  const { t } = useI18n()
   const drafts = useQuery({ queryKey: ['import-drafts'], queryFn: api.importDrafts })
   return (
-    <Page title="Recipe import drafts" intro="AI output is untrusted. Review and edit every draft before creating a private recipe.">
-      <QueryState query={drafts} empty="No import drafts yet. Use the official Cook skill from your AI client.">
+    <Page title={t('imports.title')} intro={t('imports.intro')}>
+      <QueryState query={drafts} empty={t('imports.empty')}>
         <div className="card-list">
           {drafts.data?.map((draft) => (
             <article className="recipe-card" key={draft.id}>
-              <span className="status verify">{draft.status}</span>
+              <span className="status verify">{importStatusLabel(draft.status, t)}</span>
               <h2>{draft.title}</h2>
               <p>{draft.sourceTitle ?? draft.sourceUrl}</p>
-              <Link to="/imports/$draftId" params={{ draftId: draft.id }}>Review draft</Link>
+              <Link to="/imports/$draftId" params={{ draftId: draft.id }}>{t('imports.review')}</Link>
             </article>
           ))}
         </div>
@@ -1282,6 +1471,7 @@ function ImportsPage() {
 }
 
 function ImportDraftPage() {
+  const { formatNumber, t } = useI18n()
   const { draftId } = importDraftRoute.useParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -1304,16 +1494,24 @@ function ImportDraftPage() {
     },
   })
   return (
-    <Page title="Review import draft" intro="Confirm the source, warnings, ingredients, and rewritten steps before accepting.">
-      <QueryState query={draft} empty="Import draft not found.">
+    <Page title={t('import.reviewTitle')} intro={t('import.reviewIntro')}>
+      <QueryState query={draft} empty={t('import.notFound')}>
         {draft.data && (
           <>
             <ImportDraftEditor draft={draft.data} />
             <section className="source-note">
-              <h2>Source and extraction warnings</h2>
+              <h2>{t('import.sourceWarnings')}</h2>
               <a href={draft.data.sourceUrl} rel="noreferrer">{draft.data.sourceTitle ?? draft.data.sourceUrl}</a>
-              {draft.data.sourceAuthor && <p>Source author: {draft.data.sourceAuthor}</p>}
-              <p>Confidence: {draft.data.confidence ?? 'not provided'}</p>
+              {draft.data.sourceAuthor && (
+                <p>{t('import.sourceAuthor', { author: draft.data.sourceAuthor })}</p>
+              )}
+              <p>
+                {t('import.confidence', {
+                  confidence: draft.data.confidence === null
+                    ? t('common.notProvided')
+                    : formatNumber(draft.data.confidence),
+                })}
+              </p>
               {draft.data.warnings.map((warning) => <p key={warning}>{warning}</p>)}
             </section>
             {draft.data.status === 'draft' && (
@@ -1321,14 +1519,14 @@ function ImportDraftPage() {
                 <button
                   className="button ghost"
                   onClick={() => {
-                    if (window.confirm('Discard this import draft? You cannot undo this action.')) {
+                    if (window.confirm(t('import.discardConfirm'))) {
                       discard.mutate()
                     }
                   }}
                 >
-                  Discard draft
+                  {t('import.discard')}
                 </button>
-                <button className="button primary" onClick={() => accept.mutate()}>Accept as private recipe</button>
+                <button className="button primary" onClick={() => accept.mutate()}>{t('import.accept')}</button>
               </div>
             )}
             {(accept.error || discard.error) && <ErrorText error={accept.error ?? discard.error} />}
@@ -1340,9 +1538,10 @@ function ImportDraftPage() {
 }
 
 function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const form = useForm<RecipeForm>({
-    resolver: zodResolver(recipeSchema),
+    resolver: zodResolver(recipeSchema(t)),
     defaultValues: {
       title: draft.title,
       description: draft.description,
@@ -1362,31 +1561,49 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
       }),
     onSuccess: (value) => queryClient.setQueryData(['import-draft', draft.id], value),
   })
-  if (draft.status !== 'draft') return <StatePanel title="Draft closed" detail={`This draft is ${draft.status}.`} />
+  if (draft.status !== 'draft') {
+    return (
+      <StatePanel
+        title={t('import.closed')}
+        detail={t('import.closedDetail', { status: importStatusLabel(draft.status, t) })}
+      />
+    )
+  }
   return (
     <form className="editor-form" onSubmit={form.handleSubmit((value) => save.mutate(value))}>
-      <label>Title<input {...form.register('title')} /></label>
-      <label>Description<textarea rows={3} {...form.register('description')} /></label>
-      <label>Instructions<textarea rows={10} {...form.register('instructions')} /></label>
+      <label>{t('recipe.title')}<input {...form.register('title')} /></label>
+      <label>{t('recipe.description')}<textarea rows={3} {...form.register('description')} /></label>
+      <label>{t('recipe.instructions')}<textarea rows={10} {...form.register('instructions')} /></label>
       <fieldset>
-        <legend>Ingredients</legend>
+        <legend>{t('recipe.ingredients')}</legend>
         {fields.fields.map((field, index) => (
           <div className="ingredient-row" key={field.id}>
-            <input aria-label={`Ingredient ${index + 1}`} {...form.register(`ingredients.${index}.name`)} />
-            <input aria-label={`Quantity ${index + 1}`} {...form.register(`ingredients.${index}.quantityNote`)} />
-            {fields.fields.length > 1 && <button type="button" className="button ghost" onClick={() => fields.remove(index)}>Remove</button>}
+            <input
+              aria-label={t('recipe.ingredientNumber', { number: index + 1 })}
+              {...form.register(`ingredients.${index}.name`)}
+            />
+            <input
+              aria-label={t('import.quantityNumber', { number: index + 1 })}
+              {...form.register(`ingredients.${index}.quantityNote`)}
+            />
+            {fields.fields.length > 1 && (
+              <button type="button" className="button ghost" onClick={() => fields.remove(index)}>
+                {t('common.remove')}
+              </button>
+            )}
           </div>
         ))}
-        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '', canonicalIngredientId: null })}>Add ingredient</button>
+        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '', canonicalIngredientId: null })}>{t('recipe.addIngredient')}</button>
       </fieldset>
-      <button className="button secondary" disabled={save.isPending}>Save draft changes</button>
-      {save.isSuccess && <p role="status">Draft saved.</p>}
+      <button className="button secondary" disabled={save.isPending}>{t('import.saveChanges')}</button>
+      {save.isSuccess && <p role="status">{t('import.saved')}</p>}
       {save.error && <ErrorText error={save.error} />}
     </form>
   )
 }
 
 function SettingsForm({ initial }: { initial: RecommendationSettings }) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const form = useForm<RecommendationSettings>({ defaultValues: initial })
   const save = useMutation({
@@ -1396,22 +1613,22 @@ function SettingsForm({ initial }: { initial: RecommendationSettings }) {
   return (
     <form className="settings-form" onSubmit={form.handleSubmit((value) => save.mutate(value))}>
       <label className="check-row">
-        <input type="checkbox" {...form.register('includeFavorites')} /> Favorites
+        <input type="checkbox" {...form.register('includeFavorites')} /> {t('sources.favorites')}
       </label>
       <label className="check-row">
-        <input type="checkbox" {...form.register('includeOwn')} /> My recipes
+        <input type="checkbox" {...form.register('includeOwn')} /> {t('sources.own')}
       </label>
       <label className="check-row">
-        <input type="checkbox" {...form.register('includePublic')} /> Other users’ public recipes
+        <input type="checkbox" {...form.register('includePublic')} /> {t('sources.public')}
       </label>
       <label>
-        Recheck pantry after this many days
+        {t('sources.recheck')}
         <input type="number" min={1} max={90} {...form.register('verificationDays', { valueAsNumber: true })} />
       </label>
       <button className="button primary" disabled={save.isPending}>
-        Save sources
+        {t('sources.save')}
       </button>
-      {save.isSuccess && <p role="status">Saved.</p>}
+      {save.isSuccess && <p role="status">{t('common.saved')}</p>}
       {save.error && <ErrorText error={save.error} />}
     </form>
   )
@@ -1426,6 +1643,7 @@ export function PantryConfirmation({
   onOpenChange: (value: boolean) => void
   names: string[]
 }) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const [answers, setAnswers] = useState<Record<string, 'have' | 'buy' | 'used'>>({})
   const save = useMutation({
@@ -1455,18 +1673,18 @@ export function PantryConfirmation({
       <Dialog.Portal>
         <Dialog.Overlay className="dialog-overlay" />
         <Dialog.Content className="confirmation-sheet">
-          <Dialog.Title>Quick pantry check</Dialog.Title>
+          <Dialog.Title>{t('confirm.title')}</Dialog.Title>
           <Dialog.Description>
-            Confirm up to five uncertain ingredients. Skip any item you cannot answer now.
+            {t('confirm.description')}
           </Dialog.Description>
           <div className="confirmation-list">
             {names.map((name) => (
               <fieldset key={name}>
                 <legend>{name}</legend>
                 {[
-                  ['have', 'Still have it'],
-                  ['buy', 'Can buy it'],
-                  ['used', 'Used up'],
+                  ['have', t('confirm.have')],
+                  ['buy', t('confirm.buy')],
+                  ['used', t('confirm.used')],
                 ].map(([value, label]) => (
                   <label className="radio-pill" key={value}>
                     <input
@@ -1484,10 +1702,10 @@ export function PantryConfirmation({
           </div>
           <div className="dialog-actions">
             <Dialog.Close asChild>
-              <button className="button ghost">Skip for now</button>
+              <button className="button ghost">{t('confirm.skip')}</button>
             </Dialog.Close>
             <button className="button primary" disabled={Object.keys(answers).length === 0 || save.isPending} onClick={() => save.mutate()}>
-              Save answers
+              {t('confirm.save')}
             </button>
           </div>
           {save.error && <ErrorText error={save.error} />}
@@ -1508,11 +1726,12 @@ function Page({
   action?: React.ReactNode
   children: React.ReactNode
 }) {
+  const { t } = useI18n()
   return (
     <div className="page">
       <header className="page-header">
         <div>
-          <p className="eyebrow">Cook workspace</p>
+          <p className="eyebrow">{t('app.workspace')}</p>
           <h1>{title}</h1>
           {intro && <p>{intro}</p>}
         </div>
@@ -1532,9 +1751,12 @@ function QueryState<T>({
   empty: string
   children: React.ReactNode
 }) {
-  if (query.isLoading) return <StatePanel title="Loading…" detail="Fetching the latest kitchen data." />
-  if (query.error) return <StatePanel title="Something went wrong" detail={errorMessage(query.error)} />
-  if (Array.isArray(query.data) && query.data.length === 0) return <StatePanel title="Nothing here yet" detail={empty} />
+  const { t } = useI18n()
+  if (query.isLoading) return <StatePanel title={t('common.loading')} detail={t('common.loadingDetail')} />
+  if (query.error) return <StatePanel title={t('common.errorTitle')} detail={errorMessage(query.error, t)} />
+  if (Array.isArray(query.data) && query.data.length === 0) {
+    return <StatePanel title={t('common.emptyTitle')} detail={empty} />
+  }
   return children
 }
 
@@ -1570,17 +1792,67 @@ function FieldError({ id, message }: { id?: string; message?: string }) {
 }
 
 function ErrorText({ error }: { error: unknown }) {
-  return <p className="error" role="alert">{errorMessage(error)}</p>
+  const { t } = useI18n()
+  return <p className="error" role="alert">{errorMessage(error, t)}</p>
 }
 
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : 'Unexpected error'
+function errorMessage(error: unknown, t: Translate) {
+  if (error instanceof ApiError) {
+    const messages: Record<string, ReturnType<Translate>> = {
+      unauthorized: t('error.unauthorized'),
+      rate_limited: t('error.rateLimited'),
+      auth_unavailable: t('error.authUnavailable'),
+      conflict: t('error.conflict'),
+      validation_error: t('error.validation'),
+      internal_error: t('error.internal'),
+    }
+    return messages[error.code] ?? t('error.internal')
+  }
+  return error instanceof Error ? error.message : t('common.unexpectedError')
 }
 
 function nextStatus(status: PantryStatus): PantryStatus {
   return status === 'have' ? 'unknown' : status === 'unknown' ? 'out' : 'have'
 }
 
-function pantryStatusLabel(status: PantryStatus): string {
-  return status === 'have' ? 'Available' : status === 'out' ? 'Used up' : 'Uncertain'
+function pantryStatusLabel(status: PantryStatus, t: Translate): string {
+  return status === 'have'
+    ? t('pantry.available')
+    : status === 'out'
+      ? t('pantry.out')
+      : t('pantry.unknown')
+}
+
+function recommendationReasonLabel(
+  reason: RecommendationReason,
+  t: Translate,
+  formatDate: (value: string | Date) => string,
+  formatNumber: (value: number) => string,
+): string {
+  switch (reason.code) {
+    case 'confirmedIngredients':
+      return t('recommend.reason.confirmed', {
+        confirmed: formatNumber(reason.confirmed),
+        total: formatNumber(reason.total),
+      })
+    case 'preferredIngredients':
+      return t('recommend.reason.preferred', { count: formatNumber(reason.count) })
+    case 'ingredientExpired':
+      return t('recommend.reason.expired', {
+        ingredient: reason.ingredient,
+        date: formatDate(reason.expiresOn),
+      })
+    case 'ingredientExpiresToday':
+      return t('recommend.reason.expiresToday', { ingredient: reason.ingredient })
+    case 'pantryOnlyBlocked':
+      return t('recommend.reason.pantryOnly')
+  }
+}
+
+function importStatusLabel(status: ImportDraft['status'], t: Translate): string {
+  return t(`imports.status.${status}`)
+}
+
+async function copyText(value: string): Promise<void> {
+  await navigator.clipboard.writeText(value)
 }

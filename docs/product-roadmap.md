@@ -38,11 +38,17 @@ Imported output is untrusted and must pass server-side URL, length, count, quota
 
 Settings provides revocable, expiring tokens with the fixed `recipes:import` scope. Secrets are generated with a CSPRNG, displayed once, and stored only as a digest plus non-secret metadata. The token derives the owner, works only on the import-draft endpoint, and must remain in an AI client's secret store or environment rather than URLs, prompts, or logs.
 
+After the one-time reveal, Settings provides a stable link to the official public skill, copyable token-free installation guidance, and a bilingual prompt template for general AI clients. The skill and prompt refer only to `COOK_IMPORT_TOKEN` and `COOK_BASE_URL`; the real secret is copied separately and is never interpolated into those outputs or stored in browser persistence.
+
 Agent Finder did not yield an adopted third-party dedicated recipe skill. Cook therefore ships its own small contract-focused skill and does not add Firecrawl or Apify as dependencies.
 
 ### User-configurable interface language
 
-Cook will provide an account-level interface language setting. The initial supported locales and fallback order are **unverified** and have not been selected yet. Implementation should avoid hard-coding a first locale set before that decision is made.
+**Shipped on `main`.** Cook provides complete English (`en`) and Simplified Chinese (`zh-CN`) interface catalogs, including navigation, authentication, onboarding, recipes, pantry and expiration states, recommendations, import drafts, token setup, form errors, empty states, ARIA labels, and live announcements.
+
+Before sign-in, locale selection uses a saved local preference first, then `navigator.languages`; Chinese browser languages map to `zh-CN` and all other languages fall back to English. After sign-in, the account locale is authoritative and persists in SQLite. An existing account with no locale is initialized once from the current local/browser preference and is not repeatedly overwritten. Settings changes update the account and local preference together so the selected language remains active after sign-out.
+
+Anonymous authors remain a semantic null nickname rather than a translated database string. Dates and numbers use locale-aware `Intl` formatting, while API enums, recommendation reason codes, error codes, and persisted domain values remain language-independent.
 
 ### Authentication availability beyond Google
 

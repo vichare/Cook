@@ -41,4 +41,10 @@ See `docs/architecture.md` and `docs/deployment.md` for design and deployment de
 
 Cook's official [recipe import skill](skills/cook-recipe-import/SKILL.md) uses browser or transcript tools already available in the user's AI client, then submits an untrusted structured payload to Cook as a private review draft. Create a scoped `recipes:import` token in Settings, store it in the client's secret store or `COOK_IMPORT_TOKEN`, and never place it in a URL or prompt. Cook does not fetch arbitrary source URLs, and accepting a reviewed draft creates a private recipe rather than publishing it.
 
+After creating a token, Settings provides the stable public skill path on `main`, token-free installation instructions, and a bilingual prompt template for general AI clients. The `main` URL follows the latest reviewed skill; clients that require immutable instructions should replace `main` with a Cook release tag. These outputs reference `COOK_IMPORT_TOKEN` and `COOK_BASE_URL` only; the one-time token secret is copied separately and is never interpolated into a prompt, URL, download, log, analytics event, or local storage.
+
+## Interface languages
+
+Cook ships complete English (`en`) and Simplified Chinese (`zh-CN`) interface catalogs. Before sign-in, Cook uses the saved local preference, then `navigator.languages`, with Chinese browser languages mapped to `zh-CN` and all other languages falling back to English. After sign-in, the account locale returned by `/api/me` is authoritative and can be changed immediately in Settings. The initial browser choice is persisted to an account only while its locale is still unset, so later browser changes do not overwrite an explicit selection.
+
 Release tags matching `vX.Y.Z` publish `ghcr.io/vichare/cook:<tag>` and deploy through a restricted SSH hook. See `docs/release-and-deployment.md` for the public mechanism; server-specific bootstrap and account details are kept in the private operations manual.

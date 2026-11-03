@@ -2,15 +2,8 @@ import { useQuery } from '@tanstack/react-query'
 import { useEffect, useId, useMemo, useState } from 'react'
 import { api } from './api'
 import { splitIngredientList } from './ingredients'
+import { useI18n } from './i18n'
 import type { IngredientReference, IngredientSuggestion } from './types'
-
-const reasonText: Record<IngredientSuggestion['reason'], string> = {
-  exact: 'Exact normalized match',
-  alias: 'Your confirmed alias',
-  prefix: 'Name starts with your text',
-  substring: 'Name contains your text',
-  similar: 'Similar spelling — review carefully',
-}
 
 export function IngredientCombobox({
   label,
@@ -31,6 +24,14 @@ export function IngredientCombobox({
   invalid?: boolean
   describedBy?: string
 }) {
+  const { t } = useI18n()
+  const reasonText: Record<IngredientSuggestion['reason'], string> = {
+    exact: t('ingredient.reason.exact'),
+    alias: t('ingredient.reason.alias'),
+    prefix: t('ingredient.reason.prefix'),
+    substring: t('ingredient.reason.substring'),
+    similar: t('ingredient.reason.similar'),
+  }
   const id = useId()
   const listId = `${id}-listbox`
   const statusId = `${id}-status`
@@ -57,8 +58,14 @@ export function IngredientCombobox({
   const activeStatus =
     activeIndex >= 0
       ? activeIndex < items.length
-        ? `Option ${activeIndex + 1} of ${optionCount}: ${value.name} → ${items[activeIndex].displayName}. ${reasonText[items[activeIndex].reason]}`
-        : `Option ${optionCount} of ${optionCount}: keep ${value.name} as unresolved input.`
+        ? t('ingredient.optionSuggestion', {
+            current: activeIndex + 1,
+            total: optionCount,
+            input: value.name,
+            candidate: items[activeIndex].displayName,
+            reason: reasonText[items[activeIndex].reason],
+          })
+        : t('ingredient.optionKeep', { current: optionCount, total: optionCount, input: value.name })
       : null
 
   function choose(suggestion: IngredientSuggestion) {
@@ -132,15 +139,17 @@ export function IngredientCombobox({
       <div id={statusId} className="combobox-status" aria-live="polite">
         {activeStatus ??
         (!queryReady || suggestions.isFetching
-          ? 'Looking for ingredient matches.'
+          ? t('ingredient.searching')
           : selected
-            ? `Matched to ${selected.displayName}.`
+            ? t('ingredient.matched', { name: selected.displayName })
             : value.canonicalIngredientId
-              ? 'Canonical ingredient selected.'
+              ? t('ingredient.canonicalSelected')
               : items.length > 0
-                ? `${items.length} suggestion${items.length === 1 ? '' : 's'} available.`
+                ? items.length === 1
+                  ? t('ingredient.oneSuggestion')
+                  : t('ingredient.suggestions', { count: items.length })
                 : value.name.trim()
-                  ? 'No close catalog matches. You can keep your entry.'
+                  ? t('ingredient.noMatches')
                   : '')}
       </div>
       {value.canonicalIngredientId && (
@@ -153,11 +162,16 @@ export function IngredientCombobox({
             setActiveIndex(-1)
           }}
         >
-          Undo selected match
+          {t('ingredient.undo')}
         </button>
       )}
       {open && value.name.trim() && (
-        <div id={listId} role="listbox" className="ingredient-listbox" aria-label={`${label} suggestions`}>
+        <div
+          id={listId}
+          role="listbox"
+          className="ingredient-listbox"
+          aria-label={t('ingredient.suggestionsLabel', { label })}
+        >
           {items.map((item, index) => (
             <button
               type="button"
@@ -173,7 +187,9 @@ export function IngredientCombobox({
                 {value.name} → {item.displayName}
               </strong>
               <span>{reasonText[item.reason]}</span>
-              {item.matchedText !== item.displayName && <small>Matched “{item.matchedText}”</small>}
+              {item.matchedText !== item.displayName && (
+                <small>{t('ingredient.matchedText', { text: item.matchedText })}</small>
+              )}
             </button>
           ))}
           <button
@@ -190,10 +206,10 @@ export function IngredientCombobox({
               setOpen(false)
             }}
           >
-            <strong>Keep “{value.name}” as entered</strong>
-            <span>Leave it unresolved or create it as a new ingredient; do not bind this entry to a suggestion.</span>
+            <strong>{t('ingredient.keep', { name: value.name })}</strong>
+            <span>{t('ingredient.keepDetail')}</span>
           </button>
-          {suggestions.error && <p className="error">Suggestions are unavailable. Your typed value is preserved.</p>}
+          {suggestions.error && <p className="error">{t('ingredient.unavailable')}</p>}
         </div>
       )}
     </div>

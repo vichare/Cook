@@ -8,12 +8,19 @@ pub struct User {
     pub display_name: String,
     pub nickname: Option<String>,
     pub onboarding_completed: bool,
+    pub locale: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileInput {
     pub nickname: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocaleInput {
+    pub locale: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

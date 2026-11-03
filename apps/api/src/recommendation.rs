@@ -26,7 +26,29 @@ pub struct Recommendation {
     pub verify: Vec<String>,
     pub missing: Vec<String>,
     pub reasons: Vec<String>,
+    pub reason_details: Vec<RecommendationReason>,
     pub score: i32,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "code", rename_all = "camelCase")]
+pub enum RecommendationReason {
+    ConfirmedIngredients {
+        confirmed: usize,
+        total: usize,
+    },
+    PreferredIngredients {
+        count: usize,
+    },
+    IngredientExpired {
+        ingredient: String,
+        #[serde(rename = "expiresOn")]
+        expires_on: String,
+    },
+    IngredientExpiresToday {
+        ingredient: String,
+    },
+    PantryOnlyBlocked,
 }
 
 pub fn recommend(
@@ -110,10 +132,17 @@ pub fn recommend(
                 available.len(),
                 recipe.ingredients.len()
             )];
+            let mut reason_details = vec![RecommendationReason::ConfirmedIngredients {
+                confirmed: available.len(),
+                total: recipe.ingredients.len(),
+            }];
             if preferred_matches > 0 {
                 reasons.push(format!(
                     "{preferred_matches} preferred ingredient(s) included"
                 ));
+                reason_details.push(RecommendationReason::PreferredIngredients {
+                    count: preferred_matches as usize,
+                });
             }
             for ingredient in &recipe.ingredients {
                 let key = ingredient_key(
@@ -124,6 +153,20 @@ pub fn recommend(
                     if let Some(expiry_reason) = expiry_reason(item, now.date_naive()) {
                         reasons.push(format!("{}: {expiry_reason}", ingredient.name));
                     }
+                    if let Some(expires_on) = item.expires_on.as_deref() {
+                        if let Some(date) = parse_date(expires_on) {
+                            if date < now.date_naive() {
+                                reason_details.push(RecommendationReason::IngredientExpired {
+                                    ingredient: ingredient.name.clone(),
+                                    expires_on: expires_on.to_string(),
+                                });
+                            } else if date == now.date_naive() {
+                                reason_details.push(RecommendationReason::IngredientExpiresToday {
+                                    ingredient: ingredient.name.clone(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
             if blocked {
@@ -131,6 +174,7 @@ pub fn recommend(
                     "Blocked by pantry-only mode because ingredients are not confirmed available"
                         .into(),
                 );
+                reason_details.push(RecommendationReason::PantryOnlyBlocked);
             }
             Some(Recommendation {
                 recipe,
@@ -139,6 +183,7 @@ pub fn recommend(
                 verify,
                 missing,
                 reasons,
+                reason_details,
                 score,
             })
         })
@@ -343,6 +388,12 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("expired on 2026-11-03")));
+        assert!(results[0]
+            .reason_details
+            .contains(&RecommendationReason::IngredientExpired {
+                ingredient: "milk".into(),
+                expires_on: "2026-11-03".into(),
+            }));
     }
 
     #[test]
@@ -367,5 +418,13 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("expires today")));
+        assert!(results[0].reason_details.contains(
+            &RecommendationReason::IngredientExpiresToday {
+                ingredient: "milk".into(),
+            }
+        ));
+        assert!(results[0]
+            .reason_details
+            .contains(&RecommendationReason::PantryOnlyBlocked));
     }
 }

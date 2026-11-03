@@ -25,7 +25,7 @@ a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visib
 .skip-link:focus { top: 1rem; }
 .site-header { min-height: 70px; padding: .8rem clamp(1rem, 4vw, 4rem); display: flex; align-items: center; gap: 2rem; background: var(--forest); color: white; }
 .site-header a { color: white; text-decoration: none; }
-.site-header nav { display: flex; gap: 1.25rem; flex: 1; }
+.site-header nav { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; flex: 1; }
 .site-header nav a[aria-current="page"] { text-decoration: underline; text-underline-offset: .35rem; }
 .brand { font-family: Georgia, serif; font-size: 1.8rem; font-weight: 700; }
 .page { width: min(1120px, calc(100% - 2rem)); margin: 0 auto; padding: 3.5rem 0 5rem; }
@@ -90,6 +90,8 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .byline { color: #53645a; font-size: .9rem; }
 .source-note, .settings-section, .secret-once { margin: 1.5rem 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: #f7f3e8; display: grid; gap: .65rem; }
 .secret-once code { overflow-wrap: anywhere; padding: .8rem; background: white; border-radius: .5rem; }
+.secret-once section { min-width: 0; padding-top: .75rem; border-top: 1px solid var(--line); display: grid; gap: .65rem; }
+.secret-once a, .secret-once p, .secret-once input { overflow-wrap: anywhere; }
 .choice-list { display: grid; gap: .5rem; margin: 1.5rem 0; }
 .compact { grid-template-columns: minmax(220px, 1fr) auto; }
 .form-actions, .date-shortcuts { display: flex; flex-wrap: wrap; gap: .65rem; align-items: center; }
@@ -113,7 +115,7 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 
 @media (max-width: 760px) {
   .site-header { flex-wrap: wrap; gap: .75rem; }
-  .site-header nav { order: 3; width: 100%; overflow-x: auto; padding-top: .5rem; }
+  .site-header nav { order: 3; width: 100%; padding-top: .5rem; }
   .metric-grid, .action-grid, .filter-panel, .inline-form, .security-grid { grid-template-columns: 1fr; }
   .page-header { align-items: start; flex-direction: column; }
   .ingredient-row, .pantry-row { grid-template-columns: 1fr; }

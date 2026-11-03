@@ -28,8 +28,8 @@ use crate::{
         clean_display_name, match_reason, normalize_ingredient, split_ingredient_list, MatchReason,
     },
     models::{
-        normalize_nickname, IngredientInput, PantryItem, PantryItemInput, PantryStatus,
-        ProfileInput, Recipe, RecipeInput, RecipeSource, RecommendationRequest,
+        normalize_nickname, IngredientInput, LocaleInput, PantryItem, PantryItemInput,
+        PantryStatus, ProfileInput, Recipe, RecipeInput, RecipeSource, RecommendationRequest,
         RecommendationSettings, User,
     },
     passwordless::{
@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/me", get(me))
         .route("/api/settings/profile", put(update_profile))
+        .route("/api/settings/locale", put(update_locale))
         .route("/api/auth/logout-all", post(logout_all))
         .route("/api/settings/security", get(security_settings))
         .route(
@@ -797,6 +798,25 @@ async fn update_profile(
     .await?;
     user.nickname = nickname;
     user.onboarding_completed = true;
+    Ok(Json(user))
+}
+
+async fn update_locale(
+    State(state): State<AppState>,
+    Extension(CurrentUser(mut user)): Extension<CurrentUser>,
+    Json(input): Json<LocaleInput>,
+) -> AppResult<Json<User>> {
+    if input.locale != "en" && input.locale != "zh-CN" {
+        return Err(AppError::Validation(
+            "locale must be en or zh-CN".to_string(),
+        ));
+    }
+    sqlx::query("UPDATE users SET locale = ? WHERE id = ?")
+        .bind(&input.locale)
+        .bind(&user.id)
+        .execute(&state.pool)
+        .await?;
+    user.locale = Some(input.locale);
     Ok(Json(user))
 }
 
@@ -1896,6 +1916,22 @@ mod tests {
         response_json(response).await
     }
 
+    async fn save_locale(app: &axum::Router, cookie: &str, locale: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/api/settings/locale")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(json!({"locale": locale}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
     async fn create_import_token(app: &axum::Router, cookie: &str) -> Value {
         let response = app
             .clone()
@@ -2041,6 +2077,52 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[tokio::test]
+    async fn locale_is_persisted_per_account_and_validated() {
+        let app = build_app(Config::test()).await.unwrap();
+        let first_cookie = login(&app, "First locale user").await;
+        let second_cookie = login(&app, "Second locale user").await;
+
+        let first = save_locale(&app, &first_cookie, "zh-CN").await;
+        assert_eq!(first["locale"], "zh-CN");
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::get("/api/me")
+                    .header("cookie", &second_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(second).await["locale"], Value::Null);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::get("/api/me")
+                    .header("cookie", &first_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(first).await["locale"], "zh-CN");
+
+        let invalid = app
+            .oneshot(
+                Request::put("/api/settings/locale")
+                    .header("content-type", "application/json")
+                    .header("cookie", first_cookie)
+                    .body(Body::from(json!({"locale": "fr"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

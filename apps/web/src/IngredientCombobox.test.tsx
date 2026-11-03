@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { IngredientCombobox } from './IngredientCombobox'
+import { LocaleProvider } from './i18n'
 
 const { ingredientSuggestions } = vi.hoisted(() => ({
   ingredientSuggestions: vi.fn().mockResolvedValue([
@@ -35,16 +36,18 @@ function renderCombobox(overrides: Partial<React.ComponentProps<typeof Ingredien
   const onCommit = vi.fn()
   const onPasteList = vi.fn()
   render(
-    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <IngredientCombobox
-        label="Ingredient"
-        value={{ name: 'tom', canonicalIngredientId: null }}
-        onChange={onChange}
-        onCommit={onCommit}
-        onPasteList={onPasteList}
-        {...overrides}
-      />
-    </QueryClientProvider>,
+    <LocaleProvider initialLocale="en" storage={null}>
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <IngredientCombobox
+          label="Ingredient"
+          value={{ name: 'tom', canonicalIngredientId: null }}
+          onChange={onChange}
+          onCommit={onCommit}
+          onPasteList={onPasteList}
+          {...overrides}
+        />
+      </QueryClientProvider>
+    </LocaleProvider>,
   )
   return { onChange, onCommit, onPasteList }
 }

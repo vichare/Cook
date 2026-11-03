@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cook API
-  version: 0.2.0
+  version: 0.3.0
 servers:
   - url: https://cook.vichare.net
 paths:
@@ -37,6 +37,24 @@ paths:
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422": { description: JSON shape contains unsupported or invalid fields }
+  /api/settings/locale:
+    put:
+      description: Persists the authenticated account's authoritative interface locale. New and migrated accounts may initially return null so the browser can initialize this once from the saved local preference or browser languages.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LocaleInput" }
+      responses:
+        "200":
+          description: Updated private current-user profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /api/auth/config:
     get:
       responses:
@@ -605,13 +623,17 @@ components:
     User:
       type: object
       description: Private current-user DTO. It is never embedded as another recipe author's public profile.
-      required: [id, email, displayName, nickname, onboardingCompleted]
+      required: [id, email, displayName, nickname, onboardingCompleted, locale]
       properties:
         id: { type: string }
         email: { type: string, format: email }
         displayName: { type: string }
         nickname: { type: [string, "null"], maxLength: 40 }
         onboardingCompleted: { type: boolean }
+        locale:
+          type: [string, "null"]
+          enum: [en, zh-CN, null]
+          description: Account-level interface locale. Null is an initialization state only, not a translated anonymous value.
     ProfileInput:
       type: object
       additionalProperties: false
@@ -621,6 +643,12 @@ components:
           type: [string, "null"]
           maxLength: 40
           description: Null selects anonymous. Values are trimmed and may not contain control characters, unusual whitespace, or repeated spaces.
+    LocaleInput:
+      type: object
+      additionalProperties: false
+      required: [locale]
+      properties:
+        locale: { type: string, enum: [en, zh-CN] }
     EmailOtpChallenge:
       type: object
       required: [challengeId, expiresAt, resendAllowedAt]
@@ -765,14 +793,48 @@ components:
           description: User-local calendar date used for date-only expiration classification. The server UTC date is used when omitted.
     Recommendation:
       type: object
-      required: [recipe, status, available, verify, missing, reasons, score]
+      required: [recipe, status, available, verify, missing, reasons, reasonDetails, score]
       properties:
         recipe: { $ref: "#/components/schemas/Recipe" }
         status: { type: string, enum: [READY, VERIFY, SHOP, BLOCKED] }
         available: { type: array, items: { type: string } }
         verify: { type: array, items: { type: string } }
         missing: { type: array, items: { type: string } }
-        reasons: { type: array, items: { type: string } }
+        reasons:
+          type: array
+          items: { type: string }
+          deprecated: true
+          description: Legacy English explanations retained for compatibility. New clients should localize reasonDetails.
+        reasonDetails:
+          type: array
+          items:
+            oneOf:
+              - type: object
+                required: [code, confirmed, total]
+                properties:
+                  code: { const: confirmedIngredients }
+                  confirmed: { type: integer, minimum: 0 }
+                  total: { type: integer, minimum: 0 }
+              - type: object
+                required: [code, count]
+                properties:
+                  code: { const: preferredIngredients }
+                  count: { type: integer, minimum: 1 }
+              - type: object
+                required: [code, ingredient, expiresOn]
+                properties:
+                  code: { const: ingredientExpired }
+                  ingredient: { type: string }
+                  expiresOn: { type: string, format: date }
+              - type: object
+                required: [code, ingredient]
+                properties:
+                  code: { const: ingredientExpiresToday }
+                  ingredient: { type: string }
+              - type: object
+                required: [code]
+                properties:
+                  code: { const: pantryOnlyBlocked }
         score: { type: integer }
     CreateImportTokenInput:
       type: object

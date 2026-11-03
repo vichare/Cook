@@ -6,6 +6,7 @@ export interface User {
   displayName: string
   nickname: string | null
   onboardingCompleted: boolean
+  locale: 'en' | 'zh-CN' | null
 }
 
 export interface AuthConfig {
@@ -96,8 +97,16 @@ export interface Recommendation {
   verify: string[]
   missing: string[]
   reasons: string[]
+  reasonDetails: RecommendationReason[]
   score: number
 }
+
+export type RecommendationReason =
+  | { code: 'confirmedIngredients'; confirmed: number; total: number }
+  | { code: 'preferredIngredients'; count: number }
+  | { code: 'ingredientExpired'; ingredient: string; expiresOn: string }
+  | { code: 'ingredientExpiresToday'; ingredient: string }
+  | { code: 'pantryOnlyBlocked' }
 
 export interface ImportToken {
   id: string

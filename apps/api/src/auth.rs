@@ -115,6 +115,7 @@ pub async fn upsert_development_user(pool: &SqlitePool, display_name: &str) -> A
         display_name: display_name.to_string(),
         nickname: None,
         onboarding_completed: false,
+        locale: None,
     };
     sqlx::query(
         "INSERT INTO users (id, email, profile_email, display_name) VALUES (?, ?, ?, ?)
@@ -130,16 +131,18 @@ pub async fn upsert_development_user(pool: &SqlitePool, display_name: &str) -> A
     Ok(user)
 }
 
+type UserRow = (String, String, String, Option<String>, bool, Option<String>);
+
 pub async fn load_user(pool: &SqlitePool, user_id: &UserId) -> AppResult<User> {
-    let row: Option<(String, String, String, Option<String>, bool)> = sqlx::query_as(
+    let row: Option<UserRow> = sqlx::query_as(
         "SELECT id, COALESCE(profile_email, email), display_name, public_nickname,
-           profile_onboarding_completed
+           profile_onboarding_completed, locale
          FROM users WHERE id = ?",
     )
     .bind(user_id.as_str())
     .fetch_optional(pool)
     .await?;
-    let (id, email, display_name, nickname, onboarding_completed) =
+    let (id, email, display_name, nickname, onboarding_completed, locale) =
         row.ok_or(AppError::Unauthorized)?;
     Ok(User {
         id,
@@ -147,6 +150,7 @@ pub async fn load_user(pool: &SqlitePool, user_id: &UserId) -> AppResult<User> {
         display_name,
         nickname,
         onboarding_completed,
+        locale,
     })
 }
 
