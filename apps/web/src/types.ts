@@ -63,6 +63,8 @@ export interface Recipe {
   description: string
   instructions: string
   visibility: 'private' | 'public'
+  difficulty: number | null
+  estimatedCalories: number | null
   ingredients: Ingredient[]
   isFavorite: boolean
   coverImage: RecipeImage | null
@@ -165,6 +167,8 @@ export interface RecipeRevision {
   title: string
   description: string
   instructions: string
+  difficulty: number | null
+  estimatedCalories: number | null
   ingredients: Ingredient[]
   imageAction: 'keep' | 'replace' | 'delete'
   imageAltText: string | null
@@ -190,6 +194,8 @@ export interface ImportDraft {
   title: string
   description: string
   instructions: string
+  difficulty: number | null
+  estimatedCalories: number | null
   ingredients: Ingredient[]
   warnings: string[]
   confidence: number | null

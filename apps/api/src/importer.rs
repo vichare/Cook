@@ -28,6 +28,8 @@ impl LicensedRecipeImporter for FixtureImporter {
                 description: "Synthetic fixture content for importer tests.".into(),
                 instructions: "Toast the bread.".into(),
                 visibility: "private".into(),
+                difficulty: None,
+                estimated_calories: None,
                 ingredients: vec![IngredientInput {
                     name: "bread".into(),
                     quantity_note: "one slice".into(),

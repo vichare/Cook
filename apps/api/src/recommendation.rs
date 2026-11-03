@@ -266,6 +266,8 @@ mod tests {
             description: String::new(),
             instructions: String::new(),
             visibility: "private".into(),
+            difficulty: None,
+            estimated_calories: None,
             version: 1,
             ingredients: ingredients
                 .iter()

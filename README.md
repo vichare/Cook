@@ -6,6 +6,8 @@ Pantry items can carry one optional date-only expiration and a default-off autom
 
 Ingredient entry uses shared Unicode normalization, multilingual pasted-list splitting, explicit canonical selections, and accessible suggestions; fuzzy matches are advisory and never silently alter recommendation hard filters. Expired items are explained as verification concerns rather than being changed to “used up.”
 
+Recipes may optionally include a 1–5 difficulty and an estimated total kcal value for the whole recipe. Both remain hidden when unset, flow through import drafts and scoped AI management, and do not affect recommendation scoring.
+
 ## Stack
 
 - React 19, TypeScript strict, Vite, TanStack Router and Query

@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useForm } from 'react-hook-form'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   AccountSecuritySettings,
@@ -10,8 +11,10 @@ import {
   PantryConfirmation,
   ProfileSetup,
   RecipeCoverFields,
+  RecipeMetadataFields,
   ShoppingListPage,
 } from './router'
+import type { RecipeForm } from './router'
 import { LocaleProvider, type Locale } from './i18n'
 
 const storedLocale = { value: null as string | null }
@@ -159,6 +162,50 @@ describe('shopping list', () => {
     expect(screen.getByRole('heading', { name: 'Manual and recipe items' })).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Mark Milk purchased' }))
     await waitFor(() => expect(markAutomaticShoppingPurchased).toHaveBeenCalledWith('pantry-1'))
+  })
+
+  function RecipeMetadataHarness() {
+    const form = useForm<RecipeForm>({
+      defaultValues: {
+        title: '',
+        description: '',
+        instructions: '',
+        visibility: 'private',
+        difficulty: null,
+        estimatedCalories: null,
+        ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
+      },
+    })
+    return <RecipeMetadataFields form={form} />
+  }
+
+  describe('recipe metadata', () => {
+    it('uses clearable numeric and plain-language controls', () => {
+      render(
+        <Providers>
+          <RecipeMetadataHarness />
+        </Providers>,
+      )
+      const difficulty = screen.getByLabelText('Difficulty')
+      fireEvent.change(difficulty, { target: { value: '4' } })
+      expect(difficulty).toHaveValue('4')
+      expect(screen.getByRole('option', { name: '4 — Challenging' })).toBeVisible()
+      const calories = screen.getByRole('spinbutton', { name: /Estimated total calories/ })
+      fireEvent.change(calories, { target: { value: '850' } })
+      expect(calories).toHaveValue(850)
+      fireEvent.change(difficulty, { target: { value: '' } })
+      expect(difficulty).toHaveValue('')
+    })
+
+    it('localizes difficulty and whole-recipe calorie guidance', () => {
+      render(
+        <Providers locale="zh-CN">
+          <RecipeMetadataHarness />
+        </Providers>,
+      )
+      expect(screen.getByRole('option', { name: '1 — 非常容易' })).toBeVisible()
+      expect(screen.getByText(/整份菜谱的估算值/)).toBeVisible()
+    })
   })
 
   it('renders shopping controls in Simplified Chinese', async () => {

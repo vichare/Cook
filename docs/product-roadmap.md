@@ -22,6 +22,12 @@ Each pantry item has an optional, default-off automatic-restock setting. Only an
 
 Manual and recipe-added shopping sources persist privately per account. Canonical identities deduplicate by canonical ID, unresolved input deduplicates by the account's normalized key, and overlapping automatic, manual, and recipe sources appear as one item with all provenance shown. Automatic items cannot be deleted or completed like ordinary manual entries; the user must mark them purchased or disable automatic restock. Recommendation results provide an explicit, confirmed action for adding individual missing ingredients. AI recipe tokens receive no pantry or shopping-list access.
 
+### Optional difficulty and estimated total calories
+
+Recipes, import drafts, AI management payloads, and pending revisions may carry a nullable difficulty integer from 1 to 5 and a nullable estimated total calorie value from 1 to 100,000 kcal. Calories always describe the whole recipe, not a serving, and the interface labels them as an estimate rather than medical or precise nutrition information. Null values render no label, chip, or empty placeholder in recipe lists, details, recommendations, or import review.
+
+These fields do not affect recommendation scores. Recipe-specific scaling by servings or primary-ingredient weight is future scope and remains **unverified**; Cook does not assume calories scale linearly.
+
 ### Older-adult accessibility baseline
 
 Cook targets WCAG 2.2 AA, supports 200% text zoom and reflow, uses at least 16px default body text and 44-by-44 CSS-pixel controls, provides visible keyboard focus and high contrast, and never communicates status only by color. Important forms retain entered values on recoverable errors, use plain-language recovery guidance, and do not impose short automatic timeouts. Destructive credential, token, and import-draft actions require confirmation.

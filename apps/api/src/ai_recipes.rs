@@ -38,6 +38,10 @@ pub struct AiRecipeInput {
     description: String,
     #[serde(default)]
     instructions: String,
+    #[serde(default)]
+    difficulty: Option<i64>,
+    #[serde(default)]
+    estimated_calories: Option<i64>,
     ingredients: Vec<IngredientInput>,
     expected_version: Option<i64>,
     visibility: Option<String>,
@@ -52,6 +56,8 @@ pub struct RecipeRevision {
     title: String,
     description: String,
     instructions: String,
+    difficulty: Option<i64>,
+    estimated_calories: Option<i64>,
     ingredients: Vec<IngredientInput>,
     image_action: String,
     image_alt_text: Option<String>,
@@ -147,8 +153,9 @@ pub async fn create_ai_recipe(
     let recipe_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO recipes
-         (id, owner_id, title, description, instructions, visibility, version)
-         VALUES (?, ?, ?, ?, ?, ?, 1)",
+         (id, owner_id, title, description, instructions, visibility, difficulty,
+          estimated_calories, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(&recipe_id)
     .bind(&principal.owner_id)
@@ -156,6 +163,8 @@ pub async fn create_ai_recipe(
     .bind(recipe_input.description.trim())
     .bind(recipe_input.instructions.trim())
     .bind(&recipe_input.visibility)
+    .bind(recipe_input.difficulty)
+    .bind(recipe_input.estimated_calories)
     .execute(&mut *transaction)
     .await?;
     crate::routes::insert_ingredients(
@@ -440,7 +449,8 @@ pub(crate) async fn accept_revision(
 ) -> AppResult<Json<Recipe>> {
     let mut transaction = state.pool.begin().await?;
     let row = sqlx::query(
-        "SELECT recipe_id, expected_version, title, description, instructions, image_action,
+        "SELECT recipe_id, expected_version, title, description, instructions, difficulty,
+                estimated_calories, image_action,
                 image_media_type, image_bytes, image_width, image_height, image_sha256,
                 image_alt_text, image_source_url, image_source_license, image_source_attribution
          FROM recipe_revisions WHERE id = ? AND owner_id = ? AND status = 'pending'",
@@ -454,12 +464,15 @@ pub(crate) async fn accept_revision(
     let expected_version: i64 = row.get("expected_version");
     let updated = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?,
-           version = version + 1, updated_at = CURRENT_TIMESTAMP
+           difficulty = ?, estimated_calories = ?, version = version + 1,
+           updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ? AND version = ?",
     )
     .bind(row.get::<String, _>("title"))
     .bind(row.get::<String, _>("description"))
     .bind(row.get::<String, _>("instructions"))
+    .bind(row.get::<Option<i64>, _>("difficulty"))
+    .bind(row.get::<Option<i64>, _>("estimated_calories"))
     .bind(&recipe_id)
     .bind(&user.id)
     .bind(expected_version)
@@ -587,13 +600,16 @@ async fn update_recipe_direct(
 ) -> AppResult<()> {
     let result = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?,
-           visibility = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP
+           visibility = ?, difficulty = ?, estimated_calories = ?,
+           version = version + 1, updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ? AND visibility = ? AND version = ?",
     )
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(input.instructions.trim())
     .bind(&input.visibility)
+    .bind(input.difficulty)
+    .bind(input.estimated_calories)
     .bind(recipe_id)
     .bind(&principal.owner_id)
     .bind(current_visibility)
@@ -656,10 +672,10 @@ async fn create_revision(
     sqlx::query(
         "INSERT INTO recipe_revisions
          (id, recipe_id, owner_id, token_id, expected_version, title, description,
-          instructions, image_action, image_media_type, image_bytes, image_width,
+          instructions, difficulty, estimated_calories, image_action, image_media_type, image_bytes, image_width,
           image_height, image_sha256, image_alt_text, image_source_url,
           image_source_license, image_source_attribution, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(recipe_id)
@@ -669,6 +685,8 @@ async fn create_revision(
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(input.instructions.trim())
+    .bind(input.difficulty)
+    .bind(input.estimated_calories)
     .bind(image_action)
     .bind(image.map(|_| "image/jpeg"))
     .bind(image.map(|value| value.bytes.as_slice()))
@@ -731,16 +749,21 @@ async fn load_recipe_input_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     recipe_id: &str,
 ) -> AppResult<RecipeInput> {
-    let row = sqlx::query("SELECT title, description, instructions FROM recipes WHERE id = ?")
-        .bind(recipe_id)
-        .fetch_one(&mut **transaction)
-        .await?;
+    let row = sqlx::query(
+        "SELECT title, description, instructions, difficulty, estimated_calories
+         FROM recipes WHERE id = ?",
+    )
+    .bind(recipe_id)
+    .fetch_one(&mut **transaction)
+    .await?;
     let ingredients = load_ingredients_tx(transaction, recipe_id).await?;
     Ok(RecipeInput {
         title: row.get("title"),
         description: row.get("description"),
         instructions: row.get("instructions"),
         visibility: "private".into(),
+        difficulty: row.get("difficulty"),
+        estimated_calories: row.get("estimated_calories"),
         ingredients,
     })
 }
@@ -751,6 +774,8 @@ fn recipe_input(input: &AiRecipeInput, visibility: &str) -> RecipeInput {
         description: input.description.clone(),
         instructions: input.instructions.clone(),
         visibility: visibility.into(),
+        difficulty: input.difficulty,
+        estimated_calories: input.estimated_calories,
         ingredients: input.ingredients.clone(),
     }
 }
@@ -830,6 +855,7 @@ async fn load_revision(
 ) -> AppResult<RecipeRevision> {
     let row = sqlx::query(
         "SELECT id, recipe_id, expected_version, title, description, instructions,
+                difficulty, estimated_calories,
                 image_action, image_alt_text, image_source_url, image_source_license,
                 image_source_attribution, status, created_at, updated_at
          FROM recipe_revisions WHERE id = ? AND owner_id = ?",
@@ -853,6 +879,8 @@ async fn load_revision(
         title: row.get("title"),
         description: row.get("description"),
         instructions: row.get("instructions"),
+        difficulty: row.get("difficulty"),
+        estimated_calories: row.get("estimated_calories"),
         ingredients: ingredients
             .into_iter()
             .map(

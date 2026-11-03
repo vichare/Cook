@@ -10,7 +10,7 @@ import {
 } from '@tanstack/react-router'
 import { QueryClient, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useFieldArray, useForm } from 'react-hook-form'
+import { useFieldArray, useForm, type UseFormReturn } from 'react-hook-form'
 import { z } from 'zod'
 import { ApiError, api } from './api'
 import type {
@@ -483,6 +483,12 @@ function RecommendationsPage() {
                   {t('recommend.details')}
                 </Link>
               </div>
+              <RecipeMetadata
+                difficulty={result.recipe.difficulty}
+                estimatedCalories={result.recipe.estimatedCalories}
+                formatNumber={formatNumber}
+                t={t}
+              />
               <p>
                 {result.reasonDetails
                   .map((reason) => recommendationReasonLabel(reason, t, formatDate, formatNumber))
@@ -588,7 +594,7 @@ function IngredientFilterInput({
 }
 
 function RecipesPage() {
-  const { t } = useI18n()
+  const { formatNumber, t } = useI18n()
   const recipes = useQuery({ queryKey: ['recipes'], queryFn: api.recipes })
   const queryClient = useQueryClient()
   const favorite = useMutation({
@@ -634,6 +640,12 @@ function RecipesPage() {
                 </button>
               </div>
               <p>{recipe.description || t('recipes.noDescription')}</p>
+              <RecipeMetadata
+                difficulty={recipe.difficulty}
+                estimatedCalories={recipe.estimatedCalories}
+                formatNumber={formatNumber}
+                t={t}
+              />
               <p className="byline">
                 {t('common.byAuthor', { author: recipe.authorNickname ?? t('common.anonymousUser') })}
               </p>
@@ -649,7 +661,7 @@ function RecipesPage() {
 }
 
 function RecipeDetailPage() {
-  const { t } = useI18n()
+  const { formatNumber, t } = useI18n()
   const { recipeId } = recipeRoute.useParams()
   const recipe = useQuery({ queryKey: ['recipe', recipeId], queryFn: () => api.recipe(recipeId) })
   return (
@@ -670,6 +682,12 @@ function RecipeDetailPage() {
             <p className="byline">
               {t('common.byAuthor', { author: recipe.data.authorNickname ?? t('common.anonymousUser') })}
             </p>
+            <RecipeMetadata
+              difficulty={recipe.data.difficulty}
+              estimatedCalories={recipe.data.estimatedCalories}
+              formatNumber={formatNumber}
+              t={t}
+            />
             {recipe.data.coverImage && (
               <figure className="recipe-cover-detail">
                 <img
@@ -725,7 +743,7 @@ function RecipeDetailPage() {
 }
 
 function RevisionReview({ recipeId }: { recipeId: string }) {
-  const { t } = useI18n()
+  const { formatNumber, t } = useI18n()
   const queryClient = useQueryClient()
   const revisions = useQuery({
     queryKey: ['recipe-revisions', recipeId],
@@ -757,6 +775,12 @@ function RevisionReview({ recipeId }: { recipeId: string }) {
         <article className="source-note" key={revision.id}>
           <h3>{revision.title}</h3>
           <p>{revision.description}</p>
+          <RecipeMetadata
+            difficulty={revision.difficulty}
+            estimatedCalories={revision.estimatedCalories}
+            formatNumber={formatNumber}
+            t={t}
+          />
           <p>{t('recipe.revisionImageAction', {
             action: t(
               revision.imageAction === 'replace'
@@ -844,6 +868,8 @@ function recipeSchema(t: Translate) {
   description: z.string(),
   instructions: z.string(),
   visibility: z.enum(['private', 'public']),
+  difficulty: z.number().int().min(1).max(5).nullable(),
+  estimatedCalories: z.number().int().min(1).max(100000).nullable(),
   ingredients: z.array(z.object({
     name: z.string().trim().min(1, t('recipe.ingredientRequired')),
     quantityNote: z.string(),
@@ -851,7 +877,85 @@ function recipeSchema(t: Translate) {
   })).min(1),
   })
 }
-type RecipeForm = z.infer<ReturnType<typeof recipeSchema>>
+export type RecipeForm = z.infer<ReturnType<typeof recipeSchema>>
+
+function difficultyLabel(value: number, t: Translate): string {
+  const key = `recipe.difficulty${value}` as
+    | 'recipe.difficulty1'
+    | 'recipe.difficulty2'
+    | 'recipe.difficulty3'
+    | 'recipe.difficulty4'
+    | 'recipe.difficulty5'
+  return t(key, { value })
+}
+
+function RecipeMetadata({
+  difficulty,
+  estimatedCalories,
+  formatNumber,
+  t,
+}: {
+  difficulty: number | null
+  estimatedCalories: number | null
+  formatNumber: (value: number) => string
+  t: Translate
+}) {
+  if (difficulty === null && estimatedCalories === null) return null
+  return (
+    <dl className="recipe-metadata">
+      {difficulty !== null && (
+        <div>
+          <dt>{t('recipe.difficulty')}</dt>
+          <dd>{difficultyLabel(difficulty, t)}</dd>
+        </div>
+      )}
+      {estimatedCalories !== null && (
+        <div>
+          <dt>{t('recipe.estimatedCalories')}</dt>
+          <dd>{t('recipe.estimatedCaloriesValue', { value: formatNumber(estimatedCalories) })}</dd>
+        </div>
+      )}
+    </dl>
+  )
+}
+
+export function RecipeMetadataFields({ form }: { form: UseFormReturn<RecipeForm> }) {
+  const { t } = useI18n()
+  return (
+    <fieldset>
+      <legend>{t('recipe.optionalDetails')}</legend>
+      <label>
+        {t('recipe.difficulty')}
+        <select
+          {...form.register('difficulty', {
+            setValueAs: (value) => (value === '' ? null : Number(value)),
+          })}
+        >
+          <option value="">{t('recipe.notSet')}</option>
+          {[1, 2, 3, 4, 5].map((value) => (
+            <option value={value} key={value}>
+              {difficultyLabel(value, t)}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        {t('recipe.estimatedCalories')}
+        <input
+          type="number"
+          inputMode="numeric"
+          min={1}
+          max={100000}
+          step={1}
+          {...form.register('estimatedCalories', {
+            setValueAs: (value) => (value === '' ? null : Number(value)),
+          })}
+        />
+        <small>{t('recipe.estimatedCaloriesHelp')}</small>
+      </label>
+    </fieldset>
+  )
+}
 
 function RecipeEditor({ recipe }: { recipe?: Recipe }) {
   const { t } = useI18n()
@@ -880,6 +984,8 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
       description: '',
       instructions: '',
       visibility: 'private',
+      difficulty: null,
+      estimatedCalories: null,
       ingredients: [{ name: '', quantityNote: '', canonicalIngredientId: null }],
     },
   })
@@ -964,6 +1070,7 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
           <option value="public">{t('recipe.public')}</option>
         </select>
       </label>
+      <RecipeMetadataFields form={form} />
       <RecipeCoverFields
         hasImage={Boolean(coverFile || recipe?.coverImage)}
         removed={removeCover}
@@ -2003,10 +2110,10 @@ export const COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS = `${COOK_SKILL_INSTALL_INS
 
 This high-risk token includes recipes:publish. The skill may create public recipes, publish owned private recipes, directly update owned public recipes with optimistic concurrency, and manage cover images. It still cannot delete recipes or access another account. Check the granted scopes before every operation, confirm content and image rights, process batch work one recipe at a time, and finish with created/updated/skipped/failed counts plus recipe IDs or URLs.`
 export const COOK_IMPORT_PROMPT_TEMPLATE = `English:
-Use your browser tools to extract a recipe from a webpage I am authorized to access, preferring schema.org Recipe/JSON-LD. For video, use only legitimately available captions/transcripts; if unavailable, ask me for a transcript. Do not bypass login, paywalls, robots restrictions, access controls, or DRM. Rewrite concise structured ingredients and steps, preserve source URL/title/author, and record uncertainty as warnings. Validate against the Cook import draft schema, then create a private review draft at COOK_BASE_URL using the recipes:import credential from the COOK_IMPORT_TOKEN secret/environment variable. Never print, quote, log, download, or place that token in a URL or prompt. Do not publish or finalize the recipe; tell me to review the private draft in Cook.
+Use your browser tools to extract a recipe from a webpage I am authorized to access, preferring schema.org Recipe/JSON-LD. For video, use only legitimately available captions/transcripts; if unavailable, ask me for a transcript. Do not bypass login, paywalls, robots restrictions, access controls, or DRM. Rewrite concise structured ingredients and steps, preserve source URL/title/author, and record uncertainty as warnings. Preserve a stated 1–5 difficulty; include estimatedCalories only as an explicitly estimated whole-recipe total, never per serving or medical advice. Validate against the Cook import draft schema, then create a private review draft at COOK_BASE_URL using the recipes:import credential from the COOK_IMPORT_TOKEN secret/environment variable. Never print, quote, log, download, or place that token in a URL or prompt. Do not publish or finalize the recipe; tell me to review the private draft in Cook.
 
 简体中文：
-请使用浏览器工具，从我有权访问的网页提取菜谱，优先使用 schema.org Recipe/JSON-LD。视频只能使用合法可用的字幕或 transcript；若无法取得，请要求我提供 transcript。不得绕过登录、付费墙、robots 限制、访问控制或 DRM。请将食材和步骤简洁结构化并改写，保留来源 URL、标题和作者，把不确定内容记录为 warnings。按 Cook 导入草稿 schema 验证后，使用 secret store/环境变量中的 COOK_IMPORT_TOKEN（recipes:import 权限）调用 COOK_BASE_URL，创建私密待审核草稿。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。不要发布或完成菜谱；请提醒我在 Cook 中人工审核私密草稿。`
+请使用浏览器工具，从我有权访问的网页提取菜谱，优先使用 schema.org Recipe/JSON-LD。视频只能使用合法可用的字幕或 transcript；若无法取得，请要求我提供 transcript。不得绕过登录、付费墙、robots 限制、访问控制或 DRM。请将食材和步骤简洁结构化并改写，保留来源 URL、标题和作者，把不确定内容记录为 warnings。保留来源明确给出的 1–5 难度；estimatedCalories 只能表示明确标注为估算的整份总热量，不能当作每份或医疗建议。按 Cook 导入草稿 schema 验证后，使用 secret store/环境变量中的 COOK_IMPORT_TOKEN（recipes:import 权限）调用 COOK_BASE_URL，创建私密待审核草稿。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。不要发布或完成菜谱；请提醒我在 Cook 中人工审核私密草稿。`
 export const COOK_MANAGE_PROMPT_TEMPLATE = `English:
 Use your browser or transcript tools only for content I am authorized to access. Prefer schema.org Recipe/JSON-LD and legitimately available captions/transcripts. Do not bypass login, paywalls, access controls, robots restrictions, or DRM. Use COOK_BASE_URL with the COOK_IMPORT_TOKEN secret/environment variable to read my recipes and versions, create private recipes, or update my private recipes with optimistic concurrency. Updates to public recipes must create a pending revision for my review and must never publish directly. Before uploading a local JPEG, PNG, or WebP cover image, ask me to confirm that I own it or have permission, then provide accurate alt text and any source/license/attribution. Never fetch or copy a source site's image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
 
@@ -2344,6 +2451,8 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
       description: draft.description,
       instructions: draft.instructions,
       visibility: 'private',
+      difficulty: draft.difficulty,
+      estimatedCalories: draft.estimatedCalories,
       ingredients: draft.ingredients,
     },
   })
@@ -2354,6 +2463,8 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
         title: value.title,
         description: value.description,
         instructions: value.instructions,
+        difficulty: value.difficulty,
+        estimatedCalories: value.estimatedCalories,
         ingredients: value.ingredients,
       }),
     onSuccess: (value) => queryClient.setQueryData(['import-draft', draft.id], value),
@@ -2371,6 +2482,7 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
       <label>{t('recipe.title')}<input {...form.register('title')} /></label>
       <label>{t('recipe.description')}<textarea rows={3} {...form.register('description')} /></label>
       <label>{t('recipe.instructions')}<textarea rows={10} {...form.register('instructions')} /></label>
+      <RecipeMetadataFields form={form} />
       <fieldset>
         <legend>{t('recipe.ingredients')}</legend>
         {fields.fields.map((field, index) => (

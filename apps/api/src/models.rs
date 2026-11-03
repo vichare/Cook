@@ -43,6 +43,10 @@ pub struct RecipeInput {
     pub instructions: String,
     #[serde(default = "private_visibility")]
     pub visibility: String,
+    #[serde(default)]
+    pub difficulty: Option<i64>,
+    #[serde(default)]
+    pub estimated_calories: Option<i64>,
     pub ingredients: Vec<IngredientInput>,
 }
 
@@ -62,6 +66,8 @@ pub struct Recipe {
     pub description: String,
     pub instructions: String,
     pub visibility: String,
+    pub difficulty: Option<i64>,
+    pub estimated_calories: Option<i64>,
     pub version: i64,
     pub ingredients: Vec<IngredientInput>,
     pub is_favorite: bool,

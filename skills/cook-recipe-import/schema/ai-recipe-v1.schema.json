@@ -9,6 +9,18 @@
     "title": { "type": "string", "minLength": 1, "maxLength": 120 },
     "description": { "type": "string", "maxLength": 2000, "default": "" },
     "instructions": { "type": "string", "maxLength": 20000, "default": "" },
+    "difficulty": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 5,
+      "description": "Optional whole-recipe difficulty aligned with the source's 1–5 scale."
+    },
+    "estimatedCalories": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 100000,
+      "description": "Optional estimated total kcal for the whole recipe, not per serving."
+    },
     "visibility": {
       "type": "string",
       "enum": ["private", "public"],

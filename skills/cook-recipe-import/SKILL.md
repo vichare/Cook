@@ -20,6 +20,7 @@ Use this skill to turn an authorized source into a private Cook review draft, ma
 4. Do not bypass authentication, paywalls, robots restrictions, DRM, or access controls.
 5. Do not copy source images or long passages. Convert the recipe into concise structured ingredients and rewritten cooking steps while preserving source attribution.
 6. Treat every extracted field as untrusted. Record ambiguity, missing quantities, conflicting instructions, or low-confidence interpretation in `warnings`.
+7. Preserve an explicit source difficulty only as an optional integer from 1 to 5. If estimating calories, use `estimatedCalories` only for an clearly labeled whole-recipe total; omit uncertain values rather than inventing precision. These values are estimates, not medical nutrition advice.
 
 ## Create the draft
 

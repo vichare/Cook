@@ -989,13 +989,16 @@ async fn update_recipe(
             .ok_or(AppError::NotFound)?;
     let result = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?, visibility = ?,
-         version = version + 1, updated_at = CURRENT_TIMESTAMP
+         difficulty = ?, estimated_calories = ?, version = version + 1,
+         updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ?",
     )
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(input.instructions.trim())
     .bind(&input.visibility)
+    .bind(input.difficulty)
+    .bind(input.estimated_calories)
     .bind(&id)
     .bind(&user.id)
     .execute(&mut *transaction)
@@ -1399,6 +1402,22 @@ pub(crate) fn validate_recipe(input: &RecipeInput) -> AppResult<()> {
             "visibility must be private or public".into(),
         ));
     }
+    if input
+        .difficulty
+        .is_some_and(|value| !(1..=5).contains(&value))
+    {
+        return Err(AppError::Validation(
+            "difficulty must be an integer from 1 to 5".into(),
+        ));
+    }
+    if input
+        .estimated_calories
+        .is_some_and(|value| !(1..=100_000).contains(&value))
+    {
+        return Err(AppError::Validation(
+            "estimated total calories must be an integer from 1 to 100000".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1742,7 +1761,9 @@ async fn save_recipe(
     let _ = imported;
     let mut transaction = pool.begin().await?;
     sqlx::query(
-        "INSERT INTO recipes (id, owner_id, title, description, instructions, visibility) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO recipes
+         (id, owner_id, title, description, instructions, visibility, difficulty, estimated_calories)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(owner_id)
@@ -1750,6 +1771,8 @@ async fn save_recipe(
     .bind(input.description.trim())
     .bind(input.instructions.trim())
     .bind(&input.visibility)
+    .bind(input.difficulty)
+    .bind(input.estimated_calories)
     .execute(&mut *transaction)
     .await?;
     insert_ingredients(&mut transaction, id, owner_id, &input.ingredients).await?;
@@ -1836,7 +1859,8 @@ pub(crate) async fn load_visible_recipes(
 ) -> AppResult<Vec<Recipe>> {
     let rows = if let Some(id) = id {
         sqlx::query(
-            "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility, r.version,
+            "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
+               r.difficulty, r.estimated_calories, r.version,
                u.public_nickname, r.source_url, r.source_title, r.source_author,
                r.source_warnings, r.source_confidence,
                EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite
@@ -1850,7 +1874,8 @@ pub(crate) async fn load_visible_recipes(
         .await?
     } else {
         sqlx::query(
-            "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility, r.version,
+            "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
+               r.difficulty, r.estimated_calories, r.version,
                u.public_nickname, r.source_url, r.source_title, r.source_author,
                r.source_warnings, r.source_confidence,
                EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite
@@ -1895,6 +1920,8 @@ pub(crate) async fn load_visible_recipes(
             description: row.get("description"),
             instructions: row.get("instructions"),
             visibility: row.get("visibility"),
+            difficulty: row.get("difficulty"),
+            estimated_calories: row.get("estimated_calories"),
             version: row.get("version"),
             is_favorite: row.get::<i64, _>("is_favorite") != 0,
             source,
@@ -2217,6 +2244,8 @@ mod tests {
             "sourceAuthor": "Example author",
             "title": "Imported soup",
             "description": "Review me",
+            "difficulty": 2,
+            "estimatedCalories": 450,
             "ingredients": [{"name": "water", "quantityNote": "1 cup"}],
             "steps": ["Stir the ingredients."],
             "warnings": ["Timing was inferred."],
@@ -3272,6 +3301,8 @@ mod tests {
             "title": "Reviewed public soup",
             "description": "Proposed",
             "instructions": "Stir carefully.",
+            "difficulty": 4,
+            "estimatedCalories": 1200,
             "ingredients": [{"name": "water", "quantityNote": "3 cups"}],
             "expectedVersion": created["version"]
         });
@@ -3289,6 +3320,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let pending = response_json(response).await;
         assert_eq!(pending["status"], "pendingReview");
+        assert_eq!(pending["revision"]["difficulty"], 4);
+        assert_eq!(pending["revision"]["estimatedCalories"], 1200);
         let revision_id = pending["revision"]["id"].as_str().unwrap();
 
         let live = app
@@ -3316,6 +3349,8 @@ mod tests {
         assert_eq!(accept.status(), StatusCode::OK);
         let accepted = response_json(accept).await;
         assert_eq!(accepted["title"], "Reviewed public soup");
+        assert_eq!(accepted["difficulty"], 4);
+        assert_eq!(accepted["estimatedCalories"], 1200);
         assert_eq!(accepted["version"], 2);
         assert_eq!(accepted["visibility"], "public");
 
@@ -3678,6 +3713,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let draft = response_json(response).await;
         let draft_id = draft["id"].as_str().unwrap();
+        assert_eq!(draft["difficulty"], 2);
+        assert_eq!(draft["estimatedCalories"], 450);
 
         let other = app
             .clone()
@@ -3717,6 +3754,8 @@ mod tests {
         assert_eq!(recipe["visibility"], "private");
         assert_eq!(recipe["source"]["url"], "https://example.test/soup");
         assert_eq!(recipe["source"]["warnings"][0], "Timing was inferred.");
+        assert_eq!(recipe["difficulty"], 2);
+        assert_eq!(recipe["estimatedCalories"], 450);
 
         let duplicate = app
             .oneshot(
@@ -3890,6 +3929,87 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let pantry: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(pantry, json!([]));
+    }
+
+    #[tokio::test]
+    async fn recipe_metadata_is_optional_validated_and_owner_editable() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Metadata soup",
+                            "description": "",
+                            "instructions": "Stir.",
+                            "visibility": "private",
+                            "difficulty": 3,
+                            "estimatedCalories": 900,
+                            "ingredients": [{"name": "water", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let recipe = response_json(create).await;
+        assert_eq!(recipe["difficulty"], 3);
+        assert_eq!(recipe["estimatedCalories"], 900);
+        let recipe_id = recipe["id"].as_str().unwrap();
+
+        let clear = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Metadata soup",
+                            "description": "",
+                            "instructions": "Stir.",
+                            "visibility": "private",
+                            "difficulty": null,
+                            "estimatedCalories": null,
+                            "ingredients": [{"name": "water", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(clear.status(), StatusCode::OK);
+        let cleared = response_json(clear).await;
+        assert!(cleared["difficulty"].is_null());
+        assert!(cleared["estimatedCalories"].is_null());
+
+        let invalid = app
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Invalid metadata",
+                            "visibility": "private",
+                            "difficulty": 0,
+                            "estimatedCalories": 100001,
+                            "ingredients": [{"name": "water"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

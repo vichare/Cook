@@ -112,7 +112,16 @@ export const api = {
   recipes: () => request<Recipe[]>('/api/recipes'),
   recipe: (id: string) => request<Recipe>(`/api/recipes/${id}`),
   saveRecipe: (
-    value: Pick<Recipe, 'title' | 'description' | 'instructions' | 'visibility' | 'ingredients'>,
+    value: Pick<
+      Recipe,
+      | 'title'
+      | 'description'
+      | 'instructions'
+      | 'visibility'
+      | 'difficulty'
+      | 'estimatedCalories'
+      | 'ingredients'
+    >,
     id?: string,
   ) =>
     request<Recipe>(id ? `/api/recipes/${id}` : '/api/recipes', {
@@ -249,7 +258,10 @@ export const api = {
   importDraft: (id: string) => request<ImportDraft>(`/api/import-drafts/${id}`),
   saveImportDraft: (
     id: string,
-    value: Pick<ImportDraft, 'title' | 'description' | 'instructions' | 'ingredients'>,
+    value: Pick<
+      ImportDraft,
+      'title' | 'description' | 'instructions' | 'difficulty' | 'estimatedCalories' | 'ingredients'
+    >,
   ) =>
     request<ImportDraft>(`/api/import-drafts/${id}`, {
       method: 'PUT',

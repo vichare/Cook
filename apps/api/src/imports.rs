@@ -68,6 +68,10 @@ pub struct ImportDraftSubmission {
     title: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    difficulty: Option<i64>,
+    #[serde(default)]
+    estimated_calories: Option<i64>,
     ingredients: Vec<IngredientInput>,
     steps: Vec<String>,
     #[serde(default)]
@@ -83,6 +87,10 @@ pub struct ImportDraftUpdate {
     description: String,
     #[serde(default)]
     instructions: String,
+    #[serde(default)]
+    difficulty: Option<i64>,
+    #[serde(default)]
+    estimated_calories: Option<i64>,
     ingredients: Vec<IngredientInput>,
 }
 
@@ -96,6 +104,8 @@ pub struct ImportDraft {
     title: String,
     description: String,
     instructions: String,
+    difficulty: Option<i64>,
+    estimated_calories: Option<i64>,
     ingredients: Vec<IngredientInput>,
     warnings: Vec<String>,
     confidence: Option<f64>,
@@ -253,8 +263,8 @@ pub(crate) async fn create_import_draft(
     sqlx::query(
         "INSERT INTO import_drafts
          (id, owner_id, source_url, source_title, source_author, title, description,
-          instructions, warnings_json, confidence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          instructions, difficulty, estimated_calories, warnings_json, confidence, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&owner_id)
@@ -264,6 +274,8 @@ pub(crate) async fn create_import_draft(
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(&instructions)
+    .bind(input.difficulty)
+    .bind(input.estimated_calories)
     .bind(&warnings_json)
     .bind(input.confidence)
     .bind(now.timestamp())
@@ -322,12 +334,15 @@ pub(crate) async fn update_import_draft(
     let mut transaction = state.pool.begin().await?;
     let result = sqlx::query(
         "UPDATE import_drafts
-         SET title = ?, description = ?, instructions = ?, updated_at = ?
+         SET title = ?, description = ?, instructions = ?, difficulty = ?,
+             estimated_calories = ?, updated_at = ?
          WHERE id = ? AND owner_id = ? AND status = 'draft'",
     )
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(input.instructions.trim())
+    .bind(input.difficulty)
+    .bind(input.estimated_calories)
     .bind(Utc::now().timestamp())
     .bind(&id)
     .bind(&user.id)
@@ -373,6 +388,7 @@ pub(crate) async fn accept_import_draft(
     let mut transaction = state.pool.begin().await?;
     let row = sqlx::query(
         "SELECT source_url, source_title, source_author, title, description, instructions,
+           difficulty, estimated_calories,
            warnings_json, confidence, status
          FROM import_drafts WHERE id = ? AND owner_id = ?",
     )
@@ -400,8 +416,9 @@ pub(crate) async fn accept_import_draft(
     sqlx::query(
         "INSERT INTO recipes
          (id, owner_id, title, description, instructions, visibility, source_url,
-          source_attribution, source_title, source_author, source_warnings, source_confidence)
-         VALUES (?, ?, ?, ?, ?, 'private', ?, ?, ?, ?, ?, ?)",
+          difficulty, estimated_calories, source_attribution, source_title, source_author,
+          source_warnings, source_confidence)
+         VALUES (?, ?, ?, ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&recipe_id)
     .bind(&user.id)
@@ -409,6 +426,8 @@ pub(crate) async fn accept_import_draft(
     .bind(row.get::<String, _>("description"))
     .bind(row.get::<String, _>("instructions"))
     .bind(row.get::<String, _>("source_url"))
+    .bind(row.get::<Option<i64>, _>("difficulty"))
+    .bind(row.get::<Option<i64>, _>("estimated_calories"))
     .bind(attribution)
     .bind(source_title)
     .bind(source_author)
@@ -606,6 +625,7 @@ fn validate_submission(input: &ImportDraftSubmission) -> AppResult<()> {
     validate_optional_text("sourceAuthor", input.source_author.as_deref(), 200)?;
     validate_short_text("title", &input.title, 120, false)?;
     validate_short_text("description", &input.description, 2000, true)?;
+    validate_recipe_metadata(input.difficulty, input.estimated_calories)?;
     validate_ingredients(&input.ingredients)?;
     if input.steps.is_empty() || input.steps.len() > 50 {
         return Err(AppError::Validation(
@@ -646,7 +666,25 @@ fn validate_draft_update(input: &ImportDraftUpdate) -> AppResult<()> {
     validate_short_text("title", &input.title, 120, false)?;
     validate_short_text("description", &input.description, 2000, true)?;
     validate_short_text("instructions", &input.instructions, 20_000, false)?;
+    validate_recipe_metadata(input.difficulty, input.estimated_calories)?;
     validate_ingredients(&input.ingredients)
+}
+
+fn validate_recipe_metadata(
+    difficulty: Option<i64>,
+    estimated_calories: Option<i64>,
+) -> AppResult<()> {
+    if difficulty.is_some_and(|value| !(1..=5).contains(&value)) {
+        return Err(AppError::Validation(
+            "difficulty must be an integer from 1 to 5".into(),
+        ));
+    }
+    if estimated_calories.is_some_and(|value| !(1..=100_000).contains(&value)) {
+        return Err(AppError::Validation(
+            "estimatedCalories must be an integer from 1 to 100000".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ingredients(ingredients: &[IngredientInput]) -> AppResult<()> {
@@ -700,6 +738,7 @@ fn validate_short_text(
 async fn load_import_draft(pool: &SqlitePool, owner_id: &str, id: &str) -> AppResult<ImportDraft> {
     let row = sqlx::query(
         "SELECT id, source_url, source_title, source_author, title, description, instructions,
+           difficulty, estimated_calories,
            warnings_json, confidence, status, accepted_recipe_id, created_at, updated_at
          FROM import_drafts WHERE id = ? AND owner_id = ?",
     )
@@ -716,6 +755,8 @@ async fn load_import_draft(pool: &SqlitePool, owner_id: &str, id: &str) -> AppRe
         title: row.get("title"),
         description: row.get("description"),
         instructions: row.get("instructions"),
+        difficulty: row.get("difficulty"),
+        estimated_calories: row.get("estimated_calories"),
         ingredients: load_draft_ingredients(pool, id).await?,
         warnings: serde_json::from_str(&row.get::<String, _>("warnings_json"))
             .map_err(|error| AppError::Data(format!("invalid stored import warnings: {error}")))?,
@@ -860,6 +901,8 @@ mod tests {
             source_author: None,
             title: "Soup".into(),
             description: String::new(),
+            difficulty: None,
+            estimated_calories: None,
             ingredients: vec![IngredientInput {
                 name: "water".into(),
                 quantity_note: String::new(),
