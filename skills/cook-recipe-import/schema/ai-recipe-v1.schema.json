@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cook.vichare.net/schemas/ai-recipe-v1.schema.json",
+  "title": "Cook AI recipe create or update",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "ingredients"],
+  "properties": {
+    "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "description": { "type": "string", "maxLength": 2000, "default": "" },
+    "instructions": { "type": "string", "maxLength": 20000, "default": "" },
+    "expectedVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Required for update and omitted for create."
+    },
+    "ingredients": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "quantityNote": { "type": "string", "maxLength": 240, "default": "" },
+          "canonicalIngredientId": {
+            "type": ["string", "null"],
+            "description": "Use only an ID returned by Cook for the token owner's recipe data. Never infer one from fuzzy text."
+          }
+        }
+      }
+    }
+  }
+}

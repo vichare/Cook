@@ -30,13 +30,19 @@ Google email, display name, issuer, and subject remain private authentication da
 
 First-login profile setup defaults to anonymous, offers the Google display name only as a private suggestion that must be selected explicitly, and supports a custom nickname. Skipping completes onboarding anonymously. Public recipe responses expose only the nullable nickname and whether the current viewer owns the recipe; they do not expose another account's internal owner ID or authentication profile. Nickname changes apply immediately to historical public recipes.
 
-### AI-client recipe import
+### AI-client recipe import and management
 
 The official Cook skill performs extraction in the user's AI client and submits only a private import draft for review. The Cook server does not fetch arbitrary source URLs, which avoids creating an SSRF-capable fetch service. Web extraction prefers `schema.org/Recipe` JSON-LD and then visible content. Video extraction uses legitimately available captions or transcripts and asks the user for a transcript when tools cannot obtain one. The skill must not bypass login, paywalls, access controls, or DRM.
 
 Imported output is untrusted and must pass server-side URL, length, count, quota, and rate-limit validation. The draft preserves source URL, source title/author, warnings, and confidence without copying source images or long copyrighted passages. A user must review and edit the draft before transactionally accepting it as a private recipe; publication is a later explicit action.
 
-Settings provides revocable, expiring tokens with the fixed `recipes:import` scope. Secrets are generated with a CSPRNG, displayed once, and stored only as a digest plus non-secret metadata. The token derives the owner, works only on the import-draft endpoint, and must remain in an AI client's secret store or environment rather than URLs, prompts, or logs.
+Settings provides revocable, expiring scoped tokens. The recommended preset grants only `recipes:import`; the management preset grants only `recipes:read`, `recipes:write`, and `recipes:images:write`. Tokens never receive publish, recipe-delete, pantry, or account scopes. Secrets are generated with a CSPRNG, displayed once, and stored only as a digest plus non-secret metadata. Every token operation derives the owner and must remain in an AI client's secret store or environment rather than URLs, prompts, or logs.
+
+Management tokens can list/read owned recipes, idempotently create private recipes, and optimistically update owned private recipes. Changes to public recipes create a pending owner-reviewed revision and cannot affect live content until the authenticated owner accepts it. Stale versions return a conflict instead of overwriting user edits. Audit metadata records the token ID/prefix, action, recipe ID, and time without authorization secrets or recipe content.
+
+**Shipped on `main`.** Each recipe supports one optional normalized cover image with editable alt text and optional source/license/attribution. Cook uses SQLite BLOB storage for the current single-VM, low-traffic scope so the existing consistent backup includes image bytes atomically and no external storage secret is required. Images are served through random IDs with owner authorization for private recipes and public caching only for public recipes. A future object-storage migration is expected if scale requires it.
+
+The image pipeline accepts only JPEG, PNG, and WebP bytes, rejects SVG/GIF/unsupported formats, enforces request/decoder/pixel/stored-byte limits, applies orientation, resizes to a 1,600px longest edge, flattens transparency, and re-encodes to JPEG to remove metadata. Cook never fetches remote images. The skill must ask the user to confirm image rights and must not automatically copy source-site or video images.
 
 After the one-time reveal, Settings provides a stable link to the official public skill, copyable token-free installation guidance, and a bilingual prompt template for general AI clients. The skill and prompt refer only to `COOK_IMPORT_TOKEN` and `COOK_BASE_URL`; the real secret is copied separately and is never interpolated into those outputs or stored in browser persistence.
 
@@ -64,22 +70,6 @@ These are product and engineering decisions, not legal advice. Any mainland-Chin
 
 ## Proposed
 
-### Recipe image uploads
+### Recipe image expansion
 
-Recipe image upload is a post-MVP feature. A reasonable initial scope is one cover image per recipe, without galleries or inline instruction images.
-
-The implementation complexity is moderate when images are stored on a local persistent volume, but it adds backup size, restore time, capacity monitoring, and orphan-file cleanup to operations. Object storage is likely easier to scale later. The final storage backend is **unverified** and remains undecided.
-
-Any image-upload design must include these security and privacy controls:
-
-- accept only JPEG, PNG, and WebP; reject SVG and other active or unsupported formats;
-- validate by actually decoding the file server-side, then re-encode it into an approved format;
-- remove EXIF and other metadata during re-encoding;
-- enforce limits on uploaded bytes, decoded pixel dimensions, and images per recipe;
-- generate random, non-guessable storage identifiers instead of trusting original file names;
-- require authentication, recipe-owner authorization, storage quotas, and upload rate limits;
-- never trust the client-provided file name, extension, or MIME type as validation;
-- ensure images attached to private recipes cannot be fetched through a public or predictable URL;
-- include image data in backup and restore procedures, and periodically remove orphaned files safely.
-
-Before implementation, the storage choice, serving authorization model, size limits, image transformations, retention rules, and migration path must be documented and tested.
+Image galleries, inline step images, and object-storage migration remain future work and are **unverified**. The current confirmed scope is exactly one normalized cover per recipe.

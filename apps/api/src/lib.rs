@@ -1,7 +1,9 @@
+pub mod ai_recipes;
 pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod images;
 pub mod importer;
 pub mod imports;
 pub mod ingredients;

@@ -266,6 +266,7 @@ mod tests {
             description: String::new(),
             instructions: String::new(),
             visibility: "private".into(),
+            version: 1,
             ingredients: ingredients
                 .iter()
                 .map(|name| IngredientInput {
@@ -276,6 +277,7 @@ mod tests {
                 .collect(),
             is_favorite: false,
             source: None,
+            cover_image: None,
         }
     }
 

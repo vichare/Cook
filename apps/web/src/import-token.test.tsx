@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LocaleProvider } from './i18n'
 import {
   COOK_IMPORT_PROMPT_TEMPLATE,
+  COOK_MANAGE_PROMPT_TEMPLATE,
+  COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS,
   COOK_SKILL_INSTALL_INSTRUCTIONS,
   COOK_SKILL_URL,
   ImportTokenSettings,
@@ -16,7 +18,7 @@ const { createImportToken, importTokens } = vi.hoisted(() => ({
       id: 'token-id',
       name: 'My AI client',
       prefix: 'cook_imp',
-      scope: 'recipes:import',
+      scopes: ['recipes:import'],
       createdAt: '2026-11-04T00:00:00Z',
       lastUsedAt: null,
       expiresAt: '2027-02-02T00:00:00Z',
@@ -45,11 +47,13 @@ describe('import token reveal', () => {
 
   beforeEach(() => {
     writeText.mockClear()
+    createImportToken.mockClear()
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText },
     })
   })
+  afterEach(cleanup)
 
   it('keeps installation and prompt outputs token-free while retaining a separate one-time copy action', async () => {
     render(
@@ -60,8 +64,9 @@ describe('import token reveal', () => {
       </LocaleProvider>,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create 90-day token' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
     expect(await screen.findByText(secret)).toBeVisible()
+    expect(createImportToken).toHaveBeenCalledWith('My AI client', 90, 'import')
 
     fireEvent.click(screen.getByRole('button', { name: 'Copy installation instructions' }))
     await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(COOK_SKILL_INSTALL_INSTRUCTIONS))
@@ -77,5 +82,33 @@ describe('import token reveal', () => {
     await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(secret))
     fireEvent.click(screen.getByRole('button', { name: 'I have stored it securely' }))
     expect(screen.queryByText(secret)).not.toBeInTheDocument()
+  })
+
+  it('uses the manage preset without embedding the one-time token in its prompt', async () => {
+    render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <ImportTokenSettings />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('radio', { name: /Manage my private recipes/ }))
+    fireEvent.change(screen.getByLabelText('Token expiry'), { target: { value: 'none' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
+    expect(await screen.findByText(secret)).toBeVisible()
+    expect(createImportToken).toHaveBeenCalledWith('My AI client', null, 'manage')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy installation instructions' }))
+    await waitFor(() =>
+      expect(writeText).toHaveBeenLastCalledWith(COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS),
+    )
+    expect(COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS).not.toContain(secret)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy prompt template' }))
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(COOK_MANAGE_PROMPT_TEMPLATE))
+    expect(COOK_MANAGE_PROMPT_TEMPLATE).toContain('COOK_IMPORT_TOKEN')
+    expect(COOK_MANAGE_PROMPT_TEMPLATE).not.toContain(secret)
+    expect(COOK_MANAGE_PROMPT_TEMPLATE).toContain('pending revision')
   })
 })

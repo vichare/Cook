@@ -7,6 +7,11 @@ trap 'rm -rf "$fixture"' EXIT
 
 grep -Fq "location = /health {" "$root/deploy/image-nginx.conf"
 grep -Fq "proxy_pass http://127.0.0.1:8081/health;" "$root/deploy/image-nginx.conf"
+grep -Fq "client_max_body_size 9m;" "$root/deploy/image-nginx.conf"
+grep -Fq "client_max_body_size 9m;" "$root/deploy/container-nginx.conf"
+grep -Fq "client_max_body_size 9m;" "$root/deploy/nginx/cook.vichare.net.conf"
+grep -Fq "FROM rust:1.89-bookworm AS api-build" "$root/Dockerfile"
+grep -Fq "FROM rust:1.89-bookworm AS build" "$root/apps/api/Dockerfile"
 # The literal command substitution is part of the Compose healthcheck.
 # shellcheck disable=SC2016
 grep -Fq 'test: ["CMD-SHELL", "[ \"$(curl -fsS http://127.0.0.1:8080/health)\" = ok ]"]' \

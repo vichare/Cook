@@ -9,6 +9,7 @@ import {
   LanguageSettings,
   PantryConfirmation,
   ProfileSetup,
+  RecipeCoverFields,
 } from './router'
 import { LocaleProvider, type Locale } from './i18n'
 
@@ -190,6 +191,43 @@ describe('pantry confirmation', () => {
     expect(screen.getByRole('button', { name: 'Save answers' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Skip for now' }))
     expect(screen.getByRole('button', { name: 'Save answers' })).toBeDisabled()
+  })
+
+  describe('recipe cover fields', () => {
+    it('exposes keyboard-accessible file, alt, source, license, attribution, and remove controls', () => {
+      const onFile = vi.fn()
+      const onRemove = vi.fn()
+      render(
+        <Providers>
+          <RecipeCoverFields
+            hasImage
+            removed={false}
+            preview="/api/recipe-images/image-id"
+            metadata={{
+              altText: 'Soup in a blue bowl',
+              sourceUrl: '',
+              sourceLicense: '',
+              sourceAttribution: '',
+            }}
+            onMetadataChange={() => undefined}
+            onFile={onFile}
+            onRemove={onRemove}
+          />
+        </Providers>,
+      )
+      const input = screen.getByLabelText('Choose or drop a cover image')
+      expect(input).toHaveAttribute('accept', 'image/jpeg,image/png,image/webp')
+      const file = new File(['bytes'], 'cover.webp', { type: 'image/webp' })
+      fireEvent.change(input, { target: { files: [file] } })
+      expect(onFile).toHaveBeenCalledWith(file)
+      expect(screen.getByLabelText('Image description (alt text)')).toBeRequired()
+      expect(screen.getByLabelText('Source URL (optional)')).toHaveAttribute('type', 'url')
+      expect(screen.getByLabelText('License (optional)')).toBeVisible()
+      expect(screen.getByLabelText('Attribution (optional)')).toBeVisible()
+      expect(screen.getByRole('img', { name: 'Soup in a blue bowl' })).toBeVisible()
+      fireEvent.click(screen.getByRole('button', { name: 'Remove cover image' }))
+      expect(onRemove).toHaveBeenCalledOnce()
+    })
   })
 
   describe('expiration editor', () => {

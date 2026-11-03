@@ -403,7 +403,7 @@ paths:
                 items: { $ref: "#/components/schemas/Recommendation" }
   /api/settings/import-tokens:
     get:
-      description: Lists non-secret metadata for the authenticated user's import tokens. Token secrets are never returned.
+      description: Lists non-secret metadata and scopes for the authenticated user's AI tokens. Token secrets are never returned.
       security:
         - sessionCookie: []
       responses:
@@ -416,7 +416,7 @@ paths:
                 items: { $ref: "#/components/schemas/ImportToken" }
         "401": { $ref: "#/components/responses/Unauthorized" }
     post:
-      description: Creates a token with the fixed recipes:import scope. The secret is returned exactly once.
+      description: Creates either the minimal recipes:import token or a private-recipe management token. The secret is returned exactly once.
       security:
         - sessionCookie: []
       requestBody:
@@ -444,6 +444,234 @@ paths:
         "204": { description: Token revoked }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Missing or not owned }
+  /api/recipes/{id}/cover:
+    parameters:
+      - $ref: "#/components/parameters/RecipeId"
+    post:
+      description: Replaces the authenticated owner's single cover image. JPEG, PNG, and WebP are decoded under resource limits, orientation-corrected, resized to at most 1600px, metadata-stripped, and re-encoded as JPEG.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: "#/components/schemas/RecipeImageUpload" }
+      responses:
+        "204": { description: Cover image replaced }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Recipe missing or not owned }
+        "413": { description: Upload, decoded pixels, decoder allocation, or normalized bytes exceed the documented limit }
+    put:
+      description: Updates alt text and optional source/license/attribution for the authenticated owner's existing cover.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecipeImageMetadata" }
+      responses:
+        "204": { description: Cover metadata updated }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Recipe or cover missing or not owned }
+    delete:
+      description: Removes the authenticated owner's cover image without deleting the recipe.
+      security:
+        - sessionCookie: []
+      responses:
+        "204": { description: Cover image removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Recipe missing or not owned }
+  /api/recipe-images/{id}:
+    get:
+      description: Returns a normalized JPEG by random image ID. Public recipe images are anonymous and immutable-cacheable; private images require the owner session or an owner token with recipes:read and use private, no-store caching.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - {}
+        - sessionCookie: []
+        - importBearer: []
+      responses:
+        "200":
+          description: Normalized cover bytes with ETag, Content-Length, nosniff, and visibility-appropriate Cache-Control
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "304": { description: ETag matched }
+        "401": { description: A supplied Bearer token is invalid, expired, or revoked }
+        "404": { description: Image missing or private image not owned }
+  /api/ai/recipes:
+    get:
+      description: Lists only recipes owned by the token principal. Requires recipes:read.
+      security:
+        - importBearer: []
+      responses:
+        "200":
+          description: Owned recipes
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Recipe" }
+        "401": { description: Invalid, expired, or revoked token }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      description: Creates a private recipe for the token principal. Requires recipes:write and an Idempotency-Key; retries with the same token/key return the original recipe.
+      security:
+        - importBearer: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AiRecipeInput" }
+            example:
+              title: Tomato noodles
+              description: A private weeknight recipe.
+              instructions: Boil the noodles, cook the tomatoes, and combine.
+              ingredients:
+                - name: noodles
+                  quantityNote: 200 g
+                - name: tomato
+                  quantityNote: 3
+      responses:
+        "201": { description: Private recipe created, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "200": { description: Idempotent replay of the original creation, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { description: Invalid, expired, or revoked token }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { description: Token rate limit exceeded }
+  /api/ai/recipes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/RecipeId"
+    get:
+      description: Reads an owned recipe. Cross-account IDs return 404. Requires recipes:read.
+      security:
+        - importBearer: []
+      responses:
+        "200": { description: Owned recipe, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "401": { description: Invalid, expired, or revoked token }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Recipe missing or not owned }
+    put:
+      description: Optimistically updates an owned private recipe or creates a pending owner-reviewed revision for an owned public recipe. A token can never publish or directly change live public content.
+      security:
+        - importBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AiRecipeInput" }
+            example:
+              title: Tomato noodles
+              description: Updated after the user's feedback.
+              instructions: Boil the noodles, simmer the tomatoes, and combine.
+              ingredients:
+                - name: noodles
+                  quantityNote: 200 g
+                - name: tomato
+                  quantityNote: 4
+              expectedVersion: 3
+      responses:
+        "200": { description: Direct private update or pending public revision, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { description: Invalid, expired, or revoked token }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Recipe missing or not owned }
+        "409": { description: Recipe version is stale or a pending revision already exists }
+  /api/ai/recipes/{id}/cover:
+    parameters:
+      - $ref: "#/components/parameters/RecipeId"
+      - $ref: "#/components/parameters/RecipeVersion"
+    post:
+      description: Replaces a private recipe cover directly or creates a pending image revision for a public recipe. Requires recipes:images:write.
+      security:
+        - importBearer: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: "#/components/schemas/RecipeImageUpload" }
+      responses:
+        "200": { description: Direct private update or pending public revision, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { description: Invalid, expired, or revoked token }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Recipe missing or not owned }
+        "409": { description: Recipe version is stale or a pending revision already exists }
+        "413": { description: Image resource limit exceeded }
+    delete:
+      description: Removes a private cover directly or creates a pending removal revision for a public recipe. Recipe deletion is not supported.
+      security:
+        - importBearer: []
+      responses:
+        "200": { description: Direct private update or pending public revision, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "401": { description: Invalid, expired, or revoked token }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Recipe missing or not owned }
+        "409": { description: Recipe version is stale or a pending revision already exists }
+  /api/recipe-revisions:
+    get:
+      description: Lists pending AI revisions owned by the authenticated user.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: recipeId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Pending revisions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RecipeRevision" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/recipe-revisions/{id}/accept:
+    post:
+      description: Atomically applies an owned pending revision only when the live recipe version still matches, then marks the revision accepted.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RecipeRevisionId"
+      responses:
+        "200": { description: Updated live recipe, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Revision missing or not owned }
+        "409": { description: Live recipe changed after the revision was created }
+  /api/recipe-revisions/{id}/cover:
+    get:
+      description: Returns the normalized proposed cover for an owned pending replacement revision. Never public and always private, no-store.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RecipeRevisionId"
+      responses:
+        "200":
+          description: Proposed normalized JPEG
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Revision image missing or not owned }
+  /api/recipe-revisions/{id}:
+    delete:
+      description: Rejects an owned pending revision without changing the live recipe.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RecipeRevisionId"
+      responses:
+        "204": { description: Revision rejected }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Revision missing or not owned }
   /api/import/drafts:
     post:
       description: Token-only endpoint used by the official AI-client skill. The owner is derived from the token; the server does not fetch sourceUrl. Creates a private review draft, not a recipe.
@@ -567,6 +795,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: cook_imp
+      description: Scoped Cook AI token. The endpoint enforces recipes:import, recipes:read, recipes:write, or recipes:images:write as documented.
   parameters:
     RecipeId:
       name: id
@@ -583,11 +812,32 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    RecipeRevisionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 8, maxLength: 128 }
+    RecipeVersion:
+      name: If-Match
+      in: header
+      required: true
+      description: Current live recipe version using the exact form "recipe-v<version>" including quotes.
+      schema: { type: string, pattern: '^"recipe-v[1-9][0-9]*"$' }
   responses:
     Unauthorized:
       description: Host-only Cook session is absent or invalid
     ValidationError:
       description: Request failed server-side validation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Token is valid but lacks the required scope
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -699,9 +949,9 @@ components:
       type: object
       required: [title, description, instructions, visibility, ingredients]
       properties:
-        title: { type: string }
-        description: { type: string }
-        instructions: { type: string }
+        title: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        instructions: { type: string, maxLength: 20000 }
         visibility: { type: string, enum: [private, public], default: private }
         ingredients:
           type: array
@@ -711,9 +961,10 @@ components:
       allOf:
         - $ref: "#/components/schemas/RecipeInput"
         - type: object
-          required: [id, isOwner, authorNickname, isFavorite, source]
+          required: [id, version, isOwner, authorNickname, isFavorite, source, coverImage]
           properties:
             id: { type: string, format: uuid }
+            version: { type: integer, minimum: 1 }
             isOwner: { type: boolean }
             authorNickname:
               type: [string, "null"]
@@ -723,6 +974,47 @@ components:
               oneOf:
                 - $ref: "#/components/schemas/RecipeSource"
                 - type: "null"
+            coverImage:
+              oneOf:
+                - $ref: "#/components/schemas/RecipeImage"
+                - type: "null"
+    RecipeImage:
+      type: object
+      required: [id, url, width, height, altText, sourceUrl, sourceLicense, sourceAttribution, version]
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string }
+        width: { type: integer, minimum: 1, maximum: 1600 }
+        height: { type: integer, minimum: 1, maximum: 1600 }
+        altText: { type: string, minLength: 1, maxLength: 300 }
+        sourceUrl: { type: [string, "null"], format: uri, maxLength: 2048 }
+        sourceLicense: { type: [string, "null"], maxLength: 120 }
+        sourceAttribution: { type: [string, "null"], maxLength: 500 }
+        version: { type: integer, minimum: 1 }
+    RecipeImageMetadata:
+      type: object
+      additionalProperties: false
+      required: [altText]
+      properties:
+        altText: { type: string, minLength: 1, maxLength: 300 }
+        sourceUrl:
+          oneOf:
+            - { type: string, const: "" }
+            - { type: string, format: uri, maxLength: 2048 }
+        sourceLicense: { type: string, maxLength: 120, default: "" }
+        sourceAttribution: { type: string, maxLength: 500, default: "" }
+    RecipeImageUpload:
+      type: object
+      required: [image, altText]
+      properties:
+        image:
+          type: string
+          format: binary
+          description: JPEG, PNG, or WebP only; at most 8 MiB request file, 20 megapixels, 10000px decoder dimensions, 128 MiB decoder allocation, and 2.5 MB normalized storage.
+        altText: { type: string, minLength: 1, maxLength: 300 }
+        sourceUrl: { type: string, format: uri, maxLength: 2048 }
+        sourceLicense: { type: string, maxLength: 120 }
+        sourceAttribution: { type: string, maxLength: 500 }
     RecipeSource:
       type: object
       required: [url, title, author, warnings, confidence]
@@ -855,14 +1147,25 @@ components:
           type: [integer, "null"]
           minimum: 1
           maximum: 365
+        preset:
+          type: string
+          enum: [import, manage]
+          default: import
+          description: import grants only recipes:import. manage grants recipes:read, recipes:write, and recipes:images:write; neither grants publish or recipe deletion.
     ImportToken:
       type: object
-      required: [id, name, prefix, scope, createdAt, lastUsedAt, expiresAt, revokedAt]
+      required: [id, name, prefix, scopes, createdAt, lastUsedAt, expiresAt, revokedAt]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
         prefix: { type: string, description: Non-secret display prefix }
-        scope: { type: string, const: "recipes:import" }
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: ["recipes:import", "recipes:read", "recipes:write", "recipes:images:write"]
         createdAt: { type: string, format: date-time }
         lastUsedAt: { type: [string, "null"], format: date-time }
         expiresAt: { type: [string, "null"], format: date-time }
@@ -876,6 +1179,57 @@ components:
           type: string
           writeOnly: true
           description: Returned once. Cook stores only its digest.
+    AiRecipeInput:
+      type: object
+      additionalProperties: false
+      required: [title, ingredients]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, maxLength: 2000, default: "" }
+        instructions: { type: string, maxLength: 20000, default: "" }
+        ingredients:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: "#/components/schemas/Ingredient" }
+        expectedVersion:
+          type: integer
+          minimum: 1
+          description: Required for update; omitted for create.
+    AiRecipeMutation:
+      oneOf:
+        - type: object
+          required: [status, recipe]
+          properties:
+            status: { const: updated }
+            recipe: { $ref: "#/components/schemas/Recipe" }
+        - type: object
+          required: [status, revision]
+          properties:
+            status: { const: pendingReview }
+            revision: { $ref: "#/components/schemas/RecipeRevision" }
+    RecipeRevision:
+      type: object
+      required: [id, recipeId, expectedVersion, title, description, instructions, ingredients, imageAction, imageAltText, imageUrl, imageSourceUrl, imageSourceLicense, imageSourceAttribution, status, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        recipeId: { type: string, format: uuid }
+        expectedVersion: { type: integer, minimum: 1 }
+        title: { type: string }
+        description: { type: string }
+        instructions: { type: string }
+        ingredients:
+          type: array
+          items: { $ref: "#/components/schemas/Ingredient" }
+        imageAction: { type: string, enum: [keep, replace, delete] }
+        imageAltText: { type: [string, "null"] }
+        imageUrl: { type: [string, "null"] }
+        imageSourceUrl: { type: [string, "null"], format: uri }
+        imageSourceLicense: { type: [string, "null"] }
+        imageSourceAttribution: { type: [string, "null"] }
+        status: { type: string, enum: [pending, accepted, rejected] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
     ImportDraftSubmission:
       type: object
       additionalProperties: false

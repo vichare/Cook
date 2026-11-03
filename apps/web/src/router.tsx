@@ -561,6 +561,15 @@ function RecipesPage() {
         <div className="card-list">
           {recipes.data?.map((recipe) => (
             <article className="recipe-card" key={recipe.id}>
+              {recipe.coverImage && (
+                <img
+                  className="recipe-cover"
+                  src={recipe.coverImage.url}
+                  alt={recipe.coverImage.altText}
+                  width={recipe.coverImage.width}
+                  height={recipe.coverImage.height}
+                />
+              )}
               <div className="card-heading">
                 <div>
                   <span className="eyebrow">
@@ -613,6 +622,28 @@ function RecipeDetailPage() {
             <p className="byline">
               {t('common.byAuthor', { author: recipe.data.authorNickname ?? t('common.anonymousUser') })}
             </p>
+            {recipe.data.coverImage && (
+              <figure className="recipe-cover-detail">
+                <img
+                  src={recipe.data.coverImage.url}
+                  alt={recipe.data.coverImage.altText}
+                  width={recipe.data.coverImage.width}
+                  height={recipe.data.coverImage.height}
+                />
+                {(recipe.data.coverImage.sourceAttribution || recipe.data.coverImage.sourceLicense) && (
+                  <figcaption>
+                    {recipe.data.coverImage.sourceAttribution}
+                    {recipe.data.coverImage.sourceAttribution && recipe.data.coverImage.sourceLicense && ' · '}
+                    {recipe.data.coverImage.sourceLicense}
+                  </figcaption>
+                )}
+                {recipe.data.coverImage.sourceUrl && (
+                  <a href={recipe.data.coverImage.sourceUrl} rel="noreferrer" target="_blank">
+                    {t('recipe.coverSourceLink')}
+                  </a>
+                )}
+              </figure>
+            )}
             {recipe.data.source && (
               <aside className="source-note">
                 <strong>{t('recipe.importedSource')}</strong>
@@ -637,10 +668,108 @@ function RecipeDetailPage() {
             </ul>
             <h2>{t('recipe.method')}</h2>
             <p className="pre-line">{recipe.data.instructions || t('recipe.noInstructions')}</p>
+            {recipe.data.isOwner && <RevisionReview recipeId={recipeId} />}
           </article>
         )}
       </QueryState>
     </Page>
+  )
+}
+
+function RevisionReview({ recipeId }: { recipeId: string }) {
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const revisions = useQuery({
+    queryKey: ['recipe-revisions', recipeId],
+    queryFn: () => api.recipeRevisions(recipeId),
+  })
+  const accept = useMutation({
+    mutationFn: api.acceptRecipeRevision,
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['recipe', recipeId] }),
+        queryClient.invalidateQueries({ queryKey: ['recipes'] }),
+        queryClient.invalidateQueries({ queryKey: ['recipe-revisions', recipeId] }),
+      ])
+    },
+  })
+  const reject = useMutation({
+    mutationFn: api.rejectRecipeRevision,
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ['recipe-revisions', recipeId] }),
+  })
+  if (revisions.isLoading) return <p role="status">{t('common.loading')}</p>
+  if (revisions.error) return <ErrorText error={revisions.error} />
+  if (!revisions.data?.length) return null
+  return (
+    <section className="revision-review" aria-labelledby={`recipe-revisions-${recipeId}`}>
+      <h2 id={`recipe-revisions-${recipeId}`}>{t('recipe.pendingRevision')}</h2>
+      <p>{t('recipe.pendingRevisionDetail')}</p>
+      {revisions.data.map((revision) => (
+        <article className="source-note" key={revision.id}>
+          <h3>{revision.title}</h3>
+          <p>{revision.description}</p>
+          <p>{t('recipe.revisionImageAction', {
+            action: t(
+              revision.imageAction === 'replace'
+                ? 'recipe.imageAction.replace'
+                : revision.imageAction === 'delete'
+                  ? 'recipe.imageAction.delete'
+                  : 'recipe.imageAction.keep',
+            ),
+          })}</p>
+          {revision.imageUrl && (
+            <figure className="recipe-cover-detail">
+              <img src={revision.imageUrl} alt={revision.imageAltText ?? ''} />
+              {(revision.imageSourceAttribution || revision.imageSourceLicense) && (
+                <figcaption>
+                  {revision.imageSourceAttribution}
+                  {revision.imageSourceAttribution && revision.imageSourceLicense && ' · '}
+                  {revision.imageSourceLicense}
+                </figcaption>
+              )}
+              {revision.imageSourceUrl && (
+                <a href={revision.imageSourceUrl} rel="noreferrer" target="_blank">
+                  {t('recipe.coverSourceLink')}
+                </a>
+              )}
+            </figure>
+          )}
+          <details>
+            <summary>{t('recipe.reviewRevision')}</summary>
+            <h4>{t('recipe.ingredients')}</h4>
+            <ul>
+              {revision.ingredients.map((ingredient, index) => (
+                <li key={`${ingredient.name}-${index}`}>{ingredient.name} {ingredient.quantityNote}</li>
+              ))}
+            </ul>
+            <h4>{t('recipe.method')}</h4>
+            <p className="pre-line">{revision.instructions}</p>
+          </details>
+          <div className="button-row">
+            <button
+              type="button"
+              className="button primary"
+              disabled={accept.isPending || reject.isPending}
+              onClick={() => accept.mutate(revision.id)}
+            >
+              {t('recipe.acceptRevision')}
+            </button>
+            <button
+              type="button"
+              className="button ghost"
+              disabled={accept.isPending || reject.isPending}
+              onClick={() => {
+                if (window.confirm(t('recipe.rejectRevisionConfirm'))) reject.mutate(revision.id)
+              }}
+            >
+              {t('recipe.rejectRevision')}
+            </button>
+          </div>
+        </article>
+      ))}
+      {(accept.error || reject.error) && <ErrorText error={accept.error ?? reject.error} />}
+    </section>
   )
 }
 
@@ -681,6 +810,21 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const errorSummaryRef = useRef<HTMLDivElement>(null)
+  const [coverFile, setCoverFile] = useState<File | null>(null)
+  const [removeCover, setRemoveCover] = useState(false)
+  const [coverPreview, setCoverPreview] = useState<string | null>(recipe?.coverImage?.url ?? null)
+  const [coverMetadata, setCoverMetadata] = useState({
+    altText: recipe?.coverImage?.altText ?? '',
+    sourceUrl: recipe?.coverImage?.sourceUrl ?? '',
+    sourceLicense: recipe?.coverImage?.sourceLicense ?? '',
+    sourceAttribution: recipe?.coverImage?.sourceAttribution ?? '',
+  })
+  useEffect(() => {
+    if (!coverFile) return
+    const url = URL.createObjectURL(coverFile)
+    setCoverPreview(url)
+    return () => URL.revokeObjectURL(url)
+  }, [coverFile])
   const form = useForm<RecipeForm>({
     resolver: zodResolver(recipeSchema(t)),
     defaultValues: recipe ?? {
@@ -693,9 +837,30 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
   })
   const fields = useFieldArray({ control: form.control, name: 'ingredients' })
   const save = useMutation({
-    mutationFn: (value: RecipeForm) => api.saveRecipe(value, recipe?.id),
+    mutationFn: async (value: RecipeForm) => {
+      const saved = await api.saveRecipe(value, recipe?.id)
+      if (coverFile) {
+        await api.uploadRecipeCover(saved.id, coverFile, coverMetadata)
+      } else if (removeCover && recipe?.coverImage) {
+        await api.deleteRecipeCover(saved.id)
+      } else if (
+        recipe?.coverImage &&
+        (
+          coverMetadata.altText !== recipe.coverImage.altText ||
+          coverMetadata.sourceUrl !== (recipe.coverImage.sourceUrl ?? '') ||
+          coverMetadata.sourceLicense !== (recipe.coverImage.sourceLicense ?? '') ||
+          coverMetadata.sourceAttribution !== (recipe.coverImage.sourceAttribution ?? '')
+        )
+      ) {
+        await api.updateRecipeCoverMetadata(saved.id, coverMetadata)
+      }
+      return saved
+    },
     onSuccess: async (saved) => {
-      await queryClient.invalidateQueries({ queryKey: ['recipes'] })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['recipes'] }),
+        queryClient.invalidateQueries({ queryKey: ['recipe', saved.id] }),
+      ])
       await navigate({ to: '/recipes/$recipeId', params: { recipeId: saved.id } })
     },
   })
@@ -730,6 +895,7 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
         {t('recipe.title')}
         <input
           {...form.register('title')}
+          maxLength={120}
           aria-invalid={Boolean(form.formState.errors.title)}
           aria-describedby={form.formState.errors.title ? 'recipe-title-error' : undefined}
         />
@@ -737,11 +903,11 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
       </label>
       <label>
         {t('recipe.description')}
-        <textarea {...form.register('description')} rows={3} />
+        <textarea {...form.register('description')} rows={3} maxLength={2000} />
       </label>
       <label>
         {t('recipe.instructions')}
-        <textarea {...form.register('instructions')} rows={8} />
+        <textarea {...form.register('instructions')} rows={8} maxLength={20000} />
       </label>
       <label>
         {t('recipe.visibility')}
@@ -750,6 +916,22 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
           <option value="public">{t('recipe.public')}</option>
         </select>
       </label>
+      <RecipeCoverFields
+        hasImage={Boolean(coverFile || recipe?.coverImage)}
+        removed={removeCover}
+        preview={coverPreview}
+        metadata={coverMetadata}
+        onMetadataChange={setCoverMetadata}
+        onFile={(file) => {
+          setCoverFile(file)
+          if (file) setRemoveCover(false)
+        }}
+        onRemove={() => {
+          setCoverFile(null)
+          setCoverPreview(null)
+          setRemoveCover(Boolean(recipe?.coverImage))
+        }}
+      />
       <fieldset>
         <legend>{t('recipe.ingredients')}</legend>
         {fields.fields.map((field, index) => (
@@ -808,6 +990,103 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
       </button>
       {save.error && <ErrorText error={save.error} />}
     </form>
+  )
+}
+
+interface CoverMetadata {
+  altText: string
+  sourceUrl: string
+  sourceLicense: string
+  sourceAttribution: string
+}
+
+export function RecipeCoverFields({
+  hasImage,
+  removed,
+  preview,
+  metadata,
+  onMetadataChange,
+  onFile,
+  onRemove,
+}: {
+  hasImage: boolean
+  removed: boolean
+  preview: string | null
+  metadata: CoverMetadata
+  onMetadataChange: (metadata: CoverMetadata) => void
+  onFile: (file: File | null) => void
+  onRemove: () => void
+}) {
+  const { t } = useI18n()
+  const active = hasImage && !removed
+  return (
+    <fieldset>
+      <legend>{t('recipe.coverImage')}</legend>
+      <p>{t('recipe.coverImageHelp')}</p>
+      <label
+        className="image-drop-zone"
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => {
+          event.preventDefault()
+          onFile(event.dataTransfer.files[0] ?? null)
+        }}
+      >
+        {t('recipe.chooseCover')}
+        <input
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          onChange={(event) => onFile(event.target.files?.[0] ?? null)}
+        />
+      </label>
+      {preview && active && (
+        <img className="recipe-cover-preview" src={preview} alt={metadata.altText} />
+      )}
+      {active && (
+        <div className="image-metadata-grid">
+          <label>
+            {t('recipe.coverAlt')}
+            <input
+              value={metadata.altText}
+              maxLength={300}
+              required
+              onChange={(event) => onMetadataChange({ ...metadata, altText: event.target.value })}
+            />
+          </label>
+          <label>
+            {t('recipe.coverSourceUrl')}
+            <input
+              type="url"
+              value={metadata.sourceUrl}
+              onChange={(event) => onMetadataChange({ ...metadata, sourceUrl: event.target.value })}
+            />
+          </label>
+          <label>
+            {t('recipe.coverLicense')}
+            <input
+              value={metadata.sourceLicense}
+              maxLength={120}
+              onChange={(event) => onMetadataChange({ ...metadata, sourceLicense: event.target.value })}
+            />
+          </label>
+          <label>
+            {t('recipe.coverAttribution')}
+            <input
+              value={metadata.sourceAttribution}
+              maxLength={500}
+              onChange={(event) =>
+                onMetadataChange({ ...metadata, sourceAttribution: event.target.value })
+              }
+            />
+          </label>
+        </div>
+      )}
+      {active && (
+        <button type="button" className="button ghost" onClick={onRemove}>
+          {t('recipe.removeCover')}
+        </button>
+      )}
+      <p className="field-note">{t('recipe.coverRights')}</p>
+    </fieldset>
   )
 }
 
@@ -1357,24 +1636,36 @@ export const COOK_SKILL_INSTALL_INSTRUCTIONS = `Install the official Cook recipe
 ${COOK_SKILL_URL}
 
 Use your AI client's documented “install skill from GitHub URL” flow. Client commands differ, so follow that client's instructions. Configure COOK_IMPORT_TOKEN in the client's secret store or environment and COOK_BASE_URL=https://cook.vichare.net separately. Never paste the token into a prompt or chat.`
+export const COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS = `${COOK_SKILL_INSTALL_INSTRUCTIONS}
+
+This token uses Cook's management preset. The skill may read owned recipes, create or update private recipes, propose reviewed revisions for public recipes, and manage cover images. It cannot publish or delete recipes. Confirm image rights before every upload.`
 export const COOK_IMPORT_PROMPT_TEMPLATE = `English:
 Use your browser tools to extract a recipe from a webpage I am authorized to access, preferring schema.org Recipe/JSON-LD. For video, use only legitimately available captions/transcripts; if unavailable, ask me for a transcript. Do not bypass login, paywalls, robots restrictions, access controls, or DRM. Rewrite concise structured ingredients and steps, preserve source URL/title/author, and record uncertainty as warnings. Validate against the Cook import draft schema, then create a private review draft at COOK_BASE_URL using the recipes:import credential from the COOK_IMPORT_TOKEN secret/environment variable. Never print, quote, log, download, or place that token in a URL or prompt. Do not publish or finalize the recipe; tell me to review the private draft in Cook.
 
 简体中文：
 请使用浏览器工具，从我有权访问的网页提取菜谱，优先使用 schema.org Recipe/JSON-LD。视频只能使用合法可用的字幕或 transcript；若无法取得，请要求我提供 transcript。不得绕过登录、付费墙、robots 限制、访问控制或 DRM。请将食材和步骤简洁结构化并改写，保留来源 URL、标题和作者，把不确定内容记录为 warnings。按 Cook 导入草稿 schema 验证后，使用 secret store/环境变量中的 COOK_IMPORT_TOKEN（recipes:import 权限）调用 COOK_BASE_URL，创建私密待审核草稿。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。不要发布或完成菜谱；请提醒我在 Cook 中人工审核私密草稿。`
+export const COOK_MANAGE_PROMPT_TEMPLATE = `English:
+Use your browser or transcript tools only for content I am authorized to access. Prefer schema.org Recipe/JSON-LD and legitimately available captions/transcripts. Do not bypass login, paywalls, access controls, robots restrictions, or DRM. Use COOK_BASE_URL with the COOK_IMPORT_TOKEN secret/environment variable to read my recipes and versions, create private recipes, or update my private recipes with optimistic concurrency. Updates to public recipes must create a pending revision for my review and must never publish directly. Before uploading a local JPEG, PNG, or WebP cover image, ask me to confirm that I own it or have permission, then provide accurate alt text and any source/license/attribution. Never fetch or copy a source site's image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
+
+简体中文：
+仅使用浏览器或 transcript 工具处理我有权访问的内容。优先使用 schema.org Recipe/JSON-LD 和合法可用的字幕或 transcript。不得绕过登录、付费墙、访问控制、robots 限制或 DRM。使用 COOK_BASE_URL，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN，以读取我的菜谱及版本、创建私密菜谱，或通过乐观并发更新我的私密菜谱。公开菜谱的更新必须创建待审核 revision，绝不能直接发布。上传本地 JPEG、PNG 或 WebP 封面前，先请我确认拥有或获准使用，并提供准确的替代文字及来源、许可、归属信息。绝不要自动抓取或复制来源网站图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
 
 export function ImportTokenSettings() {
   const { formatDateTime, t } = useI18n()
   const queryClient = useQueryClient()
   const tokens = useQuery({ queryKey: ['import-tokens'], queryFn: api.importTokens })
   const [name, setName] = useState(() => t('token.defaultName'))
+  const [preset, setPreset] = useState<'import' | 'manage'>('import')
+  const [createdPreset, setCreatedPreset] = useState<'import' | 'manage'>('import')
+  const [expiresInDays, setExpiresInDays] = useState<30 | 90 | null>(90)
   const [secret, setSecret] = useState<string | null>(null)
   const [copyStatus, setCopyStatus] = useState<string | null>(null)
   const [copyError, setCopyError] = useState<string | null>(null)
   const create = useMutation({
-    mutationFn: () => api.createImportToken(name, 90),
+    mutationFn: () => api.createImportToken(name, expiresInDays, preset),
     onSuccess: async (created) => {
       setSecret(created.secret)
+      setCreatedPreset(preset)
       setCopyStatus(null)
       setCopyError(null)
       await queryClient.invalidateQueries({ queryKey: ['import-tokens'] })
@@ -1408,6 +1699,49 @@ export function ImportTokenSettings() {
           {t('token.name')}
           <input value={name} onChange={(event) => setName(event.target.value)} required maxLength={80} />
         </label>
+        <fieldset>
+          <legend>{t('token.accessPreset')}</legend>
+          <label className="choice-card">
+            <input
+              type="radio"
+              name="token-preset"
+              value="import"
+              checked={preset === 'import'}
+              onChange={() => setPreset('import')}
+            />
+            <span>
+              <strong>{t('token.presetImport')}</strong>
+              <small>{t('token.presetImportDetail')}</small>
+            </span>
+          </label>
+          <label className="choice-card">
+            <input
+              type="radio"
+              name="token-preset"
+              value="manage"
+              checked={preset === 'manage'}
+              onChange={() => setPreset('manage')}
+            />
+            <span>
+              <strong>{t('token.presetManage')}</strong>
+              <small>{t('token.presetManageDetail')}</small>
+            </span>
+          </label>
+        </fieldset>
+        <label>
+          {t('token.expiry')}
+          <select
+            value={expiresInDays ?? 'none'}
+            onChange={(event) => {
+              const value = event.target.value
+              setExpiresInDays(value === 'none' ? null : value === '30' ? 30 : 90)
+            }}
+          >
+            <option value="30">{t('token.expiry30')}</option>
+            <option value="90">{t('token.expiry90')}</option>
+            <option value="none">{t('token.expiryNone')}</option>
+          </select>
+        </label>
         <button className="button primary" disabled={create.isPending}>{t('token.create')}</button>
       </form>
       {secret && (
@@ -1434,7 +1768,12 @@ export function ImportTokenSettings() {
             </a>
             <button
               className="button ghost"
-              onClick={() => copyOutput(COOK_SKILL_INSTALL_INSTRUCTIONS, t('token.installCopied'))}
+              onClick={() => copyOutput(
+                createdPreset === 'manage'
+                  ? COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS
+                  : COOK_SKILL_INSTALL_INSTRUCTIONS,
+                t('token.installCopied'),
+              )}
             >
               {t('token.copyInstall')}
             </button>
@@ -1444,7 +1783,10 @@ export function ImportTokenSettings() {
             <p>{t('token.promptDetail')}</p>
             <button
               className="button ghost"
-              onClick={() => copyOutput(COOK_IMPORT_PROMPT_TEMPLATE, t('token.promptCopied'))}
+              onClick={() => copyOutput(
+                createdPreset === 'manage' ? COOK_MANAGE_PROMPT_TEMPLATE : COOK_IMPORT_PROMPT_TEMPLATE,
+                t('token.promptCopied'),
+              )}
             >
               {t('token.copyPrompt')}
             </button>
@@ -1465,7 +1807,13 @@ export function ImportTokenSettings() {
           {tokens.data?.map((token) => (
             <article className="recipe-card" key={token.id}>
               <strong>{token.name}</strong>
-              <span>{token.prefix}… · {token.scope}</span>
+              <span>{token.prefix}… · {token.scopes.join(', ')}</span>
+              <span>{t('token.created', { date: formatDateTime(token.createdAt) })}</span>
+              <span>
+                {token.lastUsedAt
+                  ? t('token.lastUsed', { date: formatDateTime(token.lastUsedAt) })
+                  : t('token.neverUsed')}
+              </span>
               <span>
                 {token.revokedAt
                   ? t('token.revoked')
@@ -1849,6 +2197,8 @@ function errorMessage(error: unknown, t: Translate) {
       rate_limited: t('error.rateLimited'),
       auth_unavailable: t('error.authUnavailable'),
       conflict: t('error.conflict'),
+      forbidden: t('error.forbidden'),
+      payload_too_large: t('error.payloadTooLarge'),
       validation_error: t('error.validation'),
       internal_error: t('error.internal'),
     }

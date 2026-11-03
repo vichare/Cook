@@ -20,6 +20,10 @@ pub enum AppError {
     AuthUnavailable,
     #[error("resource not found")]
     NotFound,
+    #[error("permission denied")]
+    Forbidden,
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
@@ -53,6 +57,8 @@ impl IntoResponse for AppError {
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             Self::AuthUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "auth_unavailable"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
             Self::Configuration(_)

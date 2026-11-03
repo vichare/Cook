@@ -20,17 +20,18 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
+    ai_recipes,
     auth::{load_user, upsert_development_user, GoogleCompletionError},
     config::AuthMode,
     error::{AppError, AppResult},
-    imports,
+    images, imports,
     ingredients::{
         clean_display_name, match_reason, normalize_ingredient, split_ingredient_list, MatchReason,
     },
     models::{
         normalize_nickname, IngredientInput, LocaleInput, PantryItem, PantryItemInput,
-        PantryStatus, ProfileInput, Recipe, RecipeInput, RecipeSource, RecommendationRequest,
-        RecommendationSettings, User,
+        PantryStatus, ProfileInput, Recipe, RecipeImage, RecipeInput, RecipeSource,
+        RecommendationRequest, RecommendationSettings, User,
     },
     passwordless::{
         email_address, map_email_error, map_passkey_error, normalize_email, purpose,
@@ -75,6 +76,26 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/recipes/{id}/favorite",
             put(favorite_recipe).delete(unfavorite_recipe),
+        )
+        .route(
+            "/api/recipes/{id}/cover",
+            post(images::session_upload_image)
+                .put(images::session_update_image_metadata)
+                .delete(images::session_delete_image)
+                .layer(images::upload_body_limit()),
+        )
+        .route("/api/recipe-revisions", get(ai_recipes::list_revisions))
+        .route(
+            "/api/recipe-revisions/{id}/accept",
+            post(ai_recipes::accept_revision),
+        )
+        .route(
+            "/api/recipe-revisions/{id}",
+            axum::routing::delete(ai_recipes::reject_revision),
+        )
+        .route(
+            "/api/recipe-revisions/{id}/cover",
+            get(ai_recipes::get_revision_image),
         )
         .route("/api/pantry", get(list_pantry).put(upsert_pantry))
         .route("/api/ingredients/suggestions", get(ingredient_suggestions))
@@ -124,6 +145,21 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/auth/logout", post(logout))
         .route("/api/import/drafts", post(imports::create_import_draft))
+        .route(
+            "/api/ai/recipes",
+            get(ai_recipes::list_ai_recipes).post(ai_recipes::create_ai_recipe),
+        )
+        .route(
+            "/api/ai/recipes/{id}",
+            get(ai_recipes::get_ai_recipe).put(ai_recipes::update_ai_recipe),
+        )
+        .route(
+            "/api/ai/recipes/{id}/cover",
+            post(ai_recipes::upload_ai_image)
+                .delete(ai_recipes::delete_ai_image)
+                .layer(images::upload_body_limit()),
+        )
+        .route("/api/recipe-images/{id}", get(images::get_recipe_image))
         .merge(protected)
         .with_state(state)
 }
@@ -924,8 +960,16 @@ async fn update_recipe(
     input.ingredients = expand_ingredient_inputs(input.ingredients);
     validate_recipe(&input)?;
     let mut transaction = state.pool.begin().await?;
+    let previous_visibility: String =
+        sqlx::query_scalar("SELECT visibility FROM recipes WHERE id = ? AND owner_id = ?")
+            .bind(&id)
+            .bind(&user.id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(AppError::NotFound)?;
     let result = sqlx::query(
-        "UPDATE recipes SET title = ?, description = ?, instructions = ?, visibility = ?, updated_at = CURRENT_TIMESTAMP
+        "UPDATE recipes SET title = ?, description = ?, instructions = ?, visibility = ?,
+         version = version + 1, updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ?",
     )
     .bind(input.title.trim())
@@ -940,6 +984,17 @@ async fn update_recipe(
         return Err(AppError::NotFound);
     }
     replace_ingredients(&mut transaction, &id, &user.id, &input.ingredients).await?;
+    if previous_visibility == "public" && input.visibility == "private" {
+        sqlx::query(
+            "UPDATE recipe_images SET id = ?, version = version + 1, updated_at = ?
+             WHERE recipe_id = ?",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(Utc::now().timestamp())
+        .bind(&id)
+        .execute(&mut *transaction)
+        .await?;
+    }
     transaction.commit().await?;
     let recipe = load_visible_recipes(&state.pool, &user.id, Some(&id))
         .await?
@@ -1270,9 +1325,18 @@ fn map_login_error(error: LoginError) -> AppError {
     }
 }
 
-fn validate_recipe(input: &RecipeInput) -> AppResult<()> {
+pub(crate) fn validate_recipe(input: &RecipeInput) -> AppResult<()> {
     if input.title.trim().is_empty() {
         return Err(AppError::Validation("title is required".into()));
+    }
+    if input.title.trim().chars().count() > 120
+        || input.title.chars().any(char::is_control)
+        || input.description.chars().count() > 2_000
+        || input.instructions.chars().count() > 20_000
+    {
+        return Err(AppError::Validation(
+            "recipe title, description, or instructions exceed the allowed length".into(),
+        ));
     }
     if input.ingredients.is_empty()
         || input
@@ -1302,7 +1366,7 @@ fn validate_recipe(input: &RecipeInput) -> AppResult<()> {
     Ok(())
 }
 
-fn expand_ingredient_inputs(items: Vec<IngredientInput>) -> Vec<IngredientInput> {
+pub(crate) fn expand_ingredient_inputs(items: Vec<IngredientInput>) -> Vec<IngredientInput> {
     let mut expanded = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for item in items {
@@ -1489,6 +1553,23 @@ async fn canonical_ingredient_is_visible(
     Ok(visible.is_some())
 }
 
+pub(crate) async fn validate_ingredient_selections(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner_id: &str,
+    ingredients: &[IngredientInput],
+) -> AppResult<()> {
+    for ingredient in ingredients {
+        if let Some(selected_id) = ingredient.canonical_ingredient_id.as_deref() {
+            if !canonical_ingredient_is_visible(transaction, owner_id, selected_id).await? {
+                return Err(AppError::Validation(
+                    "selected canonical ingredient is not available to this account".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn resolve_recommendation_request(
     pool: &SqlitePool,
     owner_id: &str,
@@ -1637,17 +1718,18 @@ async fn save_recipe(
     Ok(())
 }
 
-async fn replace_ingredients(
+pub(crate) async fn replace_ingredients(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     recipe_id: &str,
     owner_id: &str,
     ingredients: &[IngredientInput],
 ) -> AppResult<()> {
+    let ingredients = resolve_ingredients(transaction, owner_id, ingredients).await?;
     sqlx::query("DELETE FROM recipe_ingredients WHERE recipe_id = ?")
         .bind(recipe_id)
         .execute(&mut **transaction)
         .await?;
-    insert_ingredients(transaction, recipe_id, owner_id, ingredients).await
+    insert_resolved_ingredients(transaction, recipe_id, &ingredients).await
 }
 
 pub(crate) async fn insert_ingredients(
@@ -1656,8 +1738,18 @@ pub(crate) async fn insert_ingredients(
     owner_id: &str,
     ingredients: &[IngredientInput],
 ) -> AppResult<()> {
+    let ingredients = resolve_ingredients(transaction, owner_id, ingredients).await?;
+    insert_resolved_ingredients(transaction, recipe_id, &ingredients).await
+}
+
+async fn resolve_ingredients(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner_id: &str,
+    ingredients: &[IngredientInput],
+) -> AppResult<Vec<(IngredientInput, String)>> {
     let ingredients = expand_ingredient_inputs(ingredients.to_vec());
-    for (index, ingredient) in ingredients.iter().enumerate() {
+    let mut resolved = Vec::with_capacity(ingredients.len());
+    for ingredient in ingredients {
         let canonical_id = resolve_canonical_ingredient(
             transaction,
             owner_id,
@@ -1665,6 +1757,17 @@ pub(crate) async fn insert_ingredients(
             ingredient.canonical_ingredient_id.as_deref(),
         )
         .await?;
+        resolved.push((ingredient, canonical_id));
+    }
+    Ok(resolved)
+}
+
+async fn insert_resolved_ingredients(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    recipe_id: &str,
+    ingredients: &[(IngredientInput, String)],
+) -> AppResult<()> {
+    for (index, (ingredient, canonical_id)) in ingredients.iter().enumerate() {
         sqlx::query(
             "INSERT INTO recipe_ingredients
              (id, recipe_id, name, normalized_name, quantity_note, sort_order,
@@ -1676,7 +1779,10 @@ pub(crate) async fn insert_ingredients(
         .bind(clean_display_name(&ingredient.name))
         .bind(normalize_ingredient(&ingredient.name))
         .bind(ingredient.quantity_note.trim())
-        .bind(index as i64)
+        .bind(
+            i64::try_from(index)
+                .map_err(|_| AppError::Validation("too many ingredients".into()))?,
+        )
         .bind(canonical_id)
         .execute(&mut **transaction)
         .await?;
@@ -1691,7 +1797,7 @@ pub(crate) async fn load_visible_recipes(
 ) -> AppResult<Vec<Recipe>> {
     let rows = if let Some(id) = id {
         sqlx::query(
-            "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
+            "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility, r.version,
                u.public_nickname, r.source_url, r.source_title, r.source_author,
                r.source_warnings, r.source_confidence,
                EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite
@@ -1705,7 +1811,7 @@ pub(crate) async fn load_visible_recipes(
         .await?
     } else {
         sqlx::query(
-            "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
+            "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility, r.version,
                u.public_nickname, r.source_url, r.source_title, r.source_author,
                r.source_warnings, r.source_confidence,
                EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite
@@ -1741,6 +1847,7 @@ pub(crate) async fn load_visible_recipes(
         };
         recipes.push(Recipe {
             ingredients: load_ingredients(pool, &recipe_id).await?,
+            cover_image: load_recipe_image_meta(pool, &recipe_id).await?,
             id: recipe_id,
             is_owner: owner_id == user_id,
             owner_id,
@@ -1749,11 +1856,41 @@ pub(crate) async fn load_visible_recipes(
             description: row.get("description"),
             instructions: row.get("instructions"),
             visibility: row.get("visibility"),
+            version: row.get("version"),
             is_favorite: row.get::<i64, _>("is_favorite") != 0,
             source,
         });
     }
+
     Ok(recipes)
+}
+
+pub(crate) async fn load_recipe_image_meta(
+    pool: &SqlitePool,
+    recipe_id: &str,
+) -> AppResult<Option<RecipeImage>> {
+    let row = sqlx::query(
+        "SELECT id, width, height, alt_text, source_url, source_license,
+                source_attribution, version
+         FROM recipe_images WHERE recipe_id = ?",
+    )
+    .bind(recipe_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| {
+        let id: String = row.get("id");
+        RecipeImage {
+            url: format!("/api/recipe-images/{id}"),
+            id,
+            width: row.get("width"),
+            height: row.get("height"),
+            alt_text: row.get("alt_text"),
+            source_url: row.get("source_url"),
+            source_license: row.get("source_license"),
+            source_attribution: row.get("source_attribution"),
+            version: row.get("version"),
+        }
+    }))
 }
 
 async fn load_candidate_recipes(
@@ -1774,7 +1911,10 @@ async fn load_candidate_recipes(
         .collect())
 }
 
-async fn load_ingredients(pool: &SqlitePool, recipe_id: &str) -> AppResult<Vec<IngredientInput>> {
+pub(crate) async fn load_ingredients(
+    pool: &SqlitePool,
+    recipe_id: &str,
+) -> AppResult<Vec<IngredientInput>> {
     let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT name, quantity_note, canonical_ingredient_id
          FROM recipe_ingredients WHERE recipe_id = ? ORDER BY sort_order",
@@ -1871,13 +2011,14 @@ async fn load_settings(pool: &SqlitePool, user_id: &str) -> AppResult<Recommenda
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io::Cursor, sync::Arc};
 
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
     use chrono::Utc;
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use serde_json::{json, Value};
     use sqlx::SqlitePool;
     use tower::ServiceExt;
@@ -1990,7 +2131,7 @@ mod tests {
         response_json(response).await
     }
 
-    async fn create_import_token(app: &axum::Router, cookie: &str) -> Value {
+    async fn create_token(app: &axum::Router, cookie: &str, preset: &str) -> Value {
         let response = app
             .clone()
             .oneshot(
@@ -1998,7 +2139,12 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", cookie)
                     .body(Body::from(
-                        json!({"name": "Test client", "expiresInDays": 90}).to_string(),
+                        json!({
+                            "name": "Test client",
+                            "expiresInDays": 90,
+                            "preset": preset
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -2006,6 +2152,14 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         response_json(response).await
+    }
+
+    async fn create_import_token(app: &axum::Router, cookie: &str) -> Value {
+        create_token(app, cookie, "import").await
+    }
+
+    async fn create_manage_token(app: &axum::Router, cookie: &str) -> Value {
+        create_token(app, cookie, "manage").await
     }
 
     fn import_payload(source_url: &str) -> Value {
@@ -2038,6 +2192,35 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    fn test_png() -> Vec<u8> {
+        let image = RgbaImage::from_pixel(2, 2, Rgba([40, 120, 200, 255]));
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    fn multipart_image(bytes: &[u8]) -> (String, Vec<u8>) {
+        let boundary = "cook-test-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"altText\"\r\n\r\nBlue soup\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cover.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        (format!("multipart/form-data; boundary={boundary}"), body)
     }
 
     #[tokio::test]
@@ -2534,6 +2717,613 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(me.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn scoped_ai_recipe_access_is_idempotent_owner_scoped_and_versioned() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Owner").await;
+        let other_cookie = login(&app, "Other").await;
+        let manage = create_manage_token(&app, &owner_cookie).await;
+        let manage_secret = manage["secret"].as_str().unwrap();
+        assert_eq!(
+            manage["token"]["scopes"],
+            json!(["recipes:read", "recipes:write", "recipes:images:write"])
+        );
+        let import = create_import_token(&app, &owner_cookie).await;
+        let import_secret = import["secret"].as_str().unwrap();
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ai/recipes")
+                    .header("authorization", format!("Bearer {import_secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let body = json!({
+            "title": "AI private soup",
+            "description": "Private",
+            "instructions": "Stir.",
+            "ingredients": [{"name": "water", "quantityNote": "1 cup"}]
+        });
+        let create_once = |key: &'static str| {
+            app.clone().oneshot(
+                Request::post("/api/ai/recipes")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {manage_secret}"))
+                    .header("idempotency-key", key)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+        let first = create_once("test-create-0001").await.unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first = response_json(first).await;
+        assert_eq!(first["visibility"], "private");
+        assert_eq!(first["version"], 1);
+        let recipe_id = first["id"].as_str().unwrap();
+        let replay = create_once("test-create-0001").await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["id"], recipe_id);
+
+        let other_manage = create_manage_token(&app, &other_cookie).await;
+        let other_secret = other_manage["secret"].as_str().unwrap();
+        let cross_account = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/ai/recipes/{recipe_id}"))
+                    .header("authorization", format!("Bearer {other_secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_account.status(), StatusCode::NOT_FOUND);
+        let delete_not_supported = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/ai/recipes/{recipe_id}"))
+                    .header("authorization", format!("Bearer {manage_secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            delete_not_supported.status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        let update_body = json!({
+            "title": "Updated private soup",
+            "description": "Private",
+            "instructions": "Stir twice.",
+            "ingredients": [{"name": "water", "quantityNote": "2 cups"}],
+            "expectedVersion": 1
+        });
+        let update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/ai/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {manage_secret}"))
+                    .body(Body::from(update_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let update = response_json(update).await;
+        assert_eq!(update["status"], "updated");
+        assert_eq!(update["recipe"]["version"], 2);
+
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/ai/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {manage_secret}"))
+                    .body(Body::from(update_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let owner_delete = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_delete.status(), StatusCode::NO_CONTENT);
+        let deleted_replay = create_once("test-create-0001").await.unwrap();
+        assert_eq!(deleted_replay.status(), StatusCode::CONFLICT);
+
+        let revoke = app
+            .clone()
+            .oneshot(
+                Request::delete(format!(
+                    "/api/settings/import-tokens/{}",
+                    manage["token"]["id"].as_str().unwrap()
+                ))
+                .header("cookie", owner_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+        let revoked = app
+            .oneshot(
+                Request::get("/api/ai/recipes")
+                    .header("authorization", format!("Bearer {manage_secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ai_create_retries_converge_on_one_recipe() {
+        let (app, _, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Owner").await;
+        let manage = create_manage_token(&app, &owner_cookie).await;
+        let secret = manage["secret"].as_str().unwrap();
+        let body = json!({
+            "title": "Concurrent soup",
+            "description": "",
+            "instructions": "Stir.",
+            "ingredients": [{"name": "water", "quantityNote": "1 cup"}]
+        })
+        .to_string();
+        let request = || {
+            app.clone().oneshot(
+                Request::post("/api/ai/recipes")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .header("idempotency-key", "concurrent-create-0001")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+        };
+        let (first, second) = tokio::join!(request(), request());
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(
+            [StatusCode::CREATED, StatusCode::OK].contains(&first.status()),
+            "{}",
+            first.status()
+        );
+        assert!(
+            [StatusCode::CREATED, StatusCode::OK].contains(&second.status()),
+            "{}",
+            second.status()
+        );
+        let first = response_json(first).await;
+        let second = response_json(second).await;
+        assert_eq!(first["id"], second["id"]);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM recipes WHERE title = 'Concurrent soup'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn public_ai_updates_require_owner_revision_acceptance() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Owner").await;
+        let created = create_recipe(&app, &owner_cookie, "public").await;
+        let recipe_id = created["id"].as_str().unwrap();
+        let manage = create_manage_token(&app, &owner_cookie).await;
+        let secret = manage["secret"].as_str().unwrap();
+        let proposed = json!({
+            "title": "Reviewed public soup",
+            "description": "Proposed",
+            "instructions": "Stir carefully.",
+            "ingredients": [{"name": "water", "quantityNote": "3 cups"}],
+            "expectedVersion": created["version"]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/ai/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .body(Body::from(proposed.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let pending = response_json(response).await;
+        assert_eq!(pending["status"], "pendingReview");
+        let revision_id = pending["revision"]["id"].as_str().unwrap();
+
+        let live = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(live).await["title"], "Test soup");
+
+        let accept = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipe-revisions/{revision_id}/accept"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept.status(), StatusCode::OK);
+        let accepted = response_json(accept).await;
+        assert_eq!(accepted["title"], "Reviewed public soup");
+        assert_eq!(accepted["version"], 2);
+        assert_eq!(accepted["visibility"], "public");
+
+        let duplicate = app
+            .oneshot(
+                Request::post(format!("/api/recipe-revisions/{revision_id}/accept"))
+                    .header("cookie", owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn recipe_images_are_normalized_private_and_revision_controlled() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Owner").await;
+        let created = create_recipe(&app, &owner_cookie, "private").await;
+        let recipe_id = created["id"].as_str().unwrap();
+        let first_token = create_manage_token(&app, &owner_cookie).await;
+        let first_secret = first_token["secret"].as_str().unwrap();
+        let (oversized_type, oversized_body) =
+            multipart_image(&vec![b'x'; crate::images::MAX_UPLOAD_BYTES + 128 * 1024]);
+        let oversized = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/ai/recipes/{recipe_id}/cover"))
+                    .header("content-type", oversized_type)
+                    .header("authorization", format!("Bearer {first_secret}"))
+                    .header("if-match", "\"recipe-v1\"")
+                    .body(Body::from(oversized_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let (content_type, body) = multipart_image(&test_png());
+        let upload = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/ai/recipes/{recipe_id}/cover"))
+                    .header("content-type", content_type)
+                    .header("authorization", format!("Bearer {first_secret}"))
+                    .header("if-match", "\"recipe-v1\"")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::OK);
+        let uploaded = response_json(upload).await;
+        assert_eq!(uploaded["status"], "updated");
+        assert_eq!(uploaded["recipe"]["version"], 2);
+        assert_eq!(uploaded["recipe"]["coverImage"]["altText"], "Blue soup");
+        let image_url = uploaded["recipe"]["coverImage"]["url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let anonymous = app
+            .clone()
+            .oneshot(Request::get(&image_url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::NOT_FOUND);
+        let owner_token_read = app
+            .clone()
+            .oneshot(
+                Request::get(&image_url)
+                    .header("authorization", format!("Bearer {first_secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_token_read.status(), StatusCode::OK);
+        assert_eq!(owner_token_read.headers()["content-type"], "image/jpeg");
+        assert_eq!(
+            owner_token_read.headers()["cache-control"],
+            "private, no-store"
+        );
+        assert_eq!(
+            owner_token_read.headers()["x-content-type-options"],
+            "nosniff"
+        );
+        let etag = owner_token_read.headers()["etag"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let not_modified = app
+            .clone()
+            .oneshot(
+                Request::get(&image_url)
+                    .header("authorization", format!("Bearer {first_secret}"))
+                    .header("if-none-match", etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        let metadata_update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "altText": "Updated blue soup",
+                            "sourceUrl": "",
+                            "sourceLicense": "",
+                            "sourceAttribution": ""
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata_update.status(), StatusCode::NO_CONTENT);
+        let metadata_recipe = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metadata_recipe = response_json(metadata_recipe).await;
+        assert_eq!(metadata_recipe["version"], 3);
+        assert_eq!(
+            metadata_recipe["coverImage"]["altText"],
+            "Updated blue soup"
+        );
+
+        let revoke = app
+            .clone()
+            .oneshot(
+                Request::delete(format!(
+                    "/api/settings/import-tokens/{}",
+                    first_token["token"]["id"].as_str().unwrap()
+                ))
+                .header("cookie", &owner_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+        let revoked_read = app
+            .clone()
+            .oneshot(
+                Request::get(&image_url)
+                    .header("authorization", format!("Bearer {first_secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked_read.status(), StatusCode::UNAUTHORIZED);
+
+        let publish = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Test soup",
+                            "description": "",
+                            "instructions": "",
+                            "visibility": "public",
+                            "ingredients": [{"name": "water", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(publish.status(), StatusCode::OK);
+        assert_eq!(response_json(publish).await["version"], 4);
+        let public_read = app
+            .clone()
+            .oneshot(
+                Request::get(&image_url)
+                    .header("range", "bytes=0-9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_read.status(), StatusCode::OK);
+        assert_eq!(
+            public_read.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        let make_private = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Test soup",
+                            "description": "",
+                            "instructions": "",
+                            "visibility": "private",
+                            "ingredients": [{"name": "water", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(make_private.status(), StatusCode::OK);
+        let private_recipe = response_json(make_private).await;
+        assert_eq!(private_recipe["version"], 5);
+        let private_url = private_recipe["coverImage"]["url"].as_str().unwrap();
+        assert_ne!(private_url, image_url);
+        let retired_public_url = app
+            .clone()
+            .oneshot(Request::get(&image_url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(retired_public_url.status(), StatusCode::NOT_FOUND);
+        let anonymous_private = app
+            .clone()
+            .oneshot(Request::get(private_url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(anonymous_private.status(), StatusCode::NOT_FOUND);
+        let republish = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Test soup",
+                            "description": "",
+                            "instructions": "",
+                            "visibility": "public",
+                            "ingredients": [{"name": "water", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(republish.status(), StatusCode::OK);
+        assert_eq!(response_json(republish).await["version"], 6);
+
+        let second_token = create_manage_token(&app, &owner_cookie).await;
+        let second_secret = second_token["secret"].as_str().unwrap();
+        let (replacement_type, replacement_body) = multipart_image(&test_png());
+        let proposed_replace = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/ai/recipes/{recipe_id}/cover"))
+                    .header("content-type", replacement_type)
+                    .header("authorization", format!("Bearer {second_secret}"))
+                    .header("if-match", "\"recipe-v6\"")
+                    .body(Body::from(replacement_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposed_replace.status(), StatusCode::OK);
+        let proposed_replace = response_json(proposed_replace).await;
+        assert_eq!(proposed_replace["status"], "pendingReview");
+        assert_eq!(proposed_replace["revision"]["imageAction"], "replace");
+        let replace_revision_id = proposed_replace["revision"]["id"].as_str().unwrap();
+        let preview = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipe-revisions/{replace_revision_id}/cover"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        assert_eq!(preview.headers()["cache-control"], "private, no-store");
+        let accept_replace = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/recipe-revisions/{replace_revision_id}/accept"
+                ))
+                .header("cookie", &owner_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept_replace.status(), StatusCode::OK);
+        let accepted_replace = response_json(accept_replace).await;
+        assert_eq!(accepted_replace["version"], 7);
+        assert_ne!(accepted_replace["coverImage"]["url"], private_url);
+        let retired_url = app
+            .clone()
+            .oneshot(Request::get(private_url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(retired_url.status(), StatusCode::NOT_FOUND);
+
+        let proposed_delete = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/ai/recipes/{recipe_id}/cover"))
+                    .header("authorization", format!("Bearer {second_secret}"))
+                    .header("if-match", "\"recipe-v7\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposed_delete.status(), StatusCode::OK);
+        let proposed_delete = response_json(proposed_delete).await;
+        assert_eq!(proposed_delete["status"], "pendingReview");
+        assert_eq!(proposed_delete["revision"]["imageAction"], "delete");
+        let revision_id = proposed_delete["revision"]["id"].as_str().unwrap();
+        let accepted = app
+            .oneshot(
+                Request::post(format!("/api/recipe-revisions/{revision_id}/accept"))
+                    .header("cookie", owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let accepted_status = accepted.status();
+        let accepted = response_json(accepted).await;
+        assert_eq!(accepted_status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["version"], 8);
+        assert!(accepted["coverImage"].is_null());
     }
 
     #[tokio::test]

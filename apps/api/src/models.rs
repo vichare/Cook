@@ -62,9 +62,25 @@ pub struct Recipe {
     pub description: String,
     pub instructions: String,
     pub visibility: String,
+    pub version: i64,
     pub ingredients: Vec<IngredientInput>,
     pub is_favorite: bool,
     pub source: Option<RecipeSource>,
+    pub cover_image: Option<RecipeImage>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeImage {
+    pub id: String,
+    pub url: String,
+    pub width: i64,
+    pub height: i64,
+    pub alt_text: String,
+    pub source_url: Option<String>,
+    pub source_license: Option<String>,
+    pub source_attribution: Option<String>,
+    pub version: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]

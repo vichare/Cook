@@ -6,6 +6,7 @@ import type {
   ImportToken,
   Recommendation,
   RecommendationSettings,
+  RecipeRevision,
   AuthConfig,
   EmailOtpChallenge,
   IngredientSuggestion,
@@ -117,6 +118,57 @@ export const api = {
       method: id ? 'PUT' : 'POST',
       body: JSON.stringify(value),
     }),
+  uploadRecipeCover: async (
+    id: string,
+    image: File,
+    metadata: {
+      altText: string
+      sourceUrl: string
+      sourceLicense: string
+      sourceAttribution: string
+    },
+  ) => {
+    const body = new FormData()
+    body.set('image', image)
+    body.set('altText', metadata.altText)
+    if (metadata.sourceUrl) body.set('sourceUrl', metadata.sourceUrl)
+    if (metadata.sourceLicense) body.set('sourceLicense', metadata.sourceLicense)
+    if (metadata.sourceAttribution) body.set('sourceAttribution', metadata.sourceAttribution)
+    const response = await fetch(`/api/recipes/${id}/cover`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      body,
+    })
+    if (!response.ok) {
+      const error = (await response.json().catch(() => null)) as { error?: string; message?: string } | null
+      throw new ApiError(
+        error?.message ?? `Request failed (${response.status})`,
+        response.status,
+        error?.error ?? 'unknown_error',
+      )
+    }
+  },
+  deleteRecipeCover: (id: string) =>
+    request<void>(`/api/recipes/${id}/cover`, { method: 'DELETE' }),
+  updateRecipeCoverMetadata: (
+    id: string,
+    metadata: {
+      altText: string
+      sourceUrl: string
+      sourceLicense: string
+      sourceAttribution: string
+    },
+  ) =>
+    request<void>(`/api/recipes/${id}/cover`, {
+      method: 'PUT',
+      body: JSON.stringify(metadata),
+    }),
+  recipeRevisions: (recipeId: string) =>
+    request<RecipeRevision[]>(`/api/recipe-revisions?recipeId=${encodeURIComponent(recipeId)}`),
+  acceptRecipeRevision: (id: string) =>
+    request<Recipe>(`/api/recipe-revisions/${id}/accept`, { method: 'POST' }),
+  rejectRecipeRevision: (id: string) =>
+    request<void>(`/api/recipe-revisions/${id}`, { method: 'DELETE' }),
   favorite: (id: string, favorite: boolean) =>
     request<void>(`/api/recipes/${id}/favorite`, { method: favorite ? 'PUT' : 'DELETE' }),
   pantry: () => request<PantryItem[]>('/api/pantry'),
@@ -145,10 +197,14 @@ export const api = {
       body: JSON.stringify(value),
     }),
   importTokens: () => request<ImportToken[]>('/api/settings/import-tokens'),
-  createImportToken: (name: string, expiresInDays: number | null) =>
+  createImportToken: (
+    name: string,
+    expiresInDays: number | null,
+    preset: 'import' | 'manage',
+  ) =>
     request<CreatedImportToken>('/api/settings/import-tokens', {
       method: 'POST',
-      body: JSON.stringify({ name, expiresInDays }),
+      body: JSON.stringify({ name, expiresInDays, preset }),
     }),
   revokeImportToken: (id: string) =>
     request<void>(`/api/settings/import-tokens/${id}`, { method: 'DELETE' }),

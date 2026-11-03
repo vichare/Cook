@@ -56,6 +56,7 @@ export interface IngredientSuggestion {
 
 export interface Recipe {
   id: string
+  version: number
   isOwner: boolean
   authorNickname: string | null
   title: string
@@ -64,7 +65,20 @@ export interface Recipe {
   visibility: 'private' | 'public'
   ingredients: Ingredient[]
   isFavorite: boolean
+  coverImage: RecipeImage | null
   source: RecipeSource | null
+}
+
+export interface RecipeImage {
+  id: string
+  url: string
+  width: number
+  height: number
+  altText: string
+  sourceUrl: string | null
+  sourceLicense: string | null
+  sourceAttribution: string | null
+  version: number
 }
 
 export interface RecipeSource {
@@ -114,11 +128,30 @@ export interface ImportToken {
   id: string
   name: string
   prefix: string
-  scope: 'recipes:import'
+  scopes: Array<'recipes:import' | 'recipes:read' | 'recipes:write' | 'recipes:images:write'>
   createdAt: string
   lastUsedAt: string | null
   expiresAt: string | null
   revokedAt: string | null
+}
+
+export interface RecipeRevision {
+  id: string
+  recipeId: string
+  expectedVersion: number
+  title: string
+  description: string
+  instructions: string
+  ingredients: Ingredient[]
+  imageAction: 'keep' | 'replace' | 'delete'
+  imageAltText: string | null
+  imageUrl: string | null
+  imageSourceUrl: string | null
+  imageSourceLicense: string | null
+  imageSourceAttribution: string | null
+  status: 'pending' | 'accepted' | 'rejected'
+  createdAt: string
+  updatedAt: string
 }
 
 export interface CreatedImportToken {

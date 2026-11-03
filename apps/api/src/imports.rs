@@ -17,9 +17,14 @@ use crate::{
     AppState,
 };
 
-const IMPORT_SCOPE: &str = "recipes:import";
+pub const SCOPE_IMPORT: &str = "recipes:import";
+pub const SCOPE_RECIPES_READ: &str = "recipes:read";
+pub const SCOPE_RECIPES_WRITE: &str = "recipes:write";
+pub const SCOPE_IMAGES_WRITE: &str = "recipes:images:write";
 const IMPORT_RATE_WINDOW_SECONDS: i64 = 60 * 60;
 const IMPORT_RATE_LIMIT: i64 = 20;
+const READ_RATE_LIMIT: i64 = 240;
+const WRITE_RATE_LIMIT: i64 = 60;
 const ACTIVE_DRAFT_QUOTA: i64 = 50;
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +32,7 @@ const ACTIVE_DRAFT_QUOTA: i64 = 50;
 pub struct CreateImportTokenInput {
     name: String,
     expires_in_days: Option<i64>,
+    preset: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,7 +41,7 @@ pub struct ImportToken {
     id: String,
     name: String,
     prefix: String,
-    scope: &'static str,
+    scopes: Vec<String>,
     created_at: String,
     last_used_at: Option<String>,
     expires_at: Option<String>,
@@ -102,7 +108,7 @@ pub(crate) async fn list_import_tokens(
     Extension(CurrentUser(user)): Extension<CurrentUser>,
 ) -> AppResult<Json<Vec<ImportToken>>> {
     let rows = sqlx::query(
-        "SELECT id, name, token_prefix, created_at, last_used_at, expires_at, revoked_at
+        "SELECT id, name, token_prefix, scopes, created_at, last_used_at, expires_at, revoked_at
          FROM import_tokens WHERE owner_id = ? ORDER BY created_at DESC",
     )
     .bind(user.id)
@@ -117,6 +123,19 @@ pub(crate) async fn create_import_token(
     Json(input): Json<CreateImportTokenInput>,
 ) -> AppResult<(StatusCode, Json<CreatedImportToken>)> {
     let name = validate_short_text("token name", &input.name, 80, false)?;
+    let scopes = match input.preset.as_deref().unwrap_or("import") {
+        "import" => vec![SCOPE_IMPORT.to_string()],
+        "manage" => vec![
+            SCOPE_RECIPES_READ.to_string(),
+            SCOPE_RECIPES_WRITE.to_string(),
+            SCOPE_IMAGES_WRITE.to_string(),
+        ],
+        _ => {
+            return Err(AppError::Validation(
+                "preset must be import or manage".into(),
+            ))
+        }
+    };
     let expires_at = match input.expires_in_days {
         Some(days) if (1..=365).contains(&days) => Some(Utc::now() + Duration::days(days)),
         Some(_) => {
@@ -136,15 +155,16 @@ pub(crate) async fn create_import_token(
     let created_at = Utc::now();
     sqlx::query(
         "INSERT INTO import_tokens
-         (id, owner_id, name, token_digest, token_prefix, scope, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, owner_id, name, token_digest, token_prefix, scope, scopes, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&user.id)
     .bind(&name)
     .bind(token_digest(&secret).as_slice())
     .bind(&prefix)
-    .bind(IMPORT_SCOPE)
+    .bind(SCOPE_IMPORT)
+    .bind(scopes.join(" "))
     .bind(created_at.timestamp())
     .bind(expires_at.map(|value| value.timestamp()))
     .execute(&state.pool)
@@ -156,7 +176,7 @@ pub(crate) async fn create_import_token(
                 id,
                 name,
                 prefix,
-                scope: IMPORT_SCOPE,
+                scopes,
                 created_at: created_at.to_rfc3339(),
                 last_used_at: None,
                 expires_at: expires_at.map(|value| value.to_rfc3339()),
@@ -193,7 +213,9 @@ pub(crate) async fn create_import_draft(
     Json(input): Json<ImportDraftSubmission>,
 ) -> AppResult<(StatusCode, Json<ImportDraft>)> {
     validate_submission(&input)?;
-    let (token_id, owner_id) = authenticate_import_token(&state.pool, &headers).await?;
+    let principal = authenticate_token(&state.pool, &headers, SCOPE_IMPORT).await?;
+    let token_id = principal.token_id.clone();
+    let owner_id = principal.owner_id.clone();
     let now = Utc::now();
     let id = Uuid::new_v4().to_string();
     let instructions = input
@@ -235,6 +257,14 @@ pub(crate) async fn create_import_draft(
     .execute(&mut *transaction)
     .await?;
     insert_draft_ingredients(&mut transaction, &id, &input.ingredients).await?;
+    record_token_audit(
+        &mut transaction,
+        &principal,
+        "import_draft.create",
+        Some(&id),
+        now.timestamp(),
+    )
+    .await?;
     transaction.commit().await?;
     tracing::info!(token_id = %token_id, "recipe import draft created");
     Ok((
@@ -399,10 +429,19 @@ pub(crate) async fn accept_import_draft(
     Ok((StatusCode::CREATED, Json(recipe)))
 }
 
-async fn authenticate_import_token(
+#[derive(Clone, Debug)]
+pub struct TokenPrincipal {
+    pub token_id: String,
+    pub owner_id: String,
+    pub prefix: String,
+    pub scopes: Vec<String>,
+}
+
+pub async fn authenticate_token(
     pool: &SqlitePool,
     headers: &HeaderMap,
-) -> AppResult<(String, String)> {
+    required_scope: &str,
+) -> AppResult<TokenPrincipal> {
     let secret = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -412,70 +451,127 @@ async fn authenticate_import_token(
     let now = Utc::now().timestamp();
     let mut transaction = pool.begin().await?;
     let row = sqlx::query(
-        "SELECT id, owner_id, scope, expires_at, revoked_at
+        "SELECT id, owner_id, token_prefix, scopes, expires_at, revoked_at
          FROM import_tokens WHERE token_digest = ?",
     )
     .bind(token_digest(secret).as_slice())
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or(AppError::Unauthorized)?;
-    if row.get::<String, _>("scope") != IMPORT_SCOPE
-        || row.get::<Option<i64>, _>("revoked_at").is_some()
+    if row.get::<Option<i64>, _>("revoked_at").is_some()
         || row
             .get::<Option<i64>, _>("expires_at")
             .is_some_and(|expires_at| expires_at <= now)
     {
         return Err(AppError::Unauthorized);
     }
+    let scopes = row
+        .get::<String, _>("scopes")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !scopes.iter().any(|scope| scope == required_scope) {
+        return Err(AppError::Forbidden);
+    }
     let token_id: String = row.get("id");
-    enforce_import_rate_limit(&mut transaction, &token_id, now).await?;
+    enforce_token_rate_limit(
+        &mut transaction,
+        &token_id,
+        required_scope,
+        rate_limit_for_scope(required_scope),
+        now,
+    )
+    .await?;
     sqlx::query("UPDATE import_tokens SET last_used_at = ? WHERE id = ?")
         .bind(now)
         .bind(&token_id)
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
-    Ok((token_id, row.get("owner_id")))
+    Ok(TokenPrincipal {
+        token_id,
+        owner_id: row.get("owner_id"),
+        prefix: row.get("token_prefix"),
+        scopes,
+    })
 }
 
-async fn enforce_import_rate_limit(
+pub async fn record_token_audit(
+    transaction: &mut Transaction<'_, Sqlite>,
+    principal: &TokenPrincipal,
+    action: &str,
+    recipe_id: Option<&str>,
+    now: i64,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO ai_token_audit_events
+         (id, token_id, token_prefix, action, recipe_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&principal.token_id)
+    .bind(&principal.prefix)
+    .bind(action)
+    .bind(recipe_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn enforce_token_rate_limit(
     transaction: &mut Transaction<'_, Sqlite>,
     token_id: &str,
+    bucket: &str,
+    limit: i64,
     now: i64,
 ) -> AppResult<()> {
     let row: Option<(i64, i64)> = sqlx::query_as(
-        "SELECT window_started_at, request_count FROM import_token_rate_limits WHERE token_id = ?",
+        "SELECT window_started_at, request_count FROM ai_token_rate_limits
+         WHERE token_id = ? AND bucket = ?",
     )
     .bind(token_id)
+    .bind(bucket)
     .fetch_optional(&mut **transaction)
     .await?;
     match row {
         Some((window, count)) if now - window < IMPORT_RATE_WINDOW_SECONDS => {
-            if count >= IMPORT_RATE_LIMIT {
+            if count >= limit {
                 return Err(AppError::RateLimited);
             }
             sqlx::query(
-                "UPDATE import_token_rate_limits SET request_count = request_count + 1
-                 WHERE token_id = ?",
+                "UPDATE ai_token_rate_limits SET request_count = request_count + 1
+                 WHERE token_id = ? AND bucket = ?",
             )
             .bind(token_id)
+            .bind(bucket)
             .execute(&mut **transaction)
             .await?;
         }
         _ => {
             sqlx::query(
-                "INSERT INTO import_token_rate_limits (token_id, window_started_at, request_count)
-                 VALUES (?, ?, 1)
-                 ON CONFLICT(token_id) DO UPDATE SET window_started_at = excluded.window_started_at,
-                   request_count = 1",
+                "INSERT INTO ai_token_rate_limits
+                 (token_id, bucket, window_started_at, request_count)
+                 VALUES (?, ?, ?, 1)
+                 ON CONFLICT(token_id, bucket) DO UPDATE SET
+                   window_started_at = excluded.window_started_at, request_count = 1",
             )
             .bind(token_id)
+            .bind(bucket)
             .bind(now)
             .execute(&mut **transaction)
             .await?;
         }
     }
     Ok(())
+}
+
+fn rate_limit_for_scope(scope: &str) -> i64 {
+    match scope {
+        SCOPE_RECIPES_READ => READ_RATE_LIMIT,
+        SCOPE_RECIPES_WRITE | SCOPE_IMAGES_WRITE => WRITE_RATE_LIMIT,
+        _ => IMPORT_RATE_LIMIT,
+    }
 }
 
 fn validate_submission(input: &ImportDraftSubmission) -> AppResult<()> {
@@ -702,7 +798,11 @@ fn token_from_row(row: sqlx::sqlite::SqliteRow) -> ImportToken {
         id: row.get("id"),
         name: row.get("name"),
         prefix: row.get("token_prefix"),
-        scope: IMPORT_SCOPE,
+        scopes: row
+            .get::<String, _>("scopes")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
         created_at: timestamp_to_string(row.get("created_at")),
         last_used_at: row
             .get::<Option<i64>, _>("last_used_at")

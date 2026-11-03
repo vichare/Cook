@@ -82,7 +82,7 @@ docker compose -f compose.yaml up -d
 test "$(curl -fsS http://127.0.0.1:18080/health)" = ok
 ```
 
-Store off-host encrypted copies and regularly test restoration. Deployment automation does not configure off-host transport.
+Store off-host encrypted copies and regularly test restoration. Normalized recipe cover images are stored as SQLite BLOBs and are included automatically, increasing backup size and restore time. Deployment automation does not configure off-host transport.
 
 ## Post-deploy checks
 
@@ -90,6 +90,7 @@ Store off-host encrypted copies and regularly test restoration. Deployment autom
 - complete real Google and Email OTP login, passkey registration/login/revocation, and current/all-device logout
 - verify Google-first exact-email OTP linking, Gmail email-first Google convergence, non-Gmail rejection, and pre-existing split-account recovery without account merging
 - verify private recipe and pantry isolation with two accounts
+- verify private cover denial, public cover delivery, scoped AI token denial, and owner revision acceptance without sending a real token in logs
 - verify READY/VERIFY/SHOP/BLOCKED recommendations
 - inspect `docker compose -f compose.yaml ps` and bounded container logs
 - verify the newest backup and perform a scheduled restore drill

@@ -1,6 +1,6 @@
-# Cook recipe import
+# Cook recipe import and management
 
-Use this skill to turn a recipe source that the user is authorized to access into a private Cook import draft for human review.
+Use this skill to turn an authorized source into a private Cook review draft, or—when the user deliberately grants the management preset—to manage that user's private recipes and cover images.
 
 ## Required configuration
 
@@ -8,7 +8,8 @@ Use this skill to turn a recipe source that the user is authorized to access int
 - Read the Cook origin from trusted client configuration or `COOK_BASE_URL`.
 - Never place the token in a URL, prompt, transcript, log, source document, or generated file.
 - Do not copy the token into skill installation instructions or a general-AI prompt. Prompts must reference the secret/environment variable name `COOK_IMPORT_TOKEN` only.
-- The token is scoped only to `recipes:import`; do not attempt to use it with Cook session endpoints.
+- The recommended token has only `recipes:import`. The optional management preset has `recipes:read`, `recipes:write`, and `recipes:images:write`.
+- Neither preset grants publish, recipe deletion, pantry, account, or ordinary Cook session access.
 
 ## Extraction rules
 
@@ -33,4 +34,22 @@ Use `schemaVersion: "1.0"`. Do not include an owner identifier or visibility. Co
 
 On success, tell the user that the draft still requires review and provide the returned `reviewUrl` resolved against `COOK_BASE_URL`. Never claim the recipe was published or finalized. Only the authenticated user can edit, accept, or discard the draft in Cook; acceptance creates a private recipe, which the user may publish separately.
 
-If Cook returns `401`, ask the user to create or replace a `recipes:import` token in Cook Settings and store it in the client's secret store. For `400`, correct the payload rather than weakening validation. For `429`, stop retrying and report the quota or rate limit.
+If Cook returns `401`, ask the user to create or replace the appropriate token preset in Cook Settings and store it in the client's secret store. A `403` means the valid token lacks the endpoint's scope; do not broaden access without the user's explicit choice. For `400`, correct the payload rather than weakening validation. For `429`, stop retrying and report the quota or rate limit.
+
+## Manage owned recipes
+
+Use management endpoints only when the user selected the management preset. Validate create/update JSON against `schema/ai-recipe-v1.schema.json`.
+
+- `GET {COOK_BASE_URL}/api/ai/recipes` lists only recipes owned by the token principal.
+- `GET {COOK_BASE_URL}/api/ai/recipes/{id}` returns an owned recipe and its current `version`.
+- `POST {COOK_BASE_URL}/api/ai/recipes` creates a private recipe. Send a stable, retry-safe `Idempotency-Key`; never generate a new key merely because a response was delayed.
+- `PUT {COOK_BASE_URL}/api/ai/recipes/{id}` includes `expectedVersion`. A private recipe updates directly. A public recipe returns a pending revision that the owner must review in Cook.
+- There is no token recipe-delete or publish endpoint. Do not attempt to simulate either operation.
+
+On `409`, re-read the recipe and ask the user how to reconcile their newer edits. On `404`, do not infer whether another account owns the ID.
+
+## Cover images
+
+Never ask Cook to fetch an image URL. Before upload, ask the user to confirm that they own the local image or have permission to use it. Do not automatically copy a webpage or video thumbnail. Upload only local JPEG, PNG, or WebP bytes to `/api/ai/recipes/{id}/cover`, provide useful alt text, and include known source URL, license, and attribution. Send `If-Match: "recipe-v<version>"`.
+
+Cook rejects SVG, GIF, malformed, oversized, and decompression-risk inputs; normalizes the longest edge to 1,600px; and stores at most one cover. A private cover changes directly. A public cover replacement/removal creates a pending revision for owner review. Do not retry a rejected image by weakening validation or converting it with an external command.

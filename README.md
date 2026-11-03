@@ -37,11 +37,11 @@ Development uses the explicit capture Email OTP sender and loopback WebAuthn set
 
 See `docs/architecture.md` and `docs/deployment.md` for design and deployment details. Future product scope and unresolved decisions are tracked in `docs/product-roadmap.md`. The manual assistive-technology, zoom, contrast, performance, and typo-benchmark release gates are in `docs/accessibility-release-checklist.md`.
 
-## AI-client recipe imports
+## AI-client recipe tools
 
-Cook's official [recipe import skill](skills/cook-recipe-import/SKILL.md) uses browser or transcript tools already available in the user's AI client, then submits an untrusted structured payload to Cook as a private review draft. Create a scoped `recipes:import` token in Settings, store it in the client's secret store or `COOK_IMPORT_TOKEN`, and never place it in a URL or prompt. Cook does not fetch arbitrary source URLs, and accepting a reviewed draft creates a private recipe rather than publishing it.
+Cook's official [recipe skill](skills/cook-recipe-import/SKILL.md) uses browser or transcript tools already available in the user's AI client. The recommended `Import drafts only` preset grants only `recipes:import` and submits untrusted structured payloads as private review drafts. The optional management preset grants `recipes:read`, `recipes:write`, and `recipes:images:write`: it can read owned recipes, idempotently create private recipes, optimistically update private recipes, and propose owner-reviewed revisions for public recipes. It cannot publish or delete recipes, access pantry/account data, or bypass owner isolation.
 
-After creating a token, Settings provides the stable public skill path on `main`, token-free installation instructions, and a bilingual prompt template for general AI clients. The `main` URL follows the latest reviewed skill; clients that require immutable instructions should replace `main` with a Cook release tag. These outputs reference `COOK_IMPORT_TOKEN` and `COOK_BASE_URL` only; the one-time token secret is copied separately and is never interpolated into a prompt, URL, download, log, analytics event, or local storage.
+Store the one-time token in the client's secret store or `COOK_IMPORT_TOKEN`, never in a URL or prompt. Cook does not fetch arbitrary source or image URLs. Cover uploads accept local JPEG, PNG, or WebP bytes only after rights confirmation, require alt text, and are safely re-encoded. Settings provides the stable public skill path on `main`, token-free installation instructions, and preset-aware bilingual prompt templates. Clients that require immutable instructions should replace `main` with a Cook release tag.
 
 ## Interface languages
 

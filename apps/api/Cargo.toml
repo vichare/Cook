@@ -13,6 +13,7 @@ base64.workspace = true
 chrono.workspace = true
 cookie.workspace = true
 http.workspace = true
+image.workspace = true
 lettre.workspace = true
 rust-web-auth-core.workspace = true
 rust-web-auth-email-otp.workspace = true

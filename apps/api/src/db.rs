@@ -195,12 +195,28 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied.0, 7);
+        assert_eq!(applied.0, 8);
         pool.close().await;
 
         let reopened = connect(&url).await.unwrap();
         reopened.close().await;
-        std::fs::remove_file(path).unwrap();
+        drop(reopened);
+        let mut last_error = None;
+        for _ in 0..10 {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            panic!("failed to remove test database {}: {error}", path.display());
+        }
     }
 
     #[tokio::test]
