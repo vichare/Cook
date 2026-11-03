@@ -200,11 +200,16 @@ export const api = {
   createImportToken: (
     name: string,
     expiresInDays: number | null,
-    preset: 'import' | 'manage',
+    preset: 'import' | 'manage' | 'publish',
   ) =>
     request<CreatedImportToken>('/api/settings/import-tokens', {
       method: 'POST',
-      body: JSON.stringify({ name, expiresInDays, preset }),
+      body: JSON.stringify({
+        name,
+        expiresInDays,
+        preset,
+        confirmPublishRisk: preset === 'publish',
+      }),
     }),
   revokeImportToken: (id: string) =>
     request<void>(`/api/settings/import-tokens/${id}`, { method: 'DELETE' }),

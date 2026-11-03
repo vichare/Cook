@@ -9,6 +9,12 @@
     "title": { "type": "string", "minLength": 1, "maxLength": 120 },
     "description": { "type": "string", "maxLength": 2000, "default": "" },
     "instructions": { "type": "string", "maxLength": 20000, "default": "" },
+    "visibility": {
+      "type": "string",
+      "enum": ["private", "public"],
+      "default": "private",
+      "description": "Public visibility requires recipes:publish. Omit to create privately or retain visibility on update."
+    },
     "expectedVersion": {
       "type": "integer",
       "minimum": 1,

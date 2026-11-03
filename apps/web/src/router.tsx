@@ -1639,6 +1639,9 @@ Use your AI client's documented “install skill from GitHub URL” flow. Client
 export const COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS = `${COOK_SKILL_INSTALL_INSTRUCTIONS}
 
 This token uses Cook's management preset. The skill may read owned recipes, create or update private recipes, propose reviewed revisions for public recipes, and manage cover images. It cannot publish or delete recipes. Confirm image rights before every upload.`
+export const COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS = `${COOK_SKILL_INSTALL_INSTRUCTIONS}
+
+This high-risk token includes recipes:publish. The skill may create public recipes, publish owned private recipes, directly update owned public recipes with optimistic concurrency, and manage cover images. It still cannot delete recipes or access another account. Check the granted scopes before every operation, confirm content and image rights, process batch work one recipe at a time, and finish with created/updated/skipped/failed counts plus recipe IDs or URLs.`
 export const COOK_IMPORT_PROMPT_TEMPLATE = `English:
 Use your browser tools to extract a recipe from a webpage I am authorized to access, preferring schema.org Recipe/JSON-LD. For video, use only legitimately available captions/transcripts; if unavailable, ask me for a transcript. Do not bypass login, paywalls, robots restrictions, access controls, or DRM. Rewrite concise structured ingredients and steps, preserve source URL/title/author, and record uncertainty as warnings. Validate against the Cook import draft schema, then create a private review draft at COOK_BASE_URL using the recipes:import credential from the COOK_IMPORT_TOKEN secret/environment variable. Never print, quote, log, download, or place that token in a URL or prompt. Do not publish or finalize the recipe; tell me to review the private draft in Cook.
 
@@ -1649,14 +1652,33 @@ Use your browser or transcript tools only for content I am authorized to access.
 
 简体中文：
 仅使用浏览器或 transcript 工具处理我有权访问的内容。优先使用 schema.org Recipe/JSON-LD 和合法可用的字幕或 transcript。不得绕过登录、付费墙、访问控制、robots 限制或 DRM。使用 COOK_BASE_URL，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN，以读取我的菜谱及版本、创建私密菜谱，或通过乐观并发更新我的私密菜谱。公开菜谱的更新必须创建待审核 revision，绝不能直接发布。上传本地 JPEG、PNG 或 WebP 封面前，先请我确认拥有或获准使用，并提供准确的替代文字及来源、许可、归属信息。绝不要自动抓取或复制来源网站图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
+export const COOK_PUBLISH_PROMPT_TEMPLATE = `English:
+Use your browser or transcript tools only for content I am authorized to access. Use COOK_BASE_URL with the COOK_IMPORT_TOKEN secret/environment variable, and check that the token has recipes:read, recipes:write, and recipes:publish before requesting public visibility; cover changes also require recipes:images:write. With recipes:publish, you may create public recipes, publish my private recipes, and directly update my public recipes, but every update must use the current recipe version and stop on 409 until you reread it. Never delete recipes, access another account, bypass validation, or publish when recipes:publish is absent. Process bulk work one recipe at a time with a distinct Idempotency-Key for each creation. Do not silently skip failures. At the end, report created, updated, skipped, and failed counts with each recipe ID or URL and error. AI output becomes public immediately and may contain errors, copyrighted material, or private information, so preserve source/license/attribution, confirm image rights before uploading local JPEG/PNG/WebP bytes, and never fetch a source image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
+
+简体中文：
+仅使用浏览器或 transcript 工具处理我有权访问的内容。使用 COOK_BASE_URL，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN；请求公开可见性前，必须确认 token 同时具有 recipes:read、recipes:write 和 recipes:publish，修改封面还需要 recipes:images:write。有 recipes:publish 时，可以创建公开菜谱、把我的私密菜谱发布为公开，并直接更新我的公开菜谱；每次更新必须使用当前菜谱 version，遇到 409 必须重新读取后再处理。绝不能删除菜谱、访问其他账号、绕过校验，或在没有 recipes:publish 时发布。批量操作应逐条处理，每个创建使用独立 Idempotency-Key；不得悄悄跳过失败项。结束时输出 created、updated、skipped、failed 数量，以及每项菜谱 ID 或 URL 和错误。AI 输出会立即公开，可能包含错误、受版权保护材料或隐私信息，因此必须保留来源、许可和归属；上传本地 JPEG/PNG/WebP 图片前确认使用权，绝不自动抓取来源图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
+
+type TokenPreset = 'import' | 'manage' | 'publish'
+
+function skillInstructionsForPreset(preset: TokenPreset) {
+  if (preset === 'publish') return COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS
+  if (preset === 'manage') return COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS
+  return COOK_SKILL_INSTALL_INSTRUCTIONS
+}
+
+function promptForPreset(preset: TokenPreset) {
+  if (preset === 'publish') return COOK_PUBLISH_PROMPT_TEMPLATE
+  if (preset === 'manage') return COOK_MANAGE_PROMPT_TEMPLATE
+  return COOK_IMPORT_PROMPT_TEMPLATE
+}
 
 export function ImportTokenSettings() {
   const { formatDateTime, t } = useI18n()
   const queryClient = useQueryClient()
   const tokens = useQuery({ queryKey: ['import-tokens'], queryFn: api.importTokens })
   const [name, setName] = useState(() => t('token.defaultName'))
-  const [preset, setPreset] = useState<'import' | 'manage'>('import')
-  const [createdPreset, setCreatedPreset] = useState<'import' | 'manage'>('import')
+  const [preset, setPreset] = useState<TokenPreset>('import')
+  const [createdPreset, setCreatedPreset] = useState<TokenPreset>('import')
   const [expiresInDays, setExpiresInDays] = useState<30 | 90 | null>(90)
   const [secret, setSecret] = useState<string | null>(null)
   const [copyStatus, setCopyStatus] = useState<string | null>(null)
@@ -1692,6 +1714,7 @@ export function ImportTokenSettings() {
         className="inline-form compact"
         onSubmit={(event) => {
           event.preventDefault()
+          if (preset === 'publish' && !window.confirm(t('token.publishConfirm'))) return
           create.mutate()
         }}
       >
@@ -1727,7 +1750,26 @@ export function ImportTokenSettings() {
               <small>{t('token.presetManageDetail')}</small>
             </span>
           </label>
+          <label className="choice-card">
+            <input
+              type="radio"
+              name="token-preset"
+              value="publish"
+              checked={preset === 'publish'}
+              onChange={() => {
+                setPreset('publish')
+                setExpiresInDays(30)
+              }}
+            />
+            <span>
+              <strong>{t('token.presetPublish')}</strong>
+              <small>{t('token.presetPublishDetail')}</small>
+            </span>
+          </label>
         </fieldset>
+        {preset === 'publish' && (
+          <p className="expiry-warning" role="alert">{t('token.publishRisk')}</p>
+        )}
         <label>
           {t('token.expiry')}
           <select
@@ -1742,6 +1784,9 @@ export function ImportTokenSettings() {
             <option value="none">{t('token.expiryNone')}</option>
           </select>
         </label>
+        {preset === 'publish' && expiresInDays === null && (
+          <p className="expiry-warning" role="alert">{t('token.publishNeverExpires')}</p>
+        )}
         <button className="button primary" disabled={create.isPending}>{t('token.create')}</button>
       </form>
       {secret && (
@@ -1769,9 +1814,7 @@ export function ImportTokenSettings() {
             <button
               className="button ghost"
               onClick={() => copyOutput(
-                createdPreset === 'manage'
-                  ? COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS
-                  : COOK_SKILL_INSTALL_INSTRUCTIONS,
+                skillInstructionsForPreset(createdPreset),
                 t('token.installCopied'),
               )}
             >
@@ -1784,7 +1827,7 @@ export function ImportTokenSettings() {
             <button
               className="button ghost"
               onClick={() => copyOutput(
-                createdPreset === 'manage' ? COOK_MANAGE_PROMPT_TEMPLATE : COOK_IMPORT_PROMPT_TEMPLATE,
+                promptForPreset(createdPreset),
                 t('token.promptCopied'),
               )}
             >

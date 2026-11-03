@@ -521,7 +521,7 @@ paths:
         "401": { description: Invalid, expired, or revoked token }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
-      description: Creates a private recipe for the token principal. Requires recipes:write and an Idempotency-Key; retries with the same token/key return the original recipe.
+      description: Creates a recipe for the token principal. The default visibility is private; public requires recipes:publish in addition to recipes:write. An Idempotency-Key is required, and retries with the same token/key return the original recipe.
       security:
         - importBearer: []
       parameters:
@@ -541,7 +541,7 @@ paths:
                 - name: tomato
                   quantityNote: 3
       responses:
-        "201": { description: Private recipe created, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "201": { description: Recipe created, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
         "200": { description: Idempotent replay of the original creation, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { description: Invalid, expired, or revoked token }
@@ -560,7 +560,7 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: Recipe missing or not owned }
     put:
-      description: Optimistically updates an owned private recipe or creates a pending owner-reviewed revision for an owned public recipe. A token can never publish or directly change live public content.
+      description: Optimistically updates an owned recipe. Without recipes:publish, public recipe changes create a pending owner-reviewed revision. With recipes:publish, the token may publish an owned private recipe or directly update an owned public recipe; stale versions still return 409.
       security:
         - importBearer: []
       requestBody:
@@ -579,7 +579,7 @@ paths:
                   quantityNote: 4
               expectedVersion: 3
       responses:
-        "200": { description: Direct private update or pending public revision, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "200": { description: Direct owned update or pending public revision, depending on scopes, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { description: Invalid, expired, or revoked token }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -590,7 +590,7 @@ paths:
       - $ref: "#/components/parameters/RecipeId"
       - $ref: "#/components/parameters/RecipeVersion"
     post:
-      description: Replaces a private recipe cover directly or creates a pending image revision for a public recipe. Requires recipes:images:write.
+      description: Replaces an owned recipe cover. Requires recipes:images:write. Public covers create a pending revision unless the token also has recipes:publish, in which case the live cover changes directly.
       security:
         - importBearer: []
       requestBody:
@@ -599,7 +599,7 @@ paths:
           multipart/form-data:
             schema: { $ref: "#/components/schemas/RecipeImageUpload" }
       responses:
-        "200": { description: Direct private update or pending public revision, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "200": { description: Direct owned image update or pending public revision, depending on scopes, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { description: Invalid, expired, or revoked token }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -607,11 +607,11 @@ paths:
         "409": { description: Recipe version is stale or a pending revision already exists }
         "413": { description: Image resource limit exceeded }
     delete:
-      description: Removes a private cover directly or creates a pending removal revision for a public recipe. Recipe deletion is not supported.
+      description: Removes an owned cover. Public cover removal creates a pending revision unless the token also has recipes:publish. Recipe deletion is not supported.
       security:
         - importBearer: []
       responses:
-        "200": { description: Direct private update or pending public revision, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "200": { description: Direct owned image removal or pending public revision, depending on scopes, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
         "401": { description: Invalid, expired, or revoked token }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: Recipe missing or not owned }
@@ -795,7 +795,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: cook_imp
-      description: Scoped Cook AI token. The endpoint enforces recipes:import, recipes:read, recipes:write, or recipes:images:write as documented.
+      description: Scoped Cook AI token. The endpoint enforces recipes:import, recipes:read, recipes:write, recipes:images:write, or recipes:publish as documented.
   parameters:
     RecipeId:
       name: id
@@ -1149,9 +1149,13 @@ components:
           maximum: 365
         preset:
           type: string
-          enum: [import, manage]
+          enum: [import, manage, publish]
           default: import
-          description: import grants only recipes:import. manage grants recipes:read, recipes:write, and recipes:images:write; neither grants publish or recipe deletion.
+          description: import grants only recipes:import. manage grants recipes:read, recipes:write, and recipes:images:write. publish grants the management scopes plus recipes:publish and requires confirmPublishRisk=true. No preset grants recipe deletion.
+        confirmPublishRisk:
+          type: boolean
+          default: false
+          description: Must be true to create the high-risk publish preset; ignored for lower-risk presets.
     ImportToken:
       type: object
       required: [id, name, prefix, scopes, createdAt, lastUsedAt, expiresAt, revokedAt]
@@ -1165,7 +1169,7 @@ components:
           uniqueItems: true
           items:
             type: string
-            enum: ["recipes:import", "recipes:read", "recipes:write", "recipes:images:write"]
+            enum: ["recipes:import", "recipes:read", "recipes:write", "recipes:images:write", "recipes:publish"]
         createdAt: { type: string, format: date-time }
         lastUsedAt: { type: [string, "null"], format: date-time }
         expiresAt: { type: [string, "null"], format: date-time }
@@ -1187,6 +1191,11 @@ components:
         title: { type: string, minLength: 1, maxLength: 120 }
         description: { type: string, maxLength: 2000, default: "" }
         instructions: { type: string, maxLength: 20000, default: "" }
+        visibility:
+          type: string
+          enum: [private, public]
+          default: private
+          description: Public requires recipes:publish. Omit on update to retain the current visibility.
         ingredients:
           type: array
           minItems: 1

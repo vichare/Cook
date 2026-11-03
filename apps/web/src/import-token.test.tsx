@@ -6,6 +6,8 @@ import {
   COOK_IMPORT_PROMPT_TEMPLATE,
   COOK_MANAGE_PROMPT_TEMPLATE,
   COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS,
+  COOK_PUBLISH_PROMPT_TEMPLATE,
+  COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS,
   COOK_SKILL_INSTALL_INSTRUCTIONS,
   COOK_SKILL_URL,
   ImportTokenSettings,
@@ -48,6 +50,10 @@ describe('import token reveal', () => {
   beforeEach(() => {
     writeText.mockClear()
     createImportToken.mockClear()
+    Object.defineProperty(window, 'confirm', {
+      configurable: true,
+      value: vi.fn().mockReturnValue(true),
+    })
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText },
@@ -110,5 +116,44 @@ describe('import token reveal', () => {
     expect(COOK_MANAGE_PROMPT_TEMPLATE).toContain('COOK_IMPORT_TOKEN')
     expect(COOK_MANAGE_PROMPT_TEMPLATE).not.toContain(secret)
     expect(COOK_MANAGE_PROMPT_TEMPLATE).toContain('pending revision')
+  })
+
+  it('requires explicit confirmation and uses short-lived token-free publish guidance', async () => {
+    render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <ImportTokenSettings />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('radio', { name: /Manage and publish recipes/ }))
+    expect(screen.getByLabelText('Token expiry')).toHaveValue('30')
+    expect(screen.getByRole('alert')).toHaveTextContent('AI content will become public immediately')
+    fireEvent.change(screen.getByLabelText('Token expiry'), { target: { value: 'none' } })
+    expect(screen.getAllByRole('alert')[1]).toHaveTextContent('has no automatic expiry')
+    fireEvent.change(screen.getByLabelText('Token expiry'), { target: { value: '30' } })
+
+    vi.mocked(window.confirm).mockReturnValueOnce(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
+    expect(createImportToken).not.toHaveBeenCalled()
+
+    vi.mocked(window.confirm).mockReturnValueOnce(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
+    expect(await screen.findByText(secret)).toBeVisible()
+    expect(createImportToken).toHaveBeenCalledWith('My AI client', 30, 'publish')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy installation instructions' }))
+    await waitFor(() =>
+      expect(writeText).toHaveBeenLastCalledWith(COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS),
+    )
+    expect(COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS).toContain('recipes:publish')
+    expect(COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS).not.toContain(secret)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy prompt template' }))
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(COOK_PUBLISH_PROMPT_TEMPLATE))
+    expect(COOK_PUBLISH_PROMPT_TEMPLATE).toContain('created, updated, skipped, and failed')
+    expect(COOK_PUBLISH_PROMPT_TEMPLATE).toContain('recipe ID or URL')
+    expect(COOK_PUBLISH_PROMPT_TEMPLATE).not.toContain(secret)
   })
 })

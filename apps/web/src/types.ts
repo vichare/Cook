@@ -128,7 +128,13 @@ export interface ImportToken {
   id: string
   name: string
   prefix: string
-  scopes: Array<'recipes:import' | 'recipes:read' | 'recipes:write' | 'recipes:images:write'>
+  scopes: Array<
+    | 'recipes:import'
+    | 'recipes:read'
+    | 'recipes:write'
+    | 'recipes:images:write'
+    | 'recipes:publish'
+  >
   createdAt: string
   lastUsedAt: string | null
   expiresAt: string | null

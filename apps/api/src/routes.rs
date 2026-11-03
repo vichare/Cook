@@ -2020,7 +2020,7 @@ mod tests {
     use chrono::Utc;
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use serde_json::{json, Value};
-    use sqlx::SqlitePool;
+    use sqlx::{Row, SqlitePool};
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -2142,7 +2142,8 @@ mod tests {
                         json!({
                             "name": "Test client",
                             "expiresInDays": 90,
-                            "preset": preset
+                            "preset": preset,
+                            "confirmPublishRisk": preset == "publish"
                         })
                         .to_string(),
                     ))
@@ -2160,6 +2161,10 @@ mod tests {
 
     async fn create_manage_token(app: &axum::Router, cookie: &str) -> Value {
         create_token(app, cookie, "manage").await
+    }
+
+    async fn create_publish_token(app: &axum::Router, cookie: &str) -> Value {
+        create_token(app, cookie, "publish").await
     }
 
     fn import_payload(source_url: &str) -> Value {
@@ -2865,6 +2870,299 @@ mod tests {
             .oneshot(
                 Request::get("/api/ai/recipes")
                     .header("authorization", format!("Bearer {manage_secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn publish_tokens_require_confirmation_and_publish_only_owned_versioned_recipes() {
+        let (app, _, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Publisher").await;
+        let other_cookie = login(&app, "Other").await;
+        let unconfirmed = app
+            .clone()
+            .oneshot(
+                Request::post("/api/settings/import-tokens")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "name": "Unconfirmed publisher",
+                            "expiresInDays": 30,
+                            "preset": "publish",
+                            "confirmPublishRisk": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unconfirmed.status(), StatusCode::BAD_REQUEST);
+
+        let manage = create_manage_token(&app, &owner_cookie).await;
+        let manage_secret = manage["secret"].as_str().unwrap();
+        let public_body = json!({
+            "title": "Published by AI",
+            "description": "Visible immediately",
+            "instructions": "Stir.",
+            "visibility": "public",
+            "ingredients": [{"name": "water", "quantityNote": "1 cup"}]
+        });
+        let manage_publish = app
+            .clone()
+            .oneshot(
+                Request::post("/api/ai/recipes")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("{} {}", "Bearer", manage_secret))
+                    .header("idempotency-key", "manage-cannot-publish")
+                    .body(Body::from(public_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manage_publish.status(), StatusCode::FORBIDDEN);
+        sqlx::query(
+            "UPDATE import_tokens SET scopes = 'recipes:write recipes:publish' WHERE id = ?",
+        )
+        .bind(manage["token"]["id"].as_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let incomplete_publish_scope = app
+            .clone()
+            .oneshot(
+                Request::post("/api/ai/recipes")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("{} {}", "Bearer", manage_secret))
+                    .header("idempotency-key", "publish-without-read")
+                    .body(Body::from(public_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(incomplete_publish_scope.status(), StatusCode::FORBIDDEN);
+
+        let publisher = create_publish_token(&app, &owner_cookie).await;
+        let secret = publisher["secret"].as_str().unwrap();
+        assert_eq!(
+            publisher["token"]["scopes"],
+            json!([
+                "recipes:read",
+                "recipes:write",
+                "recipes:images:write",
+                "recipes:publish"
+            ])
+        );
+        let create_public = || {
+            app.clone().oneshot(
+                Request::post("/api/ai/recipes")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("{} {}", "Bearer", secret))
+                    .header("idempotency-key", "publish-create-0001")
+                    .body(Body::from(public_body.to_string()))
+                    .unwrap(),
+            )
+        };
+        let created = create_public().await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = response_json(created).await;
+        assert_eq!(created["visibility"], "public");
+        let public_id = created["id"].as_str().unwrap();
+        let replay = create_public().await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["id"], public_id);
+
+        let update_body = json!({
+            "title": "Published by AI, updated",
+            "description": "Still visible immediately",
+            "instructions": "Stir twice.",
+            "visibility": "public",
+            "ingredients": [{"name": "water", "quantityNote": "2 cups"}],
+            "expectedVersion": 1
+        });
+        let update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/ai/recipes/{public_id}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("{} {}", "Bearer", secret))
+                    .body(Body::from(update_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let update = response_json(update).await;
+        assert_eq!(update["status"], "updated");
+        assert_eq!(update["recipe"]["version"], 2);
+        assert_eq!(update["recipe"]["visibility"], "public");
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/ai/recipes/{public_id}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("{} {}", "Bearer", secret))
+                    .body(Body::from(update_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let private_body = json!({
+            "title": "Private before publish",
+            "description": "",
+            "instructions": "Mix.",
+            "ingredients": [{"name": "flour", "quantityNote": "1 cup"}]
+        });
+        let private = app
+            .clone()
+            .oneshot(
+                Request::post("/api/ai/recipes")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("{} {}", "Bearer", secret))
+                    .header("idempotency-key", "publish-create-private-0001")
+                    .body(Body::from(private_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let private = response_json(private).await;
+        let promoted_id = private["id"].as_str().unwrap();
+        assert_eq!(private["visibility"], "private");
+        let promote = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/ai/recipes/{promoted_id}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("{} {}", "Bearer", secret))
+                    .body(Body::from(
+                        json!({
+                            "title": "Now public",
+                            "description": "",
+                            "instructions": "Mix.",
+                            "visibility": "public",
+                            "ingredients": [{"name": "flour", "quantityNote": "1 cup"}],
+                            "expectedVersion": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promote.status(), StatusCode::OK);
+        let promote = response_json(promote).await;
+        assert_eq!(promote["recipe"]["visibility"], "public");
+        assert_eq!(promote["recipe"]["version"], 2);
+
+        let (content_type, body) = multipart_image(&test_png());
+        let image = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/ai/recipes/{promoted_id}/cover"))
+                    .header("content-type", content_type)
+                    .header("authorization", format!("{} {}", "Bearer", secret))
+                    .header("if-match", "\"recipe-v2\"")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image.status(), StatusCode::OK);
+        let image = response_json(image).await;
+        assert_eq!(image["status"], "updated");
+        assert_eq!(image["recipe"]["visibility"], "public");
+        assert_eq!(image["recipe"]["version"], 3);
+
+        let other = create_publish_token(&app, &other_cookie).await;
+        let other_secret = other["secret"].as_str().unwrap();
+        let cross_account = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/ai/recipes/{public_id}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("{} {}", "Bearer", other_secret))
+                    .body(Body::from(
+                        json!({
+                            "title": "Not mine",
+                            "description": "",
+                            "instructions": "No.",
+                            "visibility": "public",
+                            "ingredients": [{"name": "water"}],
+                            "expectedVersion": 2
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_account.status(), StatusCode::NOT_FOUND);
+        let delete_not_supported = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/ai/recipes/{public_id}"))
+                    .header("authorization", format!("{} {}", "Bearer", secret))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            delete_not_supported.status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        let audit_text = sqlx::query(
+            "SELECT token_prefix, action, recipe_id FROM ai_token_audit_events
+             WHERE token_id = ? ORDER BY created_at",
+        )
+        .bind(publisher["token"]["id"].as_str().unwrap())
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            format!(
+                "{} {} {}",
+                row.get::<String, _>("token_prefix"),
+                row.get::<String, _>("action"),
+                row.get::<Option<String>, _>("recipe_id")
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(audit_text.contains("recipe.publish.create"));
+        assert!(audit_text.contains("recipe.publish.update"));
+        assert!(audit_text.contains("recipe.publish"));
+        assert!(audit_text.contains("recipe.image.publish.replace"));
+        assert!(!audit_text.contains(secret));
+
+        let revoke = app
+            .clone()
+            .oneshot(
+                Request::delete(format!(
+                    "/api/settings/import-tokens/{}",
+                    publisher["token"]["id"].as_str().unwrap()
+                ))
+                .header("cookie", owner_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+        let revoked = app
+            .oneshot(
+                Request::get("/api/ai/recipes")
+                    .header("authorization", format!("{} {}", "Bearer", secret))
                     .body(Body::empty())
                     .unwrap(),
             )

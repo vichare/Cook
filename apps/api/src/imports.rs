@@ -21,6 +21,7 @@ pub const SCOPE_IMPORT: &str = "recipes:import";
 pub const SCOPE_RECIPES_READ: &str = "recipes:read";
 pub const SCOPE_RECIPES_WRITE: &str = "recipes:write";
 pub const SCOPE_IMAGES_WRITE: &str = "recipes:images:write";
+pub const SCOPE_RECIPES_PUBLISH: &str = "recipes:publish";
 const IMPORT_RATE_WINDOW_SECONDS: i64 = 60 * 60;
 const IMPORT_RATE_LIMIT: i64 = 20;
 const READ_RATE_LIMIT: i64 = 240;
@@ -33,6 +34,8 @@ pub struct CreateImportTokenInput {
     name: String,
     expires_in_days: Option<i64>,
     preset: Option<String>,
+    #[serde(default)]
+    confirm_publish_risk: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,9 +133,20 @@ pub(crate) async fn create_import_token(
             SCOPE_RECIPES_WRITE.to_string(),
             SCOPE_IMAGES_WRITE.to_string(),
         ],
+        "publish" if input.confirm_publish_risk => vec![
+            SCOPE_RECIPES_READ.to_string(),
+            SCOPE_RECIPES_WRITE.to_string(),
+            SCOPE_IMAGES_WRITE.to_string(),
+            SCOPE_RECIPES_PUBLISH.to_string(),
+        ],
+        "publish" => {
+            return Err(AppError::Validation(
+                "confirmPublishRisk must be true for the publish preset".into(),
+            ))
+        }
         _ => {
             return Err(AppError::Validation(
-                "preset must be import or manage".into(),
+                "preset must be import, manage, or publish".into(),
             ))
         }
     };
@@ -569,7 +583,7 @@ async fn enforce_token_rate_limit(
 fn rate_limit_for_scope(scope: &str) -> i64 {
     match scope {
         SCOPE_RECIPES_READ => READ_RATE_LIMIT,
-        SCOPE_RECIPES_WRITE | SCOPE_IMAGES_WRITE => WRITE_RATE_LIMIT,
+        SCOPE_RECIPES_WRITE | SCOPE_IMAGES_WRITE | SCOPE_RECIPES_PUBLISH => WRITE_RATE_LIMIT,
         _ => IMPORT_RATE_LIMIT,
     }
 }

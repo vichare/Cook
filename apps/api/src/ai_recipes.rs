@@ -17,7 +17,7 @@ use crate::{
     images::{delete_image, parse_image_multipart, upsert_image, ProcessedImage},
     imports::{
         authenticate_token, record_token_audit, TokenPrincipal, SCOPE_IMAGES_WRITE,
-        SCOPE_RECIPES_READ, SCOPE_RECIPES_WRITE,
+        SCOPE_RECIPES_PUBLISH, SCOPE_RECIPES_READ, SCOPE_RECIPES_WRITE,
     },
     models::{IngredientInput, Recipe, RecipeInput},
     routes::{
@@ -40,6 +40,7 @@ pub struct AiRecipeInput {
     instructions: String,
     ingredients: Vec<IngredientInput>,
     expected_version: Option<i64>,
+    visibility: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,7 +110,11 @@ pub async fn create_ai_recipe(
     let principal = authenticate_token(&state.pool, &headers, SCOPE_RECIPES_WRITE).await?;
     let request_id = idempotency_key(&headers)?;
     input.ingredients = expand_ingredient_inputs(input.ingredients);
-    let recipe_input = private_recipe_input(&input);
+    let visibility = validate_ai_visibility(input.visibility.as_deref().unwrap_or("private"))?;
+    if visibility == "public" && !principal_can_publish(&principal) {
+        return Err(AppError::Forbidden);
+    }
+    let recipe_input = recipe_input(&input, visibility);
     validate_recipe(&recipe_input)?;
     let now = Utc::now().timestamp();
     let mut transaction = state.pool.begin().await?;
@@ -143,13 +148,14 @@ pub async fn create_ai_recipe(
     sqlx::query(
         "INSERT INTO recipes
          (id, owner_id, title, description, instructions, visibility, version)
-         VALUES (?, ?, ?, ?, ?, 'private', 1)",
+         VALUES (?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(&recipe_id)
     .bind(&principal.owner_id)
     .bind(recipe_input.title.trim())
     .bind(recipe_input.description.trim())
     .bind(recipe_input.instructions.trim())
+    .bind(&recipe_input.visibility)
     .execute(&mut *transaction)
     .await?;
     crate::routes::insert_ingredients(
@@ -173,7 +179,11 @@ pub async fn create_ai_recipe(
     record_token_audit(
         &mut transaction,
         &principal,
-        "recipe.create",
+        if recipe_input.visibility == "public" {
+            "recipe.publish.create"
+        } else {
+            "recipe.create"
+        },
         Some(&recipe_id),
         now,
     )
@@ -196,22 +206,53 @@ pub async fn update_ai_recipe(
     let expected_version = input
         .expected_version
         .ok_or_else(|| AppError::Validation("expectedVersion is required".into()))?;
-    let recipe_input = private_recipe_input(&input);
-    validate_recipe(&recipe_input)?;
     let mut transaction = state.pool.begin().await?;
-    let visibility = owned_recipe_visibility(
+    let current_visibility = owned_recipe_visibility(
         &mut transaction,
         &principal.owner_id,
         &recipe_id,
         expected_version,
     )
     .await?;
-    if visibility == "private" {
-        update_private_recipe(
+    let target_visibility = validate_ai_visibility(
+        input
+            .visibility
+            .as_deref()
+            .unwrap_or(current_visibility.as_str()),
+    )?;
+    if current_visibility == "public" && target_visibility == "private" {
+        return Err(AppError::Validation(
+            "AI tokens cannot make a public recipe private".into(),
+        ));
+    }
+    let recipe_input = recipe_input(&input, target_visibility);
+    validate_recipe(&recipe_input)?;
+    let can_publish = principal_can_publish(&principal);
+    if current_visibility == "private" {
+        if target_visibility == "public" && !can_publish {
+            return Err(AppError::Forbidden);
+        }
+        update_recipe_direct(
             &mut transaction,
             &principal,
             &recipe_id,
             expected_version,
+            &current_visibility,
+            &recipe_input,
+        )
+        .await?;
+        transaction.commit().await?;
+        return Ok(Json(AiRecipeMutation::Updated {
+            recipe: load_owned_recipe(&state.pool, &principal.owner_id, &recipe_id).await?,
+        }));
+    }
+    if can_publish {
+        update_recipe_direct(
+            &mut transaction,
+            &principal,
+            &recipe_id,
+            expected_version,
+            &current_visibility,
             &recipe_input,
         )
         .await?;
@@ -292,7 +333,8 @@ async fn mutate_ai_image(
         expected_version,
     )
     .await?;
-    if visibility == "private" {
+    let direct_public_update = visibility == "public" && principal_can_publish(&principal);
+    if visibility == "private" || direct_public_update {
         match image_action {
             "replace" => {
                 upsert_image(
@@ -309,10 +351,11 @@ async fn mutate_ai_image(
         }
         let updated = sqlx::query(
             "UPDATE recipes SET version = version + 1, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ? AND owner_id = ? AND visibility = 'private' AND version = ?",
+             WHERE id = ? AND owner_id = ? AND visibility = ? AND version = ?",
         )
         .bind(&recipe_id)
         .bind(&principal.owner_id)
+        .bind(&visibility)
         .bind(expected_version)
         .execute(&mut *transaction)
         .await?;
@@ -324,7 +367,11 @@ async fn mutate_ai_image(
         record_token_audit(
             &mut transaction,
             &principal,
-            if image_action == "replace" {
+            if direct_public_update && image_action == "replace" {
+                "recipe.image.publish.replace"
+            } else if direct_public_update {
+                "recipe.image.publish.delete"
+            } else if image_action == "replace" {
                 "recipe.image.replace"
             } else {
                 "recipe.image.delete"
@@ -530,23 +577,26 @@ pub(crate) async fn get_revision_image(
         .map_err(|_| AppError::Data("invalid revision image response".into()))
 }
 
-async fn update_private_recipe(
+async fn update_recipe_direct(
     transaction: &mut Transaction<'_, Sqlite>,
     principal: &TokenPrincipal,
     recipe_id: &str,
     expected_version: i64,
+    current_visibility: &str,
     input: &RecipeInput,
 ) -> AppResult<()> {
     let result = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?,
-           version = version + 1, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND owner_id = ? AND visibility = 'private' AND version = ?",
+           visibility = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND owner_id = ? AND visibility = ? AND version = ?",
     )
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(input.instructions.trim())
+    .bind(&input.visibility)
     .bind(recipe_id)
     .bind(&principal.owner_id)
+    .bind(current_visibility)
     .bind(expected_version)
     .execute(&mut **transaction)
     .await?;
@@ -565,7 +615,15 @@ async fn update_private_recipe(
     record_token_audit(
         transaction,
         principal,
-        "recipe.update",
+        if input.visibility == "public" {
+            if current_visibility == "private" {
+                "recipe.publish"
+            } else {
+                "recipe.publish.update"
+            }
+        } else {
+            "recipe.update"
+        },
         Some(recipe_id),
         Utc::now().timestamp(),
     )
@@ -687,14 +745,33 @@ async fn load_recipe_input_tx(
     })
 }
 
-fn private_recipe_input(input: &AiRecipeInput) -> RecipeInput {
+fn recipe_input(input: &AiRecipeInput, visibility: &str) -> RecipeInput {
     RecipeInput {
         title: input.title.clone(),
         description: input.description.clone(),
         instructions: input.instructions.clone(),
-        visibility: "private".into(),
+        visibility: visibility.into(),
         ingredients: input.ingredients.clone(),
     }
+}
+
+fn validate_ai_visibility(visibility: &str) -> AppResult<&str> {
+    match visibility {
+        "private" | "public" => Ok(visibility),
+        _ => Err(AppError::Validation(
+            "visibility must be private or public".into(),
+        )),
+    }
+}
+
+fn principal_has_scope(principal: &TokenPrincipal, scope: &str) -> bool {
+    principal.scopes.iter().any(|candidate| candidate == scope)
+}
+
+fn principal_can_publish(principal: &TokenPrincipal) -> bool {
+    principal_has_scope(principal, SCOPE_RECIPES_READ)
+        && principal_has_scope(principal, SCOPE_RECIPES_WRITE)
+        && principal_has_scope(principal, SCOPE_RECIPES_PUBLISH)
 }
 
 async fn insert_revision_ingredients(
