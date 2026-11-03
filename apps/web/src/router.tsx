@@ -1171,6 +1171,102 @@ export function RecipeEditor({ recipe }: { recipe?: Recipe }) {
   )
 }
 
+function recipeMatchesForm(recipe: Recipe, value: RecipeForm): boolean {
+  return recipe.title === value.title
+    && recipe.description === value.description
+    && recipe.instructions === value.instructions
+    && recipe.visibility === value.visibility
+    && recipe.difficulty === value.difficulty
+    && recipe.estimatedCalories === value.estimatedCalories
+    && recipe.ingredients.length === value.ingredients.length
+    && recipe.ingredients.every((ingredient, index) => {
+      const submitted = value.ingredients[index]
+      return ingredient.name === submitted.name
+        && ingredient.quantityNote === submitted.quantityNote
+        && ingredient.canonicalIngredientId === submitted.canonicalIngredientId
+    })
+}
+
+function coverMetadataMatches(recipe: Recipe, metadata: CoverMetadata): boolean {
+  const cover = recipe.coverImage
+  return cover !== null
+    && cover.altText === metadata.altText
+    && (cover.sourceUrl ?? '') === metadata.sourceUrl
+    && (cover.sourceLicense ?? '') === metadata.sourceLicense
+    && (cover.sourceAttribution ?? '') === metadata.sourceAttribution
+}
+
+function coverIsUnchanged(current: Recipe, original: Recipe): boolean {
+  return current.coverImage?.id === original.coverImage?.id
+    && current.coverImage?.version === original.coverImage?.version
+}
+
+export async function persistRecipeEdit({
+  value,
+  recipe,
+  acknowledgedVersion,
+  coverFile,
+  removeCover,
+  coverMetadata,
+  acknowledgeVersion,
+}: {
+  value: RecipeForm
+  recipe?: Recipe
+  acknowledgedVersion?: number
+  coverFile: File | null
+  removeCover: boolean
+  coverMetadata: CoverMetadata
+  acknowledgeVersion: (version: number) => void
+}): Promise<Recipe> {
+  let saved: Recipe
+  if (!recipe) {
+    saved = await api.saveRecipe(value)
+    acknowledgeVersion(saved.version)
+  } else {
+    const current = await api.recipe(recipe.id)
+    if (current.version !== acknowledgedVersion) {
+      if (!recipeMatchesForm(current, value)) {
+        throw new ApiError('Recipe changed while this editor was open', 409, 'conflict')
+      }
+      const coverOperationAlreadyApplied = coverFile
+        ? !coverIsUnchanged(current, recipe) && coverMetadataMatches(current, coverMetadata)
+        : removeCover
+          ? current.coverImage === null
+          : recipe.coverImage !== null
+            && !coverIsUnchanged(current, recipe)
+            && coverMetadataMatches(current, coverMetadata)
+      if (coverOperationAlreadyApplied) {
+        acknowledgeVersion(current.version)
+        return current
+      }
+      if (!coverIsUnchanged(current, recipe)) {
+        throw new ApiError('Recipe cover changed while this editor was open', 409, 'conflict')
+      }
+      acknowledgeVersion(current.version)
+    }
+    if (recipeMatchesForm(current, value)) {
+      saved = current
+    } else {
+      saved = await api.saveRecipe(value, recipe.id, current.version)
+      acknowledgeVersion(saved.version)
+    }
+  }
+  if (coverFile) {
+    const result = await api.uploadRecipeCover(saved.id, coverFile, coverMetadata, saved.version)
+    acknowledgeVersion(result.version)
+    saved = { ...saved, version: result.version }
+  } else if (removeCover && recipe?.coverImage) {
+    const result = await api.deleteRecipeCover(saved.id, saved.version)
+    acknowledgeVersion(result.version)
+    saved = { ...saved, version: result.version, coverImage: null }
+  } else if (recipe?.coverImage && !coverMetadataMatches(recipe, coverMetadata)) {
+    const result = await api.updateRecipeCoverMetadata(saved.id, coverMetadata, saved.version)
+    acknowledgeVersion(result.version)
+    saved = { ...saved, version: result.version }
+  }
+  return saved
+}
+
 export function RecipeEditorForm({
   recipe,
   onSaved,
@@ -1184,6 +1280,7 @@ export function RecipeEditorForm({
   const [coverFile, setCoverFile] = useState<File | null>(null)
   const [removeCover, setRemoveCover] = useState(false)
   const [coverPreview, setCoverPreview] = useState<string | null>(recipe?.coverImage?.url ?? null)
+  const [acknowledgedVersion, setAcknowledgedVersion] = useState(recipe?.version)
   const [coverMetadata, setCoverMetadata] = useState({
     altText: recipe?.coverImage?.altText ?? '',
     sourceUrl: recipe?.coverImage?.sourceUrl ?? '',
@@ -1210,28 +1307,15 @@ export function RecipeEditorForm({
   })
   const fields = useFieldArray({ control: form.control, name: 'ingredients' })
   const save = useMutation({
-    mutationFn: async (value: RecipeForm) => {
-      let saved = await api.saveRecipe(value, recipe?.id, recipe?.version)
-      if (coverFile) {
-        const result = await api.uploadRecipeCover(saved.id, coverFile, coverMetadata, saved.version)
-        saved = { ...saved, version: result.version }
-      } else if (removeCover && recipe?.coverImage) {
-        const result = await api.deleteRecipeCover(saved.id, saved.version)
-        saved = { ...saved, version: result.version, coverImage: null }
-      } else if (
-        recipe?.coverImage &&
-        (
-          coverMetadata.altText !== recipe.coverImage.altText ||
-          coverMetadata.sourceUrl !== (recipe.coverImage.sourceUrl ?? '') ||
-          coverMetadata.sourceLicense !== (recipe.coverImage.sourceLicense ?? '') ||
-          coverMetadata.sourceAttribution !== (recipe.coverImage.sourceAttribution ?? '')
-        )
-      ) {
-        const result = await api.updateRecipeCoverMetadata(saved.id, coverMetadata, saved.version)
-        saved = { ...saved, version: result.version }
-      }
-      return saved
-    },
+    mutationFn: (value: RecipeForm) => persistRecipeEdit({
+      value,
+      recipe,
+      acknowledgedVersion,
+      coverFile,
+      removeCover,
+      coverMetadata,
+      acknowledgeVersion: setAcknowledgedVersion,
+    }),
     onSuccess: async (saved) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['recipes'] }),

@@ -17,7 +17,7 @@ use rust_web_auth_passkey::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -1585,8 +1585,10 @@ async fn get_recommendations(
     }
     resolve_recommendation_request(&state.pool, &user.id, &mut request).await?;
     let settings = load_settings(&state.pool, &user.id).await?;
-    let candidates = load_candidate_recipes(&state.pool, &user.id, &settings).await?;
     let pantry = load_pantry(&state.pool, &user.id).await?;
+    let mut transaction = state.pool.begin().await?;
+    let candidates = load_candidate_recipes(&mut transaction, &user.id, &settings).await?;
+    pause_after_recommendation_selection(&user.id).await;
     let mut recommendations = recommend_limited(
         candidates,
         &pantry,
@@ -1595,7 +1597,9 @@ async fn get_recommendations(
         recommendation_time,
         limit,
     );
-    hydrate_recommendation_recipes(&state.pool, &mut recommendations).await?;
+    hydrate_recommendation_recipes(&mut transaction, &user.id, &mut recommendations).await?;
+    transaction.commit().await?;
+    discard_unauthorized_recommendations(&state.pool, &user.id, &mut recommendations).await?;
     Ok(Json(recommendations))
 }
 
@@ -1603,6 +1607,52 @@ async fn get_recommendations(
 struct RecommendationQuery {
     limit: Option<usize>,
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RecommendationSelectionHook {
+    user_id: String,
+    selected: std::sync::Arc<tokio::sync::Notify>,
+    resume: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static RECOMMENDATION_SELECTION_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<RecommendationSelectionHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_recommendation_selection_hook(user_id: String) -> RecommendationSelectionHook {
+    let hook = RecommendationSelectionHook {
+        user_id,
+        selected: std::sync::Arc::new(tokio::sync::Notify::new()),
+        resume: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    *RECOMMENDATION_SELECTION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("recommendation test hook mutex poisoned") = Some(hook.clone());
+    hook
+}
+
+#[cfg(test)]
+async fn pause_after_recommendation_selection(user_id: &str) {
+    let hook = {
+        let mut guard = RECOMMENDATION_SELECTION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("recommendation test hook mutex poisoned");
+        let matches_user = guard.as_ref().is_some_and(|hook| hook.user_id == user_id);
+        matches_user.then(|| guard.take()).flatten()
+    };
+    if let Some(hook) = hook {
+        hook.selected.notify_one();
+        hook.resume.notified().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn pause_after_recommendation_selection(_user_id: &str) {}
 
 fn seconds_until(expires_at: chrono::DateTime<Utc>) -> u64 {
     u64::try_from((expires_at - Utc::now()).num_seconds().max(0)).unwrap_or(0)
@@ -2238,7 +2288,7 @@ pub(crate) async fn load_recipe_image_meta(
 }
 
 async fn load_candidate_recipes(
-    pool: &SqlitePool,
+    transaction: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     settings: &RecommendationSettings,
 ) -> AppResult<Vec<Recipe>> {
@@ -2271,7 +2321,7 @@ async fn load_candidate_recipes(
     .bind(user_id)
     .bind(settings.include_other_public)
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?;
     let ingredient_rows = sqlx::query(
         "WITH candidates AS (
@@ -2300,7 +2350,7 @@ async fn load_candidate_recipes(
     .bind(user_id)
     .bind(settings.include_other_public)
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?;
     let mut ingredients = std::collections::HashMap::<String, Vec<IngredientInput>>::new();
     for row in ingredient_rows {
@@ -2342,8 +2392,9 @@ async fn load_candidate_recipes(
 }
 
 async fn hydrate_recommendation_recipes(
-    pool: &SqlitePool,
-    recommendations: &mut [Recommendation],
+    transaction: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    recommendations: &mut Vec<Recommendation>,
 ) -> AppResult<()> {
     if recommendations.is_empty() {
         return Ok(());
@@ -2356,8 +2407,10 @@ async fn hydrate_recommendation_recipes(
                 img.source_attribution, img.version AS image_version
          FROM recipes r
          LEFT JOIN recipe_images img ON img.recipe_id = r.id
-         WHERE r.id IN (",
+         WHERE (r.owner_id = ",
     );
+    query.push_bind(user_id);
+    query.push(" OR r.visibility = 'public') AND r.id IN (");
     {
         let mut separated = query.separated(", ");
         for recommendation in recommendations.iter() {
@@ -2365,7 +2418,7 @@ async fn hydrate_recommendation_recipes(
         }
     }
     query.push(")");
-    let rows = query.build().fetch_all(pool).await?;
+    let rows = query.build().fetch_all(&mut **transaction).await?;
     let mut by_id = rows
         .into_iter()
         .map(|row| {
@@ -2373,10 +2426,12 @@ async fn hydrate_recommendation_recipes(
             (id, row)
         })
         .collect::<std::collections::HashMap<_, _>>();
-    for recommendation in recommendations {
-        let row = by_id
-            .remove(&recommendation.recipe.id)
-            .ok_or_else(|| AppError::Data("ranked recipe disappeared during hydration".into()))?;
+    let mut missing = std::collections::HashSet::new();
+    for recommendation in recommendations.iter_mut() {
+        let Some(row) = by_id.remove(&recommendation.recipe.id) else {
+            missing.insert(recommendation.recipe.id.clone());
+            continue;
+        };
         recommendation.recipe.description = row.get("description");
         recommendation.recipe.instructions = row.get("instructions");
         let source_url: Option<String> = row.get("source_url");
@@ -2413,6 +2468,35 @@ async fn hydrate_recommendation_recipes(
                     version: row.get("image_version"),
                 });
     }
+    recommendations.retain(|recommendation| !missing.contains(&recommendation.recipe.id));
+    Ok(())
+}
+
+async fn discard_unauthorized_recommendations(
+    pool: &SqlitePool,
+    user_id: &str,
+    recommendations: &mut Vec<Recommendation>,
+) -> AppResult<()> {
+    if recommendations.is_empty() {
+        return Ok(());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new("SELECT id FROM recipes WHERE (owner_id = ");
+    query.push_bind(user_id);
+    query.push(" OR visibility = 'public') AND id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for recommendation in recommendations.iter() {
+            separated.push_bind(&recommendation.recipe.id);
+        }
+    }
+    query.push(")");
+    let authorized = query
+        .build_query_scalar::<String>()
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    recommendations.retain(|recommendation| authorized.contains(&recommendation.recipe.id));
     Ok(())
 }
 
@@ -2972,6 +3056,69 @@ mod tests {
         .await;
         assert_eq!(recommendations.as_array().unwrap().len(), 1);
         assert_eq!(recommendations[0]["recipe"]["id"], first["id"]);
+    }
+
+    #[tokio::test]
+    async fn recommendation_discards_recipe_unpublished_after_selection() {
+        let path = std::env::temp_dir().join(format!(
+            "cook-recommendation-snapshot-{}.db",
+            Uuid::new_v4()
+        ));
+        let mut config = Config::test();
+        config.database_url = format!("sqlite://{}", path.display());
+        let app = build_app(config.clone()).await.unwrap();
+        let pool = crate::db::connect(&config.database_url).await.unwrap();
+        let owner_cookie = login(&app, "Snapshot owner").await;
+        let viewer_cookie = login(&app, "Snapshot viewer").await;
+        let recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let recipe_id = recipe["id"].as_str().unwrap().to_string();
+        sqlx::query(
+            "UPDATE recipes
+             SET description = 'private-after-selection',
+                 instructions = 'do-not-return',
+                 source_url = 'https://private.example.test/source'
+             WHERE id = ?",
+        )
+        .bind(&recipe_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let viewer_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE display_name = 'Snapshot viewer'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let hook = super::install_recommendation_selection_hook(viewer_id);
+        let request_app = app.clone();
+        let request = tokio::spawn(async move {
+            request_app
+                .oneshot(
+                    Request::post("/api/recommendations")
+                        .header("content-type", "application/json")
+                        .header("cookie", viewer_cookie)
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook.selected.notified())
+            .await
+            .expect("recommendation selection did not reach test hook");
+        sqlx::query("UPDATE recipes SET visibility = 'private' WHERE id = ?")
+            .bind(&recipe_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        hook.resume.notify_one();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert!(body.as_array().unwrap().is_empty());
+        let serialized = body.to_string();
+        assert!(!serialized.contains("private-after-selection"));
+        assert!(!serialized.contains("do-not-return"));
+        assert!(!serialized.contains("private.example.test"));
     }
 
     #[tokio::test]

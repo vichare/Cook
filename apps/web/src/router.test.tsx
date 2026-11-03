@@ -14,9 +14,11 @@ import {
   RecipeConflictNotice,
   RecipeMetadataFields,
   ShoppingListPage,
+  persistRecipeEdit,
 } from './router'
 import type { RecipeForm } from './router'
 import { LocaleProvider, type Locale } from './i18n'
+import type { Recipe } from './types'
 
 const storedLocale = { value: null as string | null }
 const testStorage = {
@@ -34,7 +36,22 @@ function Providers({ children, locale = 'en' }: { children: React.ReactNode; loc
   )
 }
 
-const { shoppingItems, markAutomaticShoppingPurchased, requestEmailLink, requestEmailOtp, saveLocale, saveProfile, saveRecipe, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
+const {
+  deleteRecipeCover,
+  markAutomaticShoppingPurchased,
+  recipeApi,
+  requestEmailLink,
+  requestEmailOtp,
+  saveLocale,
+  saveProfile,
+  saveRecipe,
+  securitySettings,
+  shoppingItems,
+  updateRecipeCoverMetadata,
+  uploadRecipeCover,
+  verifyEmailLink,
+  verifyEmailOtp,
+} = vi.hoisted(() => ({
   saveProfile: vi.fn().mockImplementation((nickname: string | null) =>
     Promise.resolve({
       id: 'user',
@@ -107,6 +124,10 @@ const { shoppingItems, markAutomaticShoppingPurchased, requestEmailLink, request
   ]),
   markAutomaticShoppingPurchased: vi.fn().mockResolvedValue([]),
   saveRecipe: vi.fn(),
+  recipeApi: vi.fn(),
+  uploadRecipeCover: vi.fn(),
+  updateRecipeCoverMetadata: vi.fn(),
+  deleteRecipeCover: vi.fn(),
 }))
 
 vi.mock('./api', async () => {
@@ -136,6 +157,10 @@ vi.mock('./api', async () => {
       markAutomaticShoppingPurchased,
       saveProfile,
       saveRecipe,
+      recipe: recipeApi,
+      uploadRecipeCover,
+      updateRecipeCoverMetadata,
+      deleteRecipeCover,
       saveLocale,
       requestEmailOtp,
       verifyEmailOtp,
@@ -168,6 +193,58 @@ describe('shopping list', () => {
   })
 
   describe('recipe concurrency', () => {
+    const originalRecipe: Recipe = {
+      id: 'recipe-1',
+      version: 3,
+      isOwner: true,
+      authorHandle: 'author',
+      authorNickname: null,
+      title: 'Original title',
+      description: '',
+      instructions: 'Stir.',
+      visibility: 'private',
+      difficulty: null,
+      estimatedCalories: null,
+      ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
+      isFavorite: false,
+      isFavoriteAuthor: false,
+      coverImage: {
+        id: 'cover-1',
+        url: '/api/recipe-images/cover-1',
+        width: 800,
+        height: 600,
+        altText: 'Original cover',
+        sourceUrl: null,
+        sourceLicense: null,
+        sourceAttribution: null,
+        version: 1,
+      },
+      source: null,
+    }
+    const editedForm: RecipeForm = {
+      title: 'Edited title',
+      description: '',
+      instructions: 'Stir.',
+      visibility: 'private',
+      difficulty: null,
+      estimatedCalories: null,
+      ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
+    }
+    const coverMetadata = {
+      altText: 'Updated cover',
+      sourceUrl: '',
+      sourceLicense: '',
+      sourceAttribution: '',
+    }
+
+    afterEach(() => {
+      recipeApi.mockReset()
+      saveRecipe.mockReset()
+      uploadRecipeCover.mockReset()
+      updateRecipeCoverMetadata.mockReset()
+      deleteRecipeCover.mockReset()
+    })
+
     it('keeps unsaved input and offers comparison guidance after a stale conflict', async () => {
       const { ApiError } = await import('./api')
       render(
@@ -186,6 +263,111 @@ describe('shopping list', () => {
         'target',
         '_blank',
       )
+    })
+
+    it('retries a failed cover upload using the acknowledged body version', async () => {
+      const editedRecipe = { ...originalRecipe, ...editedForm, version: 4 }
+      const file = new File(['cover'], 'cover.png', { type: 'image/png' })
+      let acknowledgedVersion = originalRecipe.version
+      recipeApi.mockResolvedValueOnce(originalRecipe)
+      saveRecipe.mockResolvedValueOnce(editedRecipe)
+      uploadRecipeCover.mockRejectedValueOnce(new Error('upload failed'))
+
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion,
+        coverFile: file,
+        removeCover: false,
+        coverMetadata,
+        acknowledgeVersion: (version) => {
+          acknowledgedVersion = version
+        },
+      })).rejects.toThrow('upload failed')
+      expect(acknowledgedVersion).toBe(4)
+
+      recipeApi.mockResolvedValueOnce(editedRecipe)
+      uploadRecipeCover.mockResolvedValueOnce({ version: 5 })
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion,
+        coverFile: file,
+        removeCover: false,
+        coverMetadata,
+        acknowledgeVersion: (version) => {
+          acknowledgedVersion = version
+        },
+      })).resolves.toMatchObject({ version: 5 })
+      expect(saveRecipe).toHaveBeenCalledTimes(1)
+      expect(uploadRecipeCover).toHaveBeenLastCalledWith(
+        'recipe-1',
+        file,
+        coverMetadata,
+        4,
+      )
+    })
+
+    it('retries failed cover metadata using the acknowledged body version', async () => {
+      const editedRecipe = { ...originalRecipe, ...editedForm, version: 4 }
+      let acknowledgedVersion = originalRecipe.version
+      recipeApi.mockResolvedValueOnce(originalRecipe)
+      saveRecipe.mockResolvedValueOnce(editedRecipe)
+      updateRecipeCoverMetadata.mockRejectedValueOnce(new Error('metadata failed'))
+
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion,
+        coverFile: null,
+        removeCover: false,
+        coverMetadata,
+        acknowledgeVersion: (version) => {
+          acknowledgedVersion = version
+        },
+      })).rejects.toThrow('metadata failed')
+      expect(acknowledgedVersion).toBe(4)
+
+      recipeApi.mockResolvedValueOnce(editedRecipe)
+      updateRecipeCoverMetadata.mockResolvedValueOnce({ version: 5 })
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion,
+        coverFile: null,
+        removeCover: false,
+        coverMetadata,
+        acknowledgeVersion: (version) => {
+          acknowledgedVersion = version
+        },
+      })).resolves.toMatchObject({ version: 5 })
+      expect(saveRecipe).toHaveBeenCalledTimes(1)
+      expect(updateRecipeCoverMetadata).toHaveBeenLastCalledWith(
+        'recipe-1',
+        coverMetadata,
+        4,
+      )
+    })
+
+    it('retains the conflict UX for genuine external changes', async () => {
+      recipeApi.mockResolvedValueOnce({
+        ...originalRecipe,
+        version: 4,
+        title: 'External title',
+      })
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion: 3,
+        coverFile: null,
+        removeCover: false,
+        coverMetadata,
+        acknowledgeVersion: vi.fn(),
+      })).rejects.toEqual(expect.objectContaining({
+        status: 409,
+        code: 'conflict',
+      }))
+      expect(saveRecipe).not.toHaveBeenCalled()
     })
   })
 
