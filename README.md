@@ -30,6 +30,6 @@ Production uses Google Authorization Code OIDC with S256 PKCE through `vichare/r
 - `docs`: architecture and operations
 - `deploy/nginx`: host reverse-proxy example
 
-See `docs/architecture.md` and `docs/deployment.md` for design and deployment details.
+See `docs/architecture.md` and `docs/deployment.md` for design and deployment details. Future product scope and unresolved decisions are tracked in `docs/product-roadmap.md`.
 
 Release tags matching `vX.Y.Z` publish `ghcr.io/vichare/cook:<tag>` and deploy through a restricted SSH hook. See `docs/release-and-deployment.md` for the public mechanism; server-specific bootstrap and account details are kept in the private operations manual.
