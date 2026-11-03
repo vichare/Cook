@@ -6,20 +6,26 @@ Cook is a same-origin web application: the browser loads React and calls `/api` 
 
 SQLite is the single source of truth. WAL mode, foreign keys, a five-second busy timeout, and bounded connection pooling are enabled at startup. Every pantry query is scoped by `owner_id`. Private recipes are visible only to their owner; another account may read or favorite a recipe only when it is public. Update and delete statements always include the authenticated owner.
 
-## Authentication port
+## Authentication ports
 
-Cook consumes `rust-web-auth-core`, `rust-web-auth-google`, and `rust-web-auth-http` at exact revision `113d1f607f8e99efba5e888204facd53304d5b7f`. Google Authorization Code OIDC, S256 PKCE, state, nonce, provider verification, secure cookie construction, and sliding application sessions come from the shared library.
+Cook consumes `rust-web-auth-core`, `rust-web-auth-google`, `rust-web-auth-http`, `rust-web-auth-email-otp`, and `rust-web-auth-passkey` at exact revision `b087b47a3ba6fdcc04d67931e97c3214b82e5e6d`. Google Authorization Code OIDC, S256 PKCE, state, nonce, provider verification, secure cookie construction, sliding application sessions, Email OTP security policy, and WebAuthn verification come from the shared library.
 
 Cook implements the consumer ports in SQLite:
 
 - login attempts use insert-if-absent and one-statement `DELETE … RETURNING` consumption;
 - identities map only by `(issuer, subject)`, while verified email and display name remain mutable profile data;
 - sessions persist only keyed token digests and use version-based CAS renewal/revocation;
-- login starts use a 10-attempt, 15-minute SQLite rate-limit window keyed by a digest of the trusted client address.
+- Google login starts use a 10-attempt, 15-minute SQLite rate-limit window keyed by a digest of the trusted client address;
+- Email OTP stores one active challenge per purpose and normalized email, applies the shared ten-minute expiry, one-minute resend cooldown, five-attempt limit, atomic replace/verify/consume behavior, and persists separate email/IP and challenge/IP limiter buckets;
+- passkey user handles and credentials are persistent, credential IDs are globally unique, and signature counters, backup state, last-used timestamps, names, and revocation are owner-scoped.
 
-Cook owns its users, mappings, attempts, sessions, rate limits, database, keys, and `__Host-cook_session`/`__Host-cook_oauth_state` production cookies. It does not accept or share SOP-Node cookies or databases. Expired attempts are cleaned every 15 minutes. Request tracing records only method and path, never callback query strings or sensitive headers.
+Cook owns its users, mappings, attempts, sessions, rate limits, database, keys, and Host-only production cookies. It does not accept or share SOP-Node cookies or databases. Email OTP identities use the issuer `urn:cook:email-otp`; an unauthenticated verified address creates or resolves only that identity. A signed-in user may link an address only by completing a fresh OTP challenge bound to that Cook user. Matching a Google profile email never causes automatic linking or account merging.
 
-Development login is selectable only with `AUTH_MODE=dev` and a loopback bind. Production requires Google mode, the exact HTTPS origin, credentials, and independent random digest keys; incomplete configuration fails startup.
+Passkey registration requires an authenticated account with an explicitly linked Email OTP identity. Login is username-first through that identity. WebAuthn uses exact RP ID/origin validation and requires user verification. Non-serializable five-minute ceremony state remains in process memory; only a random opaque token is placed in a short-lived HttpOnly cookie. Restarting the process safely invalidates in-flight ceremonies without affecting credentials.
+
+Production SMTP uses TLS and is configured only by environment variables. OTP codes and SMTP passwords are never logged. Development/test may use an explicit capture sender, but production cannot construct it. Request tracing records only method and path, never callback query strings, OTP codes, cookies, authorization headers, or SMTP credentials.
+
+Development login is selectable only with `AUTH_MODE=dev` and a loopback bind. Production requires Google mode, exact HTTPS origin and passkey RP values, Google credentials, complete SMTP settings, and four distinct random digest keys for OAuth state, sessions, Email OTP, and passkey ceremonies. Incomplete configuration fails startup.
 
 ## Recommendation rules
 

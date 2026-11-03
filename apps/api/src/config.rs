@@ -17,6 +17,22 @@ pub enum AuthMode {
     Google,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SmtpTlsMode {
+    StartTls,
+    Tls,
+}
+
+#[derive(Clone, Debug)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub tls_mode: SmtpTlsMode,
+    pub username: String,
+    pub password: String,
+    pub from: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub environment: AppEnvironment,
@@ -26,8 +42,14 @@ pub struct Config {
     pub public_origin: String,
     pub oauth_state_digest_key: [u8; 32],
     pub session_digest_key: [u8; 32],
+    pub email_otp_digest_key: [u8; 32],
+    pub passkey_ceremony_digest_key: [u8; 32],
     pub google_client_id: Option<String>,
     pub google_client_secret: Option<String>,
+    pub smtp: Option<SmtpConfig>,
+    pub passkey_rp_id: String,
+    pub passkey_rp_origin: String,
+    pub passkey_rp_name: String,
 }
 
 impl Config {
@@ -72,8 +94,16 @@ impl Config {
             oauth_state_digest_key: optional_key("OAUTH_STATE_DIGEST_KEY")?
                 .unwrap_or(development_key),
             session_digest_key: optional_key("APP_SESSION_DIGEST_KEY")?.unwrap_or([0x24; 32]),
+            email_otp_digest_key: optional_key("EMAIL_OTP_DIGEST_KEY")?.unwrap_or([0x31; 32]),
+            passkey_ceremony_digest_key: optional_key("PASSKEY_CEREMONY_DIGEST_KEY")?
+                .unwrap_or([0x57; 32]),
             google_client_id: env::var("GOOGLE_CLIENT_ID").ok(),
             google_client_secret: env::var("GOOGLE_CLIENT_SECRET").ok(),
+            smtp: smtp_from_env()?,
+            passkey_rp_id: env::var("PASSKEY_RP_ID").unwrap_or_else(|_| "localhost".into()),
+            passkey_rp_origin: env::var("PASSKEY_RP_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:5173".into()),
+            passkey_rp_name: env::var("PASSKEY_RP_NAME").unwrap_or_else(|_| "Cook".into()),
         };
         config.validate()?;
         Ok(config)
@@ -88,8 +118,14 @@ impl Config {
             public_origin: "http://localhost".into(),
             oauth_state_digest_key: [0x42; 32],
             session_digest_key: [0x24; 32],
+            email_otp_digest_key: [0x31; 32],
+            passkey_ceremony_digest_key: [0x57; 32],
             google_client_id: None,
             google_client_secret: None,
+            smtp: None,
+            passkey_rp_id: "localhost".into(),
+            passkey_rp_origin: "http://localhost".into(),
+            passkey_rp_name: "Cook Test".into(),
         }
     }
 
@@ -112,9 +148,31 @@ impl Config {
             }
             require_secret(&self.google_client_id, "GOOGLE_CLIENT_ID")?;
             require_secret(&self.google_client_secret, "GOOGLE_CLIENT_SECRET")?;
+            let smtp = self
+                .smtp
+                .as_ref()
+                .ok_or_else(|| AppError::configuration("production requires SMTP configuration"))?;
+            require_value(&smtp.host, "SMTP_HOST")?;
+            require_value(&smtp.username, "SMTP_USERNAME")?;
+            require_value(&smtp.password, "SMTP_PASSWORD")?;
+            require_value(&smtp.from, "SMTP_FROM")?;
+            if self.passkey_rp_id != "cook.vichare.net"
+                || self.passkey_rp_origin != "https://cook.vichare.net"
+            {
+                return Err(AppError::configuration(
+                    "production passkey RP must be cook.vichare.net with exact HTTPS origin",
+                ));
+            }
             if self.oauth_state_digest_key == [0x42; 32]
                 || self.session_digest_key == [0x24; 32]
-                || self.oauth_state_digest_key == self.session_digest_key
+                || self.email_otp_digest_key == [0x31; 32]
+                || self.passkey_ceremony_digest_key == [0x57; 32]
+                || !all_keys_distinct(&[
+                    self.oauth_state_digest_key,
+                    self.session_digest_key,
+                    self.email_otp_digest_key,
+                    self.passkey_ceremony_digest_key,
+                ])
             {
                 return Err(AppError::configuration(
                     "production requires independent random auth digest keys",
@@ -154,6 +212,44 @@ fn optional_key(name: &str) -> AppResult<Option<[u8; 32]>> {
     Ok(Some(key))
 }
 
+fn smtp_from_env() -> AppResult<Option<SmtpConfig>> {
+    let names = [
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_TLS",
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD",
+        "SMTP_FROM",
+    ];
+    if !names.iter().any(|name| env::var(name).is_ok()) {
+        return Ok(None);
+    }
+    let required = |name: &str| {
+        env::var(name).map_err(|_| AppError::configuration(format!("{name} is required")))
+    };
+    let tls_mode = match required("SMTP_TLS")?.as_str() {
+        "starttls" => SmtpTlsMode::StartTls,
+        "tls" => SmtpTlsMode::Tls,
+        _ => return Err(AppError::configuration("SMTP_TLS must be starttls or tls")),
+    };
+    let port = required("SMTP_PORT")?
+        .parse()
+        .map_err(|_| AppError::configuration("SMTP_PORT must be a valid TCP port"))?;
+    if port == 0 {
+        return Err(AppError::configuration(
+            "SMTP_PORT must be greater than zero",
+        ));
+    }
+    Ok(Some(SmtpConfig {
+        host: required("SMTP_HOST")?,
+        port,
+        tls_mode,
+        username: required("SMTP_USERNAME")?,
+        password: required("SMTP_PASSWORD")?,
+        from: required("SMTP_FROM")?,
+    }))
+}
+
 fn require_secret(value: &Option<String>, name: &str) -> AppResult<()> {
     match value.as_deref() {
         Some(value) if !value.trim().is_empty() && !value.contains("replace") => Ok(()),
@@ -161,6 +257,21 @@ fn require_secret(value: &Option<String>, name: &str) -> AppResult<()> {
             "production requires {name}"
         ))),
     }
+}
+
+fn require_value(value: &str, name: &str) -> AppResult<()> {
+    if value.trim().is_empty() || value.contains("replace") {
+        return Err(AppError::configuration(format!(
+            "production requires {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn all_keys_distinct(keys: &[[u8; 32]]) -> bool {
+    keys.iter()
+        .enumerate()
+        .all(|(index, key)| keys[index + 1..].iter().all(|other| other != key))
 }
 
 #[cfg(test)]
@@ -192,9 +303,36 @@ mod tests {
         config.public_origin = "https://cook.vichare.net".into();
         config.oauth_state_digest_key = [1; 32];
         config.session_digest_key = [2; 32];
+        config.email_otp_digest_key = [3; 32];
+        config.passkey_ceremony_digest_key = [4; 32];
         config.google_client_id = Some("client".into());
         config.google_client_secret = Some("secret".into());
+        config.smtp = Some(SmtpConfig {
+            host: "smtp.example.test".into(),
+            port: 465,
+            tls_mode: SmtpTlsMode::Tls,
+            username: "user".into(),
+            password: "password".into(),
+            from: "Cook <cook@example.test>".into(),
+        });
+        config.passkey_rp_id = "cook.vichare.net".into();
+        config.passkey_rp_origin = "https://cook.vichare.net".into();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn production_requires_otp_smtp_and_passkey_secrets() {
+        let mut config = Config::test();
+        config.environment = AppEnvironment::Production;
+        config.auth_mode = AuthMode::Google;
+        config.public_origin = "https://cook.vichare.net".into();
+        config.oauth_state_digest_key = [1; 32];
+        config.session_digest_key = [2; 32];
+        config.google_client_id = Some("client".into());
+        config.google_client_secret = Some("secret".into());
+        config.passkey_rp_id = "cook.vichare.net".into();
+        config.passkey_rp_origin = "https://cook.vichare.net".into();
+        assert!(config.validate().is_err());
     }
 
     #[test]

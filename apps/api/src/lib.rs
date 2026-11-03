@@ -5,6 +5,7 @@ pub mod error;
 pub mod importer;
 pub mod imports;
 pub mod models;
+pub mod passwordless;
 pub mod recommendation;
 pub mod routes;
 

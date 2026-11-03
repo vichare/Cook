@@ -6,18 +6,21 @@
 - Host nginx and TLS certificates for `cook.vichare.net`
 - DNS pointing to the host
 - A Google OAuth client with exact callback `https://cook.vichare.net/api/auth/google/callback`
+- A TLS-capable SMTP account and verified sender for Email OTP delivery
+- A passkey relying party configured with RP ID `cook.vichare.net` and origin `https://cook.vichare.net`
 
-Host capacity, Google callback registration, and production secrets remain **unverified**. The shared auth dependency is pinned to revision `113d1f607f8e99efba5e888204facd53304d5b7f`.
+Host capacity, Google callback registration, SMTP deliverability, and production secrets remain **unverified**. The shared auth dependency is pinned to revision `b087b47a3ba6fdcc04d67931e97c3214b82e5e6d`.
 
 ## Procedure
 
 1. Copy `.env.example` to `.env` outside version control.
-2. Set `APP_ENV=production`, `AUTH_MODE=google`, `PUBLIC_ORIGIN=https://cook.vichare.net`, Google credentials, and independent random 64-hex-character `OAUTH_STATE_DIGEST_KEY` and `APP_SESSION_DIGEST_KEY` values.
+2. Set `APP_ENV=production`, `AUTH_MODE=google`, `PUBLIC_ORIGIN=https://cook.vichare.net`, Google credentials, complete TLS SMTP settings, exact passkey RP/origin/name values, and four independent random 64-hex-character authentication keys.
 3. Register the exact Google callback above; do not add wildcards or alternate query parameters.
-4. Run `docker compose build` and `docker compose up -d`.
-5. Install `deploy/nginx/cook.vichare.net.conf` in host nginx and validate with `nginx -t`.
-6. Confirm that only `127.0.0.1:18080` is published by Compose, then reload nginx.
-7. Smoke-test Google login, current/all-device logout, cross-account recipe isolation, recommendation explanations, and restore procedure.
+4. Verify the SMTP sender and delivery path without placing credentials or OTP codes in logs.
+5. Run `docker compose build` and `docker compose up -d`.
+6. Install `deploy/nginx/cook.vichare.net.conf` in host nginx and validate with `nginx -t`.
+7. Confirm that only `127.0.0.1:18080` is published by Compose, then reload nginx.
+8. Smoke-test Google, Email OTP, passkey registration/login/revocation, explicit email linking and link conflicts, current/all-device logout, cross-account recipe isolation, recommendation explanations, and restore procedure.
 
 Production releases are normally installed by the tag-driven GitHub Actions workflow rather than by building on the VM. See `release-and-deployment.md`.
 
@@ -25,4 +28,4 @@ Never put real credentials in Compose, documentation, Git, screenshots, or suppo
 
 ## Operations
 
-`GET /health` checks API process availability. Container logs are emitted to stdout/stderr. Treat repeated `401`, database lock, and startup configuration errors as actionable; there is no success-shaped fallback.
+`GET /health` checks API process availability. Container logs are emitted to stdout/stderr. Treat repeated `401`, SMTP delivery failures, WebAuthn origin/RP mismatches, database locks, and startup configuration errors as actionable; there is no success-shaped fallback.

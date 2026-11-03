@@ -33,10 +33,12 @@ Set these in the production deployment directory's `.env`:
 - `COOK_DOMAIN=cook.vichare.net`
 - `COOK_HOST_HTTP_ADDRESS=127.0.0.1:18080`
 - Google client ID and secret
-- two independent `openssl rand -hex 32` digest keys
+- TLS SMTP host, port, mode, username, password, and verified sender
+- exact passkey RP ID, HTTPS origin, and display name
+- four independent `openssl rand -hex 32` digest keys
 - backup retention
 
-Register exactly `https://cook.vichare.net/api/auth/google/callback` in Google. Never place secrets in GitHub variables, workflow logs, images, or the repository.
+Register exactly `https://cook.vichare.net/api/auth/google/callback` in Google. Keep the SMTP password and every digest key only in the private production environment; never place them in GitHub variables, workflow logs, images, or the repository.
 
 ## Release
 
@@ -85,7 +87,8 @@ Store off-host encrypted copies and regularly test restoration. Deployment autom
 ## Post-deploy checks
 
 - `test "$(curl -fsS https://cook.vichare.net/health)" = ok`
-- complete real Google login and current/all-device logout
+- complete real Google and Email OTP login, passkey registration/login/revocation, and current/all-device logout
+- verify explicit email linking and same-email cross-provider account separation
 - verify private recipe and pantry isolation with two accounts
 - verify READY/VERIFY/SHOP/BLOCKED recommendations
 - inspect `docker compose -f compose.yaml ps` and bounded container logs

@@ -8,6 +8,31 @@ export interface User {
   onboardingCompleted: boolean
 }
 
+export interface AuthConfig {
+  mode: 'development' | 'production'
+  google: boolean
+  emailOtp: boolean
+  passkey: boolean
+}
+
+export interface EmailOtpChallenge {
+  challengeId: string
+  expiresAt: string
+  resendAllowedAt: string
+}
+
+export interface PasskeySummary {
+  id: string
+  name: string
+  createdAt: string
+  lastUsedAt: string | null
+}
+
+export interface SecuritySettings {
+  linkedEmails: string[]
+  passkeys: PasskeySummary[]
+}
+
 export interface Ingredient {
   name: string
   quantityNote: string

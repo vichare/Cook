@@ -9,7 +9,11 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use chrono::Utc;
 use rust_web_auth_core::{AuthenticatedContext, LoginCallback, LoginError, UserId};
+use rust_web_auth_email_otp::{EmailOtpRequest, EmailOtpVerification};
 use rust_web_auth_http::{expired_cookie, issued_cookie};
+use rust_web_auth_passkey::{
+    KnownUserRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
@@ -25,6 +29,10 @@ use crate::{
         PantryStatus, ProfileInput, Recipe, RecipeInput, RecipeSource, RecommendationRequest,
         RecommendationSettings, User,
     },
+    passwordless::{
+        email_address, map_email_error, map_passkey_error, normalize_email, purpose,
+        PasskeySummary, EMAIL_LINK_PURPOSE, EMAIL_SIGN_IN_PURPOSE,
+    },
     recommendation::{recommend, Recommendation},
     AppState,
 };
@@ -34,6 +42,27 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me", get(me))
         .route("/api/settings/profile", put(update_profile))
         .route("/api/auth/logout-all", post(logout_all))
+        .route("/api/settings/security", get(security_settings))
+        .route(
+            "/api/settings/security/email/request",
+            post(link_email_request),
+        )
+        .route(
+            "/api/settings/security/email/verify",
+            post(link_email_verify),
+        )
+        .route(
+            "/api/settings/security/passkeys/register/start",
+            post(passkey_registration_start),
+        )
+        .route(
+            "/api/settings/security/passkeys/register/finish",
+            post(passkey_registration_finish),
+        )
+        .route(
+            "/api/settings/security/passkeys/{id}",
+            axum::routing::delete(revoke_passkey),
+        )
         .route("/api/recipes", get(list_recipes).post(create_recipe))
         .route(
             "/api/recipes/{id}",
@@ -78,6 +107,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/dev-login", post(dev_login))
         .route("/api/auth/google/start", get(google_start))
         .route("/api/auth/google/callback", get(google_callback))
+        .route("/api/auth/email/request", post(email_sign_in_request))
+        .route("/api/auth/email/verify", post(email_sign_in_verify))
+        .route(
+            "/api/auth/passkey/start",
+            post(passkey_authentication_start),
+        )
+        .route(
+            "/api/auth/passkey/finish",
+            post(passkey_authentication_finish),
+        )
         .route("/api/auth/logout", post(logout))
         .route("/api/import/drafts", post(imports::create_import_draft))
         .merge(protected)
@@ -95,8 +134,12 @@ struct DevLogin {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthConfig {
     mode: &'static str,
+    google: bool,
+    email_otp: bool,
+    passkey: bool,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +147,46 @@ struct GoogleCallback {
     state: Option<String>,
     code: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmailOtpRequestInput {
+    email: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmailOtpVerifyInput {
+    challenge_id: String,
+    code: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmailOtpChallengeResponse {
+    challenge_id: String,
+    expires_at: String,
+    resend_allowed_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecuritySettings {
+    linked_emails: Vec<String>,
+    passkeys: Vec<PasskeySummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PasskeyRegistrationInput {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PasskeyAuthenticationInput {
+    email: String,
 }
 
 #[derive(Clone)]
@@ -115,10 +198,13 @@ struct CurrentAuth(AuthenticatedContext);
 async fn auth_config(State(state): State<AppState>) -> Json<AuthConfig> {
     Json(AuthConfig {
         mode: if state.auth.mode == AuthMode::Google {
-            "google"
+            "production"
         } else {
             "development"
         },
+        google: state.auth.login.is_some(),
+        email_otp: true,
+        passkey: true,
     })
 }
 
@@ -130,22 +216,322 @@ async fn dev_login(
         return Err(AppError::NotFound);
     }
     let user = upsert_development_user(&state.pool, &input.display_name).await?;
-    let completion = state
+    issue_user_session(
+        &state,
+        UserId::new(user.id).map_err(|_| AppError::Unauthorized)?,
+    )
+    .await
+}
+
+async fn email_sign_in_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<EmailOtpRequestInput>,
+) -> AppResult<Json<EmailOtpChallengeResponse>> {
+    request_email_otp(&state, &headers, &input.email, EMAIL_SIGN_IN_PURPOSE, "/").await
+}
+
+async fn email_sign_in_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<EmailOtpVerifyInput>,
+) -> AppResult<impl IntoResponse> {
+    let verified = state
         .auth
-        .sessions
-        .issue(
-            UserId::new(user.id.clone()).map_err(|_| AppError::Unauthorized)?,
+        .passwordless
+        .email_otp
+        .verify(
+            EmailOtpVerification {
+                challenge_id: &input.challenge_id,
+                code: &input.code,
+                ip_partition: &rate_limit_key(&headers, &state.config.email_otp_digest_key),
+            },
             Utc::now(),
         )
         .await
-        .map_err(|_| AppError::AuthUnavailable)?;
+        .map_err(map_email_error)?;
+    if verified.purpose.as_str() != EMAIL_SIGN_IN_PURPOSE {
+        return Err(AppError::Unauthorized);
+    }
+    let normalized = normalize_email(verified.email.as_str()).map_err(map_email_error)?;
+    let user_id = state
+        .auth
+        .passwordless
+        .store
+        .resolve_email_sign_in(&normalized)
+        .await?;
+    issue_user_session(&state, user_id).await
+}
+
+async fn link_email_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Json(input): Json<EmailOtpRequestInput>,
+) -> AppResult<Json<EmailOtpChallengeResponse>> {
+    let challenge = request_email_otp(
+        &state,
+        &headers,
+        &input.email,
+        EMAIL_LINK_PURPOSE,
+        "/settings",
+    )
+    .await?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&challenge.expires_at)
+        .map_err(|_| AppError::AuthUnavailable)?
+        .with_timezone(&Utc);
+    state
+        .auth
+        .passwordless
+        .store
+        .bind_link_target(&challenge.challenge_id, &user.id, expires_at)
+        .await?;
+    Ok(challenge)
+}
+
+async fn link_email_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Json(input): Json<EmailOtpVerifyInput>,
+) -> AppResult<Json<SecuritySettings>> {
+    let now = Utc::now();
+    let verified = state
+        .auth
+        .passwordless
+        .email_otp
+        .verify(
+            EmailOtpVerification {
+                challenge_id: &input.challenge_id,
+                code: &input.code,
+                ip_partition: &rate_limit_key(&headers, &state.config.email_otp_digest_key),
+            },
+            now,
+        )
+        .await
+        .map_err(map_email_error)?;
+    if verified.purpose.as_str() != EMAIL_LINK_PURPOSE {
+        return Err(AppError::Unauthorized);
+    }
+    state
+        .auth
+        .passwordless
+        .store
+        .consume_link_target(&input.challenge_id, &user.id, now)
+        .await?;
+    let normalized = normalize_email(verified.email.as_str()).map_err(map_email_error)?;
+    state
+        .auth
+        .passwordless
+        .store
+        .link_email(&user.id, &normalized)
+        .await?;
+    load_security_settings(&state, &user.id).await.map(Json)
+}
+
+async fn security_settings(
+    State(state): State<AppState>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+) -> AppResult<Json<SecuritySettings>> {
+    load_security_settings(&state, &user.id).await.map(Json)
+}
+
+async fn passkey_registration_start(
+    State(state): State<AppState>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Json(input): Json<PasskeyRegistrationInput>,
+) -> AppResult<impl IntoResponse> {
+    let name = validate_passkey_name(&input.name)?;
+    let linked_emails = state
+        .auth
+        .passwordless
+        .store
+        .linked_emails(&user.id)
+        .await?;
+    let user_name = linked_emails.first().ok_or_else(|| {
+        AppError::Validation("link an email address before adding a passkey".into())
+    })?;
+    let user_id = UserId::new(user.id.clone()).map_err(|_| AppError::AuthUnavailable)?;
+    let user_handle = state
+        .auth
+        .passwordless
+        .store
+        .ensure_user_handle(&user.id)
+        .await?;
+    let start = state
+        .auth
+        .passwordless
+        .passkeys
+        .start_registration(
+            KnownUserRegistration {
+                user_id,
+                user_handle,
+                user_name: user_name.clone(),
+                user_display_name: user.display_name,
+            },
+            Utc::now(),
+        )
+        .await
+        .map_err(map_passkey_error)?;
+    state.auth.passwordless.remember_registration(
+        start.ceremony_token.expose_for_cookie(),
+        &user.id,
+        name,
+        Utc::now(),
+    )?;
     let cookie = issued_cookie(
-        &state.auth.session_cookie,
-        &completion.cookie_value,
-        seconds_until(completion.expires_at),
+        &state.auth.passwordless.passkey_registration_cookie,
+        start.ceremony_token.expose_for_cookie(),
+        5 * 60,
     )
     .map_err(|_| AppError::AuthUnavailable)?;
-    Ok(([(SET_COOKIE, cookie)], Json(user)))
+    Ok(([(SET_COOKIE, cookie)], Json(start.challenge)))
+}
+
+async fn passkey_registration_finish(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Json(response): Json<RegisterPublicKeyCredential>,
+) -> AppResult<impl IntoResponse> {
+    let token = jar
+        .get(state.auth.passwordless.passkey_registration_cookie.name())
+        .map(|cookie| cookie.value())
+        .ok_or(AppError::Unauthorized)?;
+    let name = state
+        .auth
+        .passwordless
+        .consume_registration(token, &user.id, Utc::now())?;
+    state
+        .auth
+        .passwordless
+        .store
+        .set_pending_credential_name(&user.id, name)?;
+    let result = state
+        .auth
+        .passwordless
+        .passkeys
+        .finish_registration(token, &response, Utc::now())
+        .await;
+    if result.is_err() {
+        state
+            .auth
+            .passwordless
+            .store
+            .clear_pending_credential_name(&user.id);
+    }
+    result.map_err(map_passkey_error)?;
+    let credential_row_id = state
+        .auth
+        .passwordless
+        .store
+        .take_registered_credential_id(&user.id)?;
+    let credential = state
+        .auth
+        .passwordless
+        .store
+        .passkey_summary(&user.id, &credential_row_id)
+        .await?;
+    Ok((
+        [(
+            SET_COOKIE,
+            expired_cookie(&state.auth.passwordless.passkey_registration_cookie)
+                .map_err(|_| AppError::AuthUnavailable)?,
+        )],
+        (StatusCode::CREATED, Json(credential)),
+    ))
+}
+
+async fn passkey_authentication_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<PasskeyAuthenticationInput>,
+) -> AppResult<impl IntoResponse> {
+    let normalized = normalize_email(&input.email).map_err(map_email_error)?;
+    let ip_partition = rate_limit_key(&headers, &state.config.email_otp_digest_key);
+    if !state
+        .auth
+        .passwordless
+        .store
+        .check_passkey_start(&normalized, &ip_partition, Utc::now())
+        .await?
+    {
+        return Err(AppError::RateLimited);
+    }
+    let user_id = state
+        .auth
+        .passwordless
+        .store
+        .find_user_by_email(&normalized)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let start = state
+        .auth
+        .passwordless
+        .passkeys
+        .start_authentication(user_id, Utc::now())
+        .await
+        .map_err(map_passkey_error)?;
+    let cookie = issued_cookie(
+        &state.auth.passwordless.passkey_authentication_cookie,
+        start.ceremony_token.expose_for_cookie(),
+        5 * 60,
+    )
+    .map_err(|_| AppError::AuthUnavailable)?;
+    Ok(([(SET_COOKIE, cookie)], Json(start.challenge)))
+}
+
+async fn passkey_authentication_finish(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(response): Json<PublicKeyCredential>,
+) -> AppResult<impl IntoResponse> {
+    let token = jar
+        .get(state.auth.passwordless.passkey_authentication_cookie.name())
+        .map(|cookie| cookie.value())
+        .ok_or(AppError::Unauthorized)?;
+    let user_id = state
+        .auth
+        .passwordless
+        .passkeys
+        .finish_authentication(token, &response, Utc::now())
+        .await
+        .map_err(map_passkey_error)?;
+    let (mut headers, user) = issue_user_session_parts(&state, user_id).await?;
+    headers.append(
+        SET_COOKIE,
+        expired_cookie(&state.auth.passwordless.passkey_authentication_cookie)
+            .map_err(|_| AppError::AuthUnavailable)?,
+    );
+    Ok((headers, Json(user)))
+}
+
+async fn revoke_passkey(
+    State(state): State<AppState>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> AppResult<StatusCode> {
+    let user_id = UserId::new(user.id.clone()).map_err(|_| AppError::AuthUnavailable)?;
+    let handle = state
+        .auth
+        .passwordless
+        .store
+        .ensure_user_handle(&user.id)
+        .await?;
+    let credential_id = state
+        .auth
+        .passwordless
+        .store
+        .credential_id_for_owner(&user.id, &id)
+        .await?;
+    state
+        .auth
+        .passwordless
+        .passkeys
+        .revoke_credential(&user_id, handle, &credential_id)
+        .await
+        .map_err(map_passkey_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn google_start(
@@ -227,6 +613,16 @@ async fn logout(State(state): State<AppState>, jar: CookieJar) -> AppResult<impl
         SET_COOKIE,
         expired_cookie(&state.auth.state_cookie).map_err(|_| AppError::AuthUnavailable)?,
     );
+    headers.append(
+        SET_COOKIE,
+        expired_cookie(&state.auth.passwordless.passkey_registration_cookie)
+            .map_err(|_| AppError::AuthUnavailable)?,
+    );
+    headers.append(
+        SET_COOKIE,
+        expired_cookie(&state.auth.passwordless.passkey_authentication_cookie)
+            .map_err(|_| AppError::AuthUnavailable)?,
+    );
     Ok((headers, StatusCode::NO_CONTENT))
 }
 
@@ -247,6 +643,83 @@ async fn logout_all(
         )],
         StatusCode::NO_CONTENT,
     ))
+}
+
+async fn request_email_otp(
+    state: &AppState,
+    headers: &HeaderMap,
+    email: &str,
+    purpose_value: &str,
+    continue_path: &str,
+) -> AppResult<Json<EmailOtpChallengeResponse>> {
+    let challenge = state
+        .auth
+        .passwordless
+        .email_otp
+        .request(
+            EmailOtpRequest {
+                email: email_address(email).map_err(map_email_error)?,
+                purpose: purpose(purpose_value).map_err(map_email_error)?,
+                continue_path: continue_path.to_string(),
+                ip_partition: rate_limit_key(headers, &state.config.email_otp_digest_key),
+            },
+            Utc::now(),
+        )
+        .await
+        .map_err(map_email_error)?;
+    Ok(Json(EmailOtpChallengeResponse {
+        challenge_id: challenge.challenge_id.expose_for_client().to_string(),
+        expires_at: challenge.expires_at.to_rfc3339(),
+        resend_allowed_at: challenge.resend_allowed_at.to_rfc3339(),
+    }))
+}
+
+async fn issue_user_session(
+    state: &AppState,
+    user_id: UserId,
+) -> AppResult<(HeaderMap, Json<User>)> {
+    let (headers, user) = issue_user_session_parts(state, user_id).await?;
+    Ok((headers, Json(user)))
+}
+
+async fn issue_user_session_parts(
+    state: &AppState,
+    user_id: UserId,
+) -> AppResult<(HeaderMap, User)> {
+    let completion = state
+        .auth
+        .sessions
+        .issue(user_id.clone(), Utc::now())
+        .await
+        .map_err(|_| AppError::AuthUnavailable)?;
+    let mut headers = HeaderMap::new();
+    headers.append(
+        SET_COOKIE,
+        issued_cookie(
+            &state.auth.session_cookie,
+            &completion.cookie_value,
+            seconds_until(completion.expires_at),
+        )
+        .map_err(|_| AppError::AuthUnavailable)?,
+    );
+    Ok((headers, load_user(&state.pool, &user_id).await?))
+}
+
+async fn load_security_settings(state: &AppState, user_id: &str) -> AppResult<SecuritySettings> {
+    Ok(SecuritySettings {
+        linked_emails: state.auth.passwordless.store.linked_emails(user_id).await?,
+        passkeys: state.auth.passwordless.store.list_passkeys(user_id).await?,
+    })
+}
+
+fn validate_passkey_name(value: &str) -> AppResult<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 80 || value.chars().any(char::is_control) {
+        return Err(AppError::Validation(
+            "passkey name must contain 1 to 80 visible characters".into(),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 async fn authenticate_request(
@@ -792,19 +1265,36 @@ async fn load_settings(pool: &SqlitePool, user_id: &str) -> AppResult<Recommenda
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
     use chrono::Utc;
     use serde_json::{json, Value};
+    use sqlx::SqlitePool;
     use tower::ServiceExt;
     use uuid::Uuid;
 
     use crate::{
+        auth::{build_auth, AuthRuntime},
         build_app,
         config::{AppEnvironment, AuthMode, Config},
+        db, AppState,
     };
+
+    async fn app_with_runtime() -> (axum::Router, AuthRuntime, SqlitePool) {
+        let config = Config::test();
+        let pool = db::connect(&config.database_url).await.unwrap();
+        let auth = build_auth(&config, &pool).unwrap();
+        let app = super::router(AppState {
+            pool: pool.clone(),
+            config: Arc::new(config),
+            auth: auth.clone(),
+        });
+        (app, auth, pool)
+    }
 
     async fn login(app: &axum::Router, name: &str) -> String {
         let response = app
@@ -1021,6 +1511,238 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[tokio::test]
+    async fn email_otp_request_is_non_enumerating_and_verification_is_one_time() {
+        let (app, auth, _) = app_with_runtime().await;
+        let mut shapes = Vec::new();
+        let mut known_challenge = None;
+        for email in ["unknown@example.test", "other@example.test"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/auth/email/request")
+                        .header("content-type", "application/json")
+                        .header("x-forwarded-for", "203.0.113.20")
+                        .body(Body::from(json!({"email": email}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            shapes.push(
+                body.as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            if email == "unknown@example.test" {
+                known_challenge = body["challengeId"].as_str().map(str::to_string);
+            }
+        }
+        assert_eq!(shapes[0], shapes[1]);
+
+        let challenge_id = known_challenge.unwrap();
+        let code = auth
+            .passwordless
+            .captured_code("unknown@example.test")
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/email/verify")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "203.0.113.20")
+                    .body(Body::from(
+                        json!({"challengeId": challenge_id, "code": code}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("set-cookie").is_some());
+
+        let replay = app
+            .oneshot(
+                Request::post("/api/auth/email/verify")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "203.0.113.20")
+                    .body(Body::from(
+                        json!({"challengeId": challenge_id, "code": code}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_config_exposes_camel_case_passwordless_capabilities() {
+        let response = build_app(Config::test())
+            .await
+            .unwrap()
+            .oneshot(
+                Request::get("/api/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "mode": "development",
+                "google": false,
+                "emailOtp": true,
+                "passkey": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_email_link_rejects_an_identity_owned_by_another_account() {
+        let (app, auth, _) = app_with_runtime().await;
+        let alice_cookie = login(&app, "Alice").await;
+        let bob_cookie = login(&app, "Bob").await;
+
+        for cookie in [&alice_cookie, &bob_cookie] {
+            let request = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/settings/security/email/request")
+                        .header("content-type", "application/json")
+                        .header("cookie", cookie)
+                        .header("x-forwarded-for", "203.0.113.30")
+                        .body(Body::from(
+                            json!({"email": "shared@example.test"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(request.status(), StatusCode::OK);
+            let challenge = response_json(request).await;
+            let code = auth
+                .passwordless
+                .captured_code("shared@example.test")
+                .unwrap();
+            let verify = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/settings/security/email/verify")
+                        .header("content-type", "application/json")
+                        .header("cookie", cookie)
+                        .header("x-forwarded-for", "203.0.113.30")
+                        .body(Body::from(
+                            json!({"challengeId": challenge["challengeId"], "code": code})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if cookie == &alice_cookie {
+                assert_eq!(verify.status(), StatusCode::OK);
+            } else {
+                assert_eq!(verify.status(), StatusCode::CONFLICT);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn passkey_registration_is_owner_scoped_and_requires_a_linked_email() {
+        let (app, _, pool) = app_with_runtime().await;
+        let alice_cookie = login(&app, "Alice").await;
+        let blocked = app
+            .clone()
+            .oneshot(
+                Request::post("/api/settings/security/passkeys/register/start")
+                    .header("content-type", "application/json")
+                    .header("cookie", &alice_cookie)
+                    .body(Body::from(json!({"name": "Laptop"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
+
+        let alice_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE display_name = 'Alice'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_identities (issuer, subject, user_id, created_at)
+             VALUES (?, 'alice@example.test', ?, ?)",
+        )
+        .bind(crate::passwordless::EMAIL_IDENTITY_ISSUER)
+        .bind(&alice_id)
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let allowed = app
+            .oneshot(
+                Request::post("/api/settings/security/passkeys/register/start")
+                    .header("content-type", "application/json")
+                    .header("cookie", alice_cookie)
+                    .body(Body::from(json!({"name": "Laptop"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert!(allowed.headers().get("set-cookie").is_some());
+        let body = response_json(allowed).await;
+        assert!(body.get("publicKey").is_some());
+    }
+
+    #[tokio::test]
+    async fn passkey_start_does_not_distinguish_unknown_from_no_credentials() {
+        let (app, _, pool) = app_with_runtime().await;
+        let alice_cookie = login(&app, "Alice").await;
+        let alice_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE display_name = 'Alice'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_identities (issuer, subject, user_id, created_at)
+             VALUES (?, 'alice@example.test', ?, ?)",
+        )
+        .bind(crate::passwordless::EMAIL_IDENTITY_ISSUER)
+        .bind(&alice_id)
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+        drop(alice_cookie);
+
+        let mut responses = Vec::new();
+        for email in ["unknown@example.test", "alice@example.test"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/auth/passkey/start")
+                        .header("content-type", "application/json")
+                        .header("x-forwarded-for", "203.0.113.40")
+                        .body(Body::from(json!({"email": email}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response_json(response).await;
+            responses.push((status, body));
+        }
+        assert_eq!(responses[0], responses[1]);
+        assert_eq!(responses[0].0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1355,8 +2077,20 @@ mod tests {
         config.public_origin = "https://cook.vichare.net".into();
         config.oauth_state_digest_key = [1; 32];
         config.session_digest_key = [2; 32];
+        config.email_otp_digest_key = [3; 32];
+        config.passkey_ceremony_digest_key = [4; 32];
         config.google_client_id = Some("client".into());
         config.google_client_secret = Some("secret".into());
+        config.smtp = Some(crate::config::SmtpConfig {
+            host: "smtp.example.test".into(),
+            port: 465,
+            tls_mode: crate::config::SmtpTlsMode::Tls,
+            username: "user".into(),
+            password: "password".into(),
+            from: "Cook <cook@example.test>".into(),
+        });
+        config.passkey_rp_id = "cook.vichare.net".into();
+        config.passkey_rp_origin = "https://cook.vichare.net".into();
         let app = build_app(config).await.unwrap();
         let response = app
             .oneshot(

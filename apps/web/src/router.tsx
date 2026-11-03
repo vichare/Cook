@@ -9,7 +9,7 @@ import {
   useNavigate,
 } from '@tanstack/react-router'
 import { QueryClient, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useFieldArray, useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { ApiError, api } from './api'
@@ -19,8 +19,10 @@ import type {
   PantryStatus,
   Recipe,
   RecommendationSettings,
+  SecuritySettings as SecuritySettingsData,
   User,
 } from './types'
+import { createPasskey, getPasskey } from './webauthn'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -154,11 +156,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
         <p className="eyebrow">Private pantry, practical dinner</p>
         <h1>Cook with what you already have.</h1>
         <p>Save recipes, track pantry confidence, and get deterministic recommendations with reasons.</p>
-        {config.data?.mode === 'google' ? (
-          <a className="button primary" href="/api/auth/google/start">
-            Continue with Google
-          </a>
-        ) : (
+        {config.data?.mode === 'development' && (
           <form
             onSubmit={(event) => {
               event.preventDefault()
@@ -175,9 +173,122 @@ function Login({ onLogin }: { onLogin: () => void }) {
             {login.error && <ErrorText error={login.error} />}
           </form>
         )}
-        <small>Production uses backend Google OIDC; tokens and authorization codes never reach JavaScript.</small>
+        {config.data?.emailOtp && <EmailOtpLogin onLogin={onLogin} passkeyEnabled={config.data.passkey} />}
+        {config.data?.google && (
+          <a className="button secondary" href="/api/auth/google/start">
+            Continue with Google
+          </a>
+        )}
+        <small>
+          Email codes and passkeys use Cook's Host-only session. Google authorization codes and provider tokens never reach JavaScript.
+        </small>
       </section>
     </main>
+  )
+}
+
+export function EmailOtpLogin({
+  onLogin,
+  passkeyEnabled,
+}: {
+  onLogin: () => void
+  passkeyEnabled: boolean
+}) {
+  const [email, setEmail] = useState('')
+  const [code, setCode] = useState('')
+  const [challenge, setChallenge] = useState<Awaited<ReturnType<typeof api.requestEmailOtp>> | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!challenge) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [challenge])
+  const request = useMutation({
+    mutationFn: () => api.requestEmailOtp(email),
+    onSuccess: (value) => {
+      setChallenge(value)
+      setCode('')
+      setNow(Date.now())
+    },
+  })
+  const verify = useMutation({
+    mutationFn: () => api.verifyEmailOtp(challenge!.challengeId, code),
+    onSuccess: onLogin,
+  })
+  const passkey = useMutation({
+    mutationFn: async () => {
+      const options = await api.startPasskeyLogin(email)
+      return api.finishPasskeyLogin(await getPasskey(options))
+    },
+    onSuccess: onLogin,
+  })
+  const resendSeconds = challenge
+    ? Math.max(0, Math.ceil((new Date(challenge.resendAllowedAt).getTime() - now) / 1000))
+    : 0
+  return (
+    <section className="auth-method">
+      <h2>Sign in with email</h2>
+      <label>
+        Email address
+        <input
+          type="email"
+          autoComplete="email"
+          value={email}
+          onChange={(event) => setEmail(event.target.value)}
+          required
+        />
+      </label>
+      {!challenge ? (
+        <div className="auth-actions">
+          <button className="button primary" disabled={!email || request.isPending} onClick={() => request.mutate()}>
+            Email me a code
+          </button>
+          {passkeyEnabled && (
+            <button className="button secondary" disabled={!email || passkey.isPending} onClick={() => passkey.mutate()}>
+              Sign in with a passkey
+            </button>
+          )}
+        </div>
+      ) : (
+        <>
+          <p role="status">If delivery is available, a six-digit code has been sent. Enter it below.</p>
+          <label>
+            Verification code
+            <input
+              value={code}
+              onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
+              autoComplete="one-time-code"
+              inputMode="numeric"
+              pattern="[0-9]{6}"
+              maxLength={6}
+              required
+            />
+          </label>
+          <div className="auth-actions">
+            <button
+              className="button primary"
+              disabled={code.length !== 6 || verify.isPending}
+              onClick={() => verify.mutate()}
+            >
+              Verify and sign in
+            </button>
+            <button
+              className="button ghost"
+              disabled={resendSeconds > 0 || request.isPending}
+              onClick={() => request.mutate()}
+            >
+              {resendSeconds > 0 ? `Resend in ${resendSeconds}s` : 'Resend code'}
+            </button>
+            <button className="button ghost" onClick={() => setChallenge(null)}>
+              Use another email
+            </button>
+          </div>
+        </>
+      )}
+      {(request.error || verify.error || passkey.error) && (
+        <ErrorText error={request.error ?? verify.error ?? passkey.error} />
+      )}
+    </section>
   )
 }
 
@@ -569,6 +680,7 @@ function SettingsPage() {
   return (
     <Page title="Settings" intro="Manage your public profile, recommendation sources, and import access.">
       {me.data && <ProfileSettings user={me.data} />}
+      <AccountSecuritySettings />
       <QueryState query={settings} empty="Settings unavailable.">
         {settings.data && <SettingsForm initial={settings.data} />}
       </QueryState>
@@ -656,6 +768,150 @@ export function ProfileSetup({ user }: { user: User }) {
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
+  )
+}
+
+export function AccountSecuritySettings() {
+  const queryClient = useQueryClient()
+  const security = useQuery({ queryKey: ['security-settings'], queryFn: api.securitySettings })
+  const [email, setEmail] = useState('')
+  const [code, setCode] = useState('')
+  const [challenge, setChallenge] = useState<Awaited<ReturnType<typeof api.requestEmailLink>> | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  const [passkeyName, setPasskeyName] = useState('My passkey')
+  useEffect(() => {
+    if (!challenge) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [challenge])
+  const linkRequest = useMutation({
+    mutationFn: () => api.requestEmailLink(email),
+    onSuccess: (value) => {
+      setChallenge(value)
+      setCode('')
+      setNow(Date.now())
+    },
+  })
+  const linkVerify = useMutation({
+    mutationFn: () => api.verifyEmailLink(challenge!.challengeId, code),
+    onSuccess: (value: SecuritySettingsData) => {
+      queryClient.setQueryData(['security-settings'], value)
+      setChallenge(null)
+      setEmail('')
+      setCode('')
+    },
+  })
+  const register = useMutation({
+    mutationFn: async () => {
+      const options = await api.startPasskeyRegistration(passkeyName)
+      return api.finishPasskeyRegistration(await createPasskey(options))
+    },
+    onSuccess: async () => {
+      setPasskeyName('My passkey')
+      await queryClient.invalidateQueries({ queryKey: ['security-settings'] })
+    },
+  })
+  const revoke = useMutation({
+    mutationFn: api.revokePasskey,
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['security-settings'] }),
+  })
+  const resendSeconds = challenge
+    ? Math.max(0, Math.ceil((new Date(challenge.resendAllowedAt).getTime() - now) / 1000))
+    : 0
+  return (
+    <section className="settings-section">
+      <h2>Sign-in security</h2>
+      <p>Email identities are linked only after verification. Cook never merges accounts merely because Google reports the same email.</p>
+      <QueryState query={security} empty="No email identity or passkey is linked yet.">
+        <>
+          <div>
+            <h3>Linked email</h3>
+            {security.data?.linkedEmails.length ? (
+              <ul>{security.data.linkedEmails.map((value) => <li key={value}>{value}</li>)}</ul>
+            ) : (
+              <p>Link an email before registering a passkey.</p>
+            )}
+          </div>
+          <div>
+            <h3>Passkeys</h3>
+            {security.data?.passkeys.length ? (
+              <div className="card-list">
+                {security.data.passkeys.map((passkey) => (
+                  <article className="recipe-card" key={passkey.id}>
+                    <strong>{passkey.name}</strong>
+                    <span>Added {new Date(passkey.createdAt).toLocaleDateString()}</span>
+                    <span>{passkey.lastUsedAt ? `Last used ${new Date(passkey.lastUsedAt).toLocaleString()}` : 'Not used yet'}</span>
+                    <button className="button ghost" onClick={() => revoke.mutate(passkey.id)}>Revoke</button>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p>No passkeys registered.</p>
+            )}
+          </div>
+        </>
+      </QueryState>
+      <div className="security-grid">
+        <div>
+          <h3>Link email sign-in</h3>
+          <label>
+            Email address
+            <input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} />
+          </label>
+          {challenge && (
+            <>
+              <p role="status">If delivery is available, a six-digit linking code has been sent.</p>
+              <label>
+                Verification code
+                <input
+                  autoComplete="one-time-code"
+                  inputMode="numeric"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  value={code}
+                  onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
+                />
+              </label>
+            </>
+          )}
+          <div className="auth-actions">
+            <button
+              className="button secondary"
+              disabled={!email || linkRequest.isPending || (challenge !== null && code.length !== 6)}
+              onClick={() => (challenge ? linkVerify.mutate() : linkRequest.mutate())}
+            >
+              {challenge ? 'Verify and link email' : 'Send linking code'}
+            </button>
+            {challenge && (
+              <button
+                className="button ghost"
+                disabled={resendSeconds > 0 || linkRequest.isPending}
+                onClick={() => linkRequest.mutate()}
+              >
+                {resendSeconds > 0 ? `Resend in ${resendSeconds}s` : 'Resend code'}
+              </button>
+            )}
+          </div>
+        </div>
+        <div>
+          <h3>Add a passkey</h3>
+          <label>
+            Passkey name
+            <input maxLength={80} value={passkeyName} onChange={(event) => setPasskeyName(event.target.value)} />
+          </label>
+          <button
+            className="button secondary"
+            disabled={!passkeyName.trim() || !security.data?.linkedEmails.length || register.isPending}
+            onClick={() => register.mutate()}
+          >
+            Register passkey
+          </button>
+        </div>
+      </div>
+      {(linkRequest.error || linkVerify.error || register.error || revoke.error) && (
+        <ErrorText error={linkRequest.error ?? linkVerify.error ?? register.error ?? revoke.error} />
+      )}
+    </section>
   )
 }
 

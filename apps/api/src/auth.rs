@@ -16,6 +16,7 @@ use crate::{
     config::{AuthMode, Config},
     error::{AppError, AppResult},
     models::User,
+    passwordless::{build_passwordless, PasswordlessRuntime},
 };
 
 const RATE_LIMIT_WINDOW_SECONDS: i64 = 15 * 60;
@@ -28,6 +29,7 @@ pub struct AuthRuntime {
     pub sessions: Arc<SessionService>,
     pub session_cookie: CookiePolicy,
     pub state_cookie: CookiePolicy,
+    pub passwordless: PasswordlessRuntime,
 }
 
 impl AuthRuntime {
@@ -75,6 +77,7 @@ pub fn build_auth(config: &Config, pool: &SqlitePool) -> AppResult<AuthRuntime> 
     } else {
         None
     };
+    let passwordless = build_passwordless(config, pool)?;
     Ok(AuthRuntime {
         mode: config.auth_mode.clone(),
         login,
@@ -83,6 +86,7 @@ pub fn build_auth(config: &Config, pool: &SqlitePool) -> AppResult<AuthRuntime> 
             .map_err(|error| AppError::configuration(error.to_string()))?,
         state_cookie: CookiePolicy::new(config.auth_environment(), "cook_oauth_state")
             .map_err(|error| AppError::configuration(error.to_string()))?,
+        passwordless,
     })
 }
 

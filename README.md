@@ -20,7 +20,9 @@ The API listens on `127.0.0.1:8080` by default. Vite proxies `/api` to it.
 
 ## Production safety
 
-Production uses Google Authorization Code OIDC with S256 PKCE through `vichare/rust-web-auth`, pinned to Git revision `113d1f607f8e99efba5e888204facd53304d5b7f`. Set `APP_ENV=production`, `AUTH_MODE=google`, `PUBLIC_ORIGIN=https://cook.vichare.net`, Google credentials, and two independent 32-byte digest keys. Missing or placeholder authentication configuration fails startup rather than falling back to development authentication.
+Production supports Google Authorization Code OIDC with S256 PKCE, Email OTP, and WebAuthn/passkeys through `vichare/rust-web-auth`, pinned to Git revision `b087b47a3ba6fdcc04d67931e97c3214b82e5e6d`. Email identities are linked explicitly and are never merged with Google accounts merely because email strings match. Set `APP_ENV=production`, `AUTH_MODE=google`, the exact public origin, Google credentials, TLS-protected SMTP settings, exact passkey RP/origin values, and four independent 32-byte digest keys. Missing, placeholder, or incomplete authentication configuration fails startup rather than falling back to development adapters.
+
+Development uses the explicit capture Email OTP sender and loopback WebAuthn settings only with `APP_ENV=development`; it does not send mail or make those adapters available in production.
 
 ## Repository layout
 

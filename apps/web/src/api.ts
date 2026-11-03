@@ -6,6 +6,10 @@ import type {
   ImportToken,
   Recommendation,
   RecommendationSettings,
+  AuthConfig,
+  EmailOtpChallenge,
+  PasskeySummary,
+  SecuritySettings,
   User,
 } from './types'
 
@@ -36,7 +40,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  authConfig: () => request<{ mode: 'development' | 'google' }>('/api/auth/config'),
+  authConfig: () => request<AuthConfig>('/api/auth/config'),
   me: () => request<User>('/api/me'),
   devLogin: (displayName: string) =>
     request<User>('/api/auth/dev-login', {
@@ -44,11 +48,54 @@ export const api = {
       body: JSON.stringify({ displayName }),
     }),
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
+  requestEmailOtp: (email: string) =>
+    request<EmailOtpChallenge>('/api/auth/email/request', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  verifyEmailOtp: (challengeId: string, code: string) =>
+    request<User>('/api/auth/email/verify', {
+      method: 'POST',
+      body: JSON.stringify({ challengeId, code }),
+    }),
+  startPasskeyLogin: (email: string) =>
+    request<unknown>('/api/auth/passkey/start', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  finishPasskeyLogin: (credential: unknown) =>
+    request<User>('/api/auth/passkey/finish', {
+      method: 'POST',
+      body: JSON.stringify(credential),
+    }),
   saveProfile: (nickname: string | null) =>
     request<User>('/api/settings/profile', {
       method: 'PUT',
       body: JSON.stringify({ nickname }),
     }),
+  securitySettings: () => request<SecuritySettings>('/api/settings/security'),
+  requestEmailLink: (email: string) =>
+    request<EmailOtpChallenge>('/api/settings/security/email/request', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  verifyEmailLink: (challengeId: string, code: string) =>
+    request<SecuritySettings>('/api/settings/security/email/verify', {
+      method: 'POST',
+      body: JSON.stringify({ challengeId, code }),
+    }),
+  startPasskeyRegistration: (name: string) =>
+    request<unknown>('/api/settings/security/passkeys/register/start', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }),
+  finishPasskeyRegistration: (credential: unknown) =>
+    request<PasskeySummary>('/api/settings/security/passkeys/register/finish', {
+      method: 'POST',
+      body: JSON.stringify(credential),
+    }),
+  revokePasskey: (id: string) =>
+    request<void>(`/api/settings/security/passkeys/${id}`, { method: 'DELETE' }),
   recipes: () => request<Recipe[]>('/api/recipes'),
   recipe: (id: string) => request<Recipe>(`/api/recipes/${id}`),
   saveRecipe: (

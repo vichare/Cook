@@ -11,12 +11,16 @@ rust-version = "1.89"
 axum = "0.8.1"
 axum-extra = { version = "0.10.0", features = ["cookie"] }
 async-trait = "0.1.86"
+base64 = "0.22.1"
 chrono = { version = "0.4.39", features = ["serde"] }
 cookie = "0.18.1"
 http = "1.2.0"
-rust-web-auth-core = { git = "https://github.com/vichare/rust-web-auth", rev = "113d1f607f8e99efba5e888204facd53304d5b7f" }
-rust-web-auth-google = { git = "https://github.com/vichare/rust-web-auth", rev = "113d1f607f8e99efba5e888204facd53304d5b7f" }
-rust-web-auth-http = { git = "https://github.com/vichare/rust-web-auth", rev = "113d1f607f8e99efba5e888204facd53304d5b7f" }
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "ring", "webpki-roots"] }
+rust-web-auth-core = { git = "https://github.com/vichare/rust-web-auth", rev = "b087b47a3ba6fdcc04d67931e97c3214b82e5e6d" }
+rust-web-auth-email-otp = { git = "https://github.com/vichare/rust-web-auth", rev = "b087b47a3ba6fdcc04d67931e97c3214b82e5e6d" }
+rust-web-auth-google = { git = "https://github.com/vichare/rust-web-auth", rev = "b087b47a3ba6fdcc04d67931e97c3214b82e5e6d" }
+rust-web-auth-http = { git = "https://github.com/vichare/rust-web-auth", rev = "b087b47a3ba6fdcc04d67931e97c3214b82e5e6d" }
+rust-web-auth-passkey = { git = "https://github.com/vichare/rust-web-auth", rev = "b087b47a3ba6fdcc04d67931e97c3214b82e5e6d" }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 sha2 = "0.10.8"

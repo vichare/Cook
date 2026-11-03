@@ -1,9 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { PantryConfirmation, ProfileSetup } from './router'
+import { AccountSecuritySettings, EmailOtpLogin, PantryConfirmation, ProfileSetup } from './router'
 
-const { saveProfile } = vi.hoisted(() => ({
+const { requestEmailLink, requestEmailOtp, saveProfile, securitySettings, verifyEmailLink, verifyEmailOtp } = vi.hoisted(() => ({
   saveProfile: vi.fn().mockImplementation((nickname: string | null) =>
     Promise.resolve({
       id: 'user',
@@ -13,6 +13,28 @@ const { saveProfile } = vi.hoisted(() => ({
       onboardingCompleted: true,
     }),
   ),
+  requestEmailOtp: vi.fn().mockResolvedValue({
+    challengeId: 'challenge',
+    expiresAt: '2026-11-04T00:10:00Z',
+    resendAllowedAt: '2026-11-04T00:00:00Z',
+  }),
+  verifyEmailOtp: vi.fn().mockResolvedValue({
+    id: 'user',
+    email: 'private@example.test',
+    displayName: 'Private',
+    nickname: null,
+    onboardingCompleted: false,
+  }),
+  securitySettings: vi.fn().mockResolvedValue({ linkedEmails: [], passkeys: [] }),
+  requestEmailLink: vi.fn().mockResolvedValue({
+    challengeId: 'link-challenge',
+    expiresAt: '2026-11-04T00:10:00Z',
+    resendAllowedAt: '2026-11-04T00:00:00Z',
+  }),
+  verifyEmailLink: vi.fn().mockResolvedValue({
+    linkedEmails: ['linked@example.test'],
+    passkeys: [],
+  }),
 }))
 
 vi.mock('./api', async () => {
@@ -23,6 +45,14 @@ vi.mock('./api', async () => {
       ...actual.api,
       savePantry: vi.fn().mockResolvedValue([]),
       saveProfile,
+      requestEmailOtp,
+      verifyEmailOtp,
+      securitySettings,
+      requestEmailLink,
+      verifyEmailLink,
+      startPasskeyRegistration: vi.fn(),
+      finishPasskeyRegistration: vi.fn(),
+      revokePasskey: vi.fn(),
     },
   }
 })
@@ -77,5 +107,45 @@ describe('pantry confirmation', () => {
     expect(screen.getByRole('button', { name: 'Save answers' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Skip for now' }))
     expect(screen.getByRole('button', { name: 'Save answers' })).toBeDisabled()
+  })
+})
+
+describe('email OTP sign-in', () => {
+  it('accepts a pasted six-digit code with one-time-code autocomplete', async () => {
+    requestEmailOtp.mockClear()
+    verifyEmailOtp.mockClear()
+    const onLogin = vi.fn()
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <EmailOtpLogin onLogin={onLogin} passkeyEnabled={false} />
+      </QueryClientProvider>,
+    )
+    fireEvent.change(screen.getByLabelText('Email address'), { target: { value: 'user@example.test' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Email me a code' }))
+    const code = await screen.findByLabelText('Verification code')
+    expect(code).toHaveAttribute('autocomplete', 'one-time-code')
+    fireEvent.change(code, { target: { value: '12 34a56' } })
+    expect(code).toHaveValue('123456')
+    fireEvent.click(screen.getByRole('button', { name: 'Verify and sign in' }))
+    await waitFor(() => expect(verifyEmailOtp).toHaveBeenCalledWith('challenge', '123456'))
+    expect(onLogin).toHaveBeenCalled()
+  })
+})
+
+describe('account security', () => {
+  it('links email explicitly and keeps passkey registration disabled until linked', async () => {
+    securitySettings.mockResolvedValueOnce({ linkedEmails: [], passkeys: [] })
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AccountSecuritySettings />
+      </QueryClientProvider>,
+    )
+    expect(await screen.findByRole('button', { name: 'Register passkey' })).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Email address'), { target: { value: 'linked@example.test' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send linking code' }))
+    const code = await screen.findByLabelText('Verification code')
+    fireEvent.change(code, { target: { value: '654321' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Verify and link email' }))
+    await waitFor(() => expect(verifyEmailLink).toHaveBeenCalledWith('link-challenge', '654321'))
   })
 })

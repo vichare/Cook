@@ -46,9 +46,12 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [mode]
+                required: [mode, google, emailOtp, passkey]
                 properties:
-                  mode: { type: string, enum: [development, google] }
+                  mode: { type: string, enum: [development, production] }
+                  google: { type: boolean }
+                  emailOtp: { type: boolean }
+                  passkey: { type: boolean }
   /api/auth/dev-login:
     post:
       description: Development and test only. Production returns 404.
@@ -90,6 +93,69 @@ paths:
           description: Cook session issued with a Host-only HttpOnly cookie and browser redirected home
         "401": { description: Invalid, expired, denied, or replayed login attempt }
         "503": { description: Google or authentication persistence unavailable }
+  /api/auth/email/request:
+    post:
+      description: Starts a non-enumerating Email OTP sign-in. The server does not look up account existence before returning the generic challenge response.
+      requestBody:
+        $ref: "#/components/requestBodies/EmailOtpRequest"
+      responses:
+        "200":
+          description: Generic challenge metadata
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmailOtpChallenge" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "429": { description: Email or client-address rate limit exceeded }
+        "503": { description: OTP persistence or mail delivery unavailable }
+  /api/auth/email/verify:
+    post:
+      description: Verifies and consumes a one-time challenge, then creates or resolves only the Email OTP identity and issues a Cook session.
+      requestBody:
+        $ref: "#/components/requestBodies/EmailOtpVerify"
+      responses:
+        "200":
+          description: Cook session issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { description: Invalid, expired, exhausted, or replayed challenge }
+        "429": { description: Challenge or client-address rate limit exceeded }
+  /api/auth/passkey/start:
+    post:
+      description: Starts username-first passkey login for an explicitly linked Email OTP identity. Unknown users and users without credentials share the same unauthorized response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200":
+          description: WebAuthn credential request options; a short-lived HttpOnly ceremony cookie is set.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { description: Passkey login cannot be started }
+        "429": { description: Email or client-address rate limit exceeded }
+  /api/auth/passkey/finish:
+    post:
+      description: Verifies the WebAuthn assertion, atomically updates credential state, and issues a Cook session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Cook session issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { description: Invalid, expired, replayed, or failed WebAuthn ceremony }
   /api/auth/logout:
     post:
       responses:
@@ -99,6 +165,101 @@ paths:
       responses:
         "204": { description: Every active session for the authenticated Cook user revoked }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/settings/security:
+    get:
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Explicitly linked email identities and active passkeys for the current account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecuritySettings" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/settings/security/email/request:
+    post:
+      security:
+        - sessionCookie: []
+      description: Starts an Email OTP link challenge bound to the current Cook user.
+      requestBody:
+        $ref: "#/components/requestBodies/EmailOtpRequest"
+      responses:
+        "200":
+          description: Generic challenge metadata
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmailOtpChallenge" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { description: Email or client-address rate limit exceeded }
+  /api/settings/security/email/verify:
+    post:
+      security:
+        - sessionCookie: []
+      description: Consumes a link challenge only for the Cook user who started it. Existing ownership by another account returns conflict and never merges accounts.
+      requestBody:
+        $ref: "#/components/requestBodies/EmailOtpVerify"
+      responses:
+        "200":
+          description: Updated account security settings
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecuritySettings" }
+        "401": { description: Invalid, expired, exhausted, replayed, or wrong-user challenge }
+        "409": { description: Email identity is already linked to another Cook account }
+  /api/settings/security/passkeys/register/start:
+    post:
+      security:
+        - sessionCookie: []
+      description: Starts passkey registration for an authenticated account with an explicitly linked email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        "200":
+          description: WebAuthn credential creation options; a short-lived HttpOnly ceremony cookie is set.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { description: No linked email or invalid credential name }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/settings/security/passkeys/register/finish:
+    post:
+      security:
+        - sessionCookie: []
+      description: Verifies and stores a globally unique passkey credential for the current user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "201":
+          description: Passkey registered
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Passkey" }
+        "401": { description: Invalid, expired, replayed, or wrong-user ceremony }
+        "409": { description: Credential ID already belongs to an account }
+  /api/settings/security/passkeys/{id}:
+    delete:
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Current user's passkey revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Passkey missing or owned by another account }
   /api/recipes:
     get:
       responses:
@@ -398,6 +559,29 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/RecipeInput" }
+    EmailOtpRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [email]
+            properties:
+              email: { type: string, format: email }
+    EmailOtpVerify:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [challengeId, code]
+            properties:
+              challengeId:
+                type: string
+                description: Opaque 256-bit challenge identifier; never place it or the code in URLs or logs.
+              code: { type: string, pattern: "^[0-9]{6}$" }
   schemas:
     User:
       type: object
@@ -418,6 +602,31 @@ components:
           type: [string, "null"]
           maxLength: 40
           description: Null selects anonymous. Values are trimmed and may not contain control characters, unusual whitespace, or repeated spaces.
+    EmailOtpChallenge:
+      type: object
+      required: [challengeId, expiresAt, resendAllowedAt]
+      properties:
+        challengeId: { type: string }
+        expiresAt: { type: string, format: date-time }
+        resendAllowedAt: { type: string, format: date-time }
+    Passkey:
+      type: object
+      required: [id, name, createdAt, lastUsedAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        createdAt: { type: string, format: date-time }
+        lastUsedAt: { type: [string, "null"], format: date-time }
+    SecuritySettings:
+      type: object
+      required: [linkedEmails, passkeys]
+      properties:
+        linkedEmails:
+          type: array
+          items: { type: string, format: email }
+        passkeys:
+          type: array
+          items: { $ref: "#/components/schemas/Passkey" }
     Ingredient:
       type: object
       required: [name]

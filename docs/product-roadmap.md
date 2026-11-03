@@ -26,9 +26,9 @@ Cook will provide an account-level interface language setting. The initial suppo
 
 ### Authentication availability beyond Google
 
-Google sign-in is unavailable or impractical for many users in mainland China, so Google cannot remain Cook's only long-term sign-in path. Phase 1 will add provider-neutral email one-time codes (OTP) and WebAuthn/passkeys while preserving explicit account linking. Cook must never merge accounts automatically only because provider profiles report the same email address.
+Google sign-in is unavailable or impractical for many users in mainland China, so Google cannot remain Cook's only sign-in path. Phase 1 now provides provider-neutral email one-time codes (OTP) and WebAuthn/passkeys while preserving explicit account linking. Cook never merges accounts automatically only because provider profiles report the same email address.
 
-The email OTP flow will return an opaque `challengeId` from a generic start response and verify that challenge with the emailed code. Responses and errors must not reveal whether an account exists. The UI will use `autocomplete="one-time-code"`, support pasting the complete code, show a resend countdown backed by server-enforced cooldowns, and work across devices. Magic links are not planned because email security scanners can consume one-time links before the user and links are less convenient to transfer between devices.
+The email OTP flow returns an opaque `challengeId` from a generic start response and verifies that challenge with the emailed code. Responses and errors do not reveal whether an account exists. The UI uses `autocomplete="one-time-code"`, supports pasting the complete code, shows a resend countdown backed by server-enforced cooldowns, and works across devices.
 
 Microsoft OIDC is the recommended Phase 2 provider based on current research into its global personal-account/Entra endpoints and free application registration. Apple sign-in remains optional because its developer program is paid. Direct WeChat sign-in is deferred because website-application review and eligible-entity requirements are still **unverified**. Authing and SMS login are deferred because they add third-party dependency, personal-data handling, and cost.
 
