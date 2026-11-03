@@ -109,6 +109,8 @@ pub async fn upsert_development_user(pool: &SqlitePool, display_name: &str) -> A
         id: format!("dev:{slug}"),
         email: format!("{slug}@example.test"),
         display_name: display_name.to_string(),
+        nickname: None,
+        onboarding_completed: false,
     };
     sqlx::query(
         "INSERT INTO users (id, email, profile_email, display_name) VALUES (?, ?, ?, ?)
@@ -125,17 +127,22 @@ pub async fn upsert_development_user(pool: &SqlitePool, display_name: &str) -> A
 }
 
 pub async fn load_user(pool: &SqlitePool, user_id: &UserId) -> AppResult<User> {
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT id, COALESCE(profile_email, email), display_name FROM users WHERE id = ?",
+    let row: Option<(String, String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT id, COALESCE(profile_email, email), display_name, public_nickname,
+           profile_onboarding_completed
+         FROM users WHERE id = ?",
     )
     .bind(user_id.as_str())
     .fetch_optional(pool)
     .await?;
-    let (id, email, display_name) = row.ok_or(AppError::Unauthorized)?;
+    let (id, email, display_name, nickname, onboarding_completed) =
+        row.ok_or(AppError::Unauthorized)?;
     Ok(User {
         id,
         email,
         display_name,
+        nickname,
+        onboarding_completed,
     })
 }
 

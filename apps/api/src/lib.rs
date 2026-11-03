@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod importer;
+pub mod imports;
 pub mod models;
 pub mod recommendation;
 pub mod routes;

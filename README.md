@@ -27,9 +27,14 @@ Production uses Google Authorization Code OIDC with S256 PKCE through `vichare/r
 - `apps/api`: Axum API, SQLite schema, auth port, and domain tests
 - `apps/web`: responsive React application and frontend tests
 - `openapi/openapi.yaml`: API contract
+- `skills/cook-recipe-import`: official AI-client skill and versioned import schema
 - `docs`: architecture and operations
 - `deploy/nginx`: host reverse-proxy example
 
 See `docs/architecture.md` and `docs/deployment.md` for design and deployment details. Future product scope and unresolved decisions are tracked in `docs/product-roadmap.md`.
+
+## AI-client recipe imports
+
+Cook's official [recipe import skill](skills/cook-recipe-import/SKILL.md) uses browser or transcript tools already available in the user's AI client, then submits an untrusted structured payload to Cook as a private review draft. Create a scoped `recipes:import` token in Settings, store it in the client's secret store or `COOK_IMPORT_TOKEN`, and never place it in a URL or prompt. Cook does not fetch arbitrary source URLs, and accepting a reviewed draft creates a private recipe rather than publishing it.
 
 Release tags matching `vX.Y.Z` publish `ghcr.io/vichare/cook:<tag>` and deploy through a restricted SSH hook. See `docs/release-and-deployment.md` for the public mechanism; server-specific bootstrap and account details are kept in the private operations manual.

@@ -19,9 +19,11 @@ use crate::{
     auth::{load_user, upsert_development_user},
     config::AuthMode,
     error::{AppError, AppResult},
+    imports,
     models::{
-        normalize_ingredient, IngredientInput, PantryItem, PantryItemInput, PantryStatus, Recipe,
-        RecipeInput, RecommendationRequest, RecommendationSettings, User,
+        normalize_ingredient, normalize_nickname, IngredientInput, PantryItem, PantryItemInput,
+        PantryStatus, ProfileInput, Recipe, RecipeInput, RecipeSource, RecommendationRequest,
+        RecommendationSettings, User,
     },
     recommendation::{recommend, Recommendation},
     AppState,
@@ -30,6 +32,7 @@ use crate::{
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/me", get(me))
+        .route("/api/settings/profile", put(update_profile))
         .route("/api/auth/logout-all", post(logout_all))
         .route("/api/recipes", get(list_recipes).post(create_recipe))
         .route(
@@ -46,6 +49,25 @@ pub fn router(state: AppState) -> Router {
             get(get_settings).put(update_settings),
         )
         .route("/api/recommendations", post(get_recommendations))
+        .route(
+            "/api/settings/import-tokens",
+            get(imports::list_import_tokens).post(imports::create_import_token),
+        )
+        .route(
+            "/api/settings/import-tokens/{id}",
+            axum::routing::delete(imports::revoke_import_token),
+        )
+        .route("/api/import-drafts", get(imports::list_import_drafts))
+        .route(
+            "/api/import-drafts/{id}",
+            get(imports::get_import_draft)
+                .put(imports::update_import_draft)
+                .delete(imports::discard_import_draft),
+        )
+        .route(
+            "/api/import-drafts/{id}/accept",
+            post(imports::accept_import_draft),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authenticate_request,
@@ -57,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/google/start", get(google_start))
         .route("/api/auth/google/callback", get(google_callback))
         .route("/api/auth/logout", post(logout))
+        .route("/api/import/drafts", post(imports::create_import_draft))
         .merge(protected)
         .with_state(state)
 }
@@ -84,7 +107,7 @@ struct GoogleCallback {
 }
 
 #[derive(Clone)]
-struct CurrentUser(User);
+pub(crate) struct CurrentUser(pub User);
 
 #[derive(Clone)]
 struct CurrentAuth(AuthenticatedContext);
@@ -264,6 +287,25 @@ async fn authenticate_request(
 
 async fn me(Extension(CurrentUser(user)): Extension<CurrentUser>) -> Json<User> {
     Json(user)
+}
+
+async fn update_profile(
+    State(state): State<AppState>,
+    Extension(CurrentUser(mut user)): Extension<CurrentUser>,
+    Json(input): Json<ProfileInput>,
+) -> AppResult<Json<User>> {
+    let nickname = normalize_nickname(input.nickname.as_deref())
+        .map_err(|message| AppError::Validation(message.into()))?;
+    sqlx::query(
+        "UPDATE users SET public_nickname = ?, profile_onboarding_completed = 1 WHERE id = ?",
+    )
+    .bind(&nickname)
+    .bind(&user.id)
+    .execute(&state.pool)
+    .await?;
+    user.nickname = nickname;
+    user.onboarding_completed = true;
+    Ok(Json(user))
 }
 
 async fn list_recipes(
@@ -565,7 +607,7 @@ async fn replace_ingredients(
     insert_ingredients(transaction, recipe_id, ingredients).await
 }
 
-async fn insert_ingredients(
+pub(crate) async fn insert_ingredients(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     recipe_id: &str,
     ingredients: &[IngredientInput],
@@ -587,7 +629,7 @@ async fn insert_ingredients(
     Ok(())
 }
 
-async fn load_visible_recipes(
+pub(crate) async fn load_visible_recipes(
     pool: &SqlitePool,
     user_id: &str,
     id: Option<&str>,
@@ -595,8 +637,11 @@ async fn load_visible_recipes(
     let rows = if let Some(id) = id {
         sqlx::query(
             "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
+               u.public_nickname, r.source_url, r.source_title, r.source_author,
+               r.source_warnings, r.source_confidence,
                EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite
-             FROM recipes r WHERE r.id = ? AND (r.owner_id = ? OR r.visibility = 'public')",
+             FROM recipes r JOIN users u ON u.id = r.owner_id
+             WHERE r.id = ? AND (r.owner_id = ? OR r.visibility = 'public')",
         )
         .bind(user_id)
         .bind(id)
@@ -606,8 +651,11 @@ async fn load_visible_recipes(
     } else {
         sqlx::query(
             "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
+               u.public_nickname, r.source_url, r.source_title, r.source_author,
+               r.source_warnings, r.source_confidence,
                EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite
-             FROM recipes r WHERE r.owner_id = ? OR r.visibility = 'public' ORDER BY r.updated_at DESC",
+             FROM recipes r JOIN users u ON u.id = r.owner_id
+             WHERE r.owner_id = ? OR r.visibility = 'public' ORDER BY r.updated_at DESC",
         )
         .bind(user_id)
         .bind(user_id)
@@ -617,15 +665,37 @@ async fn load_visible_recipes(
     let mut recipes = Vec::with_capacity(rows.len());
     for row in rows {
         let recipe_id: String = row.get("id");
+        let owner_id: String = row.get("owner_id");
+        let source_url: Option<String> = row.get("source_url");
+        let source = if let Some(url) = source_url {
+            let warnings = match row.get::<Option<String>, _>("source_warnings") {
+                Some(value) => serde_json::from_str(&value).map_err(|error| {
+                    AppError::Data(format!("invalid stored recipe source warnings: {error}"))
+                })?,
+                None => Vec::new(),
+            };
+            Some(RecipeSource {
+                url,
+                title: row.get("source_title"),
+                author: row.get("source_author"),
+                warnings,
+                confidence: row.get("source_confidence"),
+            })
+        } else {
+            None
+        };
         recipes.push(Recipe {
             ingredients: load_ingredients(pool, &recipe_id).await?,
             id: recipe_id,
-            owner_id: row.get("owner_id"),
+            is_owner: owner_id == user_id,
+            owner_id,
+            author_nickname: row.get("public_nickname"),
             title: row.get("title"),
             description: row.get("description"),
             instructions: row.get("instructions"),
             visibility: row.get("visibility"),
             is_favorite: row.get::<i64, _>("is_favorite") != 0,
+            source,
         });
     }
     Ok(recipes)
@@ -726,8 +796,10 @@ mod tests {
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
+    use chrono::Utc;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use crate::{
         build_app,
@@ -783,6 +855,77 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    async fn response_json(response: axum::response::Response) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn save_profile(app: &axum::Router, cookie: &str, nickname: Option<&str>) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/api/settings/profile")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(json!({"nickname": nickname}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
+    async fn create_import_token(app: &axum::Router, cookie: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/settings/import-tokens")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(
+                        json!({"name": "Test client", "expiresInDays": 90}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response_json(response).await
+    }
+
+    fn import_payload(source_url: &str) -> Value {
+        json!({
+            "schemaVersion": "1.0",
+            "sourceUrl": source_url,
+            "sourceTitle": "Example soup",
+            "sourceAuthor": "Example author",
+            "title": "Imported soup",
+            "description": "Review me",
+            "ingredients": [{"name": "water", "quantityNote": "1 cup"}],
+            "steps": ["Stir the ingredients."],
+            "warnings": ["Timing was inferred."],
+            "confidence": 0.8
+        })
+    }
+
+    async fn submit_import(
+        app: &axum::Router,
+        secret: &str,
+        payload: Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::post("/api/import/drafts")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn private_recipe_is_not_visible_to_another_account() {
         let app = build_app(Config::test()).await.unwrap();
@@ -799,6 +942,278 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_nickname_is_opt_in_and_does_not_expose_auth_profile() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Google Display Name").await;
+        let other_cookie = login(&app, "Reader").await;
+
+        let me = app
+            .clone()
+            .oneshot(
+                Request::get("/api/me")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let me = response_json(me).await;
+        assert_eq!(me["displayName"], "Google Display Name");
+        assert_eq!(me["nickname"], Value::Null);
+        assert_eq!(me["onboardingCompleted"], false);
+
+        let created = create_recipe(&app, &owner_cookie, "public").await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipes/{}", created["id"].as_str().unwrap()))
+                    .header("cookie", &other_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let public_recipe = response_json(response).await;
+        assert_eq!(public_recipe["authorNickname"], Value::Null);
+        assert_eq!(public_recipe["isOwner"], false);
+        assert!(public_recipe.get("ownerId").is_none());
+        assert!(public_recipe.get("email").is_none());
+        assert!(public_recipe.get("displayName").is_none());
+
+        let profile = save_profile(&app, &owner_cookie, Some("厨师 🌶️")).await;
+        assert_eq!(profile["nickname"], "厨师 🌶️");
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/recipes/{}", created["id"].as_str().unwrap()))
+                    .header("cookie", other_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let public_recipe = response_json(response).await;
+        assert_eq!(public_recipe["authorNickname"], "厨师 🌶️");
+    }
+
+    #[tokio::test]
+    async fn nickname_validation_and_anonymous_onboarding_are_explicit() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Private suggestion").await;
+        let anonymous = save_profile(&app, &cookie, None).await;
+        assert_eq!(anonymous["nickname"], Value::Null);
+        assert_eq!(anonymous["onboardingCompleted"], true);
+        assert_eq!(anonymous["displayName"], "Private suggestion");
+
+        for nickname in ["two  spaces", "line\nbreak"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put("/api/settings/profile")
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .body(Body::from(json!({"nickname": nickname}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn import_token_secret_is_one_time_and_bearer_scope_is_import_only() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let created = create_import_token(&app, &cookie).await;
+        let secret = created["secret"].as_str().unwrap();
+        assert!(secret.starts_with("cook_imp_"));
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::get("/api/settings/import-tokens")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list_text = String::from_utf8(
+            to_bytes(list.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!list_text.contains(secret));
+        assert!(list_text.contains("recipes:import"));
+
+        let me = app
+            .oneshot(
+                Request::get("/api/me")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(me.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn import_drafts_are_owner_scoped_and_accept_exactly_once() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Owner").await;
+        let other_cookie = login(&app, "Other").await;
+        let token = create_import_token(&app, &owner_cookie).await;
+        let secret = token["secret"].as_str().unwrap();
+        let response =
+            submit_import(&app, secret, import_payload("https://example.test/soup")).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let draft = response_json(response).await;
+        let draft_id = draft["id"].as_str().unwrap();
+
+        let other = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/import-drafts/{draft_id}"))
+                    .header("cookie", &other_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::NOT_FOUND);
+        let other_accept = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/import-drafts/{draft_id}/accept"))
+                    .header("cookie", other_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_accept.status(), StatusCode::NOT_FOUND);
+
+        let accept = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/import-drafts/{draft_id}/accept"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept.status(), StatusCode::CREATED);
+        let recipe = response_json(accept).await;
+        assert_eq!(recipe["visibility"], "private");
+        assert_eq!(recipe["source"]["url"], "https://example.test/soup");
+        assert_eq!(recipe["source"]["warnings"][0], "Timing was inferred.");
+
+        let duplicate = app
+            .oneshot(
+                Request::post(format!("/api/import-drafts/{draft_id}/accept"))
+                    .header("cookie", owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn revoked_expired_and_malformed_imports_are_rejected() {
+        let path = std::env::temp_dir().join(format!("cook-import-{}.db", Uuid::new_v4()));
+        let mut config = Config::test();
+        config.database_url = format!("sqlite://{}", path.display());
+        let app = build_app(config.clone()).await.unwrap();
+        let pool = crate::db::connect(&config.database_url).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+
+        let malformed_token = create_import_token(&app, &cookie).await;
+        let malformed_secret = malformed_token["secret"].as_str().unwrap();
+        let malformed =
+            submit_import(&app, malformed_secret, import_payload("file:///etc/passwd")).await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let oversized = json!({
+            "schemaVersion": "1.0",
+            "sourceUrl": "https://example.test/recipe",
+            "title": "Soup",
+            "ingredients": (0..101).map(|i| json!({"name": format!("item {i}"), "quantityNote": ""})).collect::<Vec<_>>(),
+            "steps": ["Stir."]
+        });
+        let oversized = submit_import(&app, malformed_secret, oversized).await;
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+        let mut owner_injection = import_payload("https://example.test/owner-injection");
+        owner_injection["ownerId"] = json!("another-user");
+        let owner_injection = submit_import(&app, malformed_secret, owner_injection).await;
+        assert_eq!(owner_injection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let revoked = create_import_token(&app, &cookie).await;
+        let revoked_secret = revoked["secret"].as_str().unwrap();
+        let token_id = revoked["token"]["id"].as_str().unwrap();
+        let revoke = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/settings/import-tokens/{token_id}"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+        let rejected = submit_import(
+            &app,
+            revoked_secret,
+            import_payload("https://example.test/revoked"),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let expired = create_import_token(&app, &cookie).await;
+        let expired_secret = expired["secret"].as_str().unwrap();
+        let expired_id = expired["token"]["id"].as_str().unwrap();
+        sqlx::query("UPDATE import_tokens SET expires_at = ? WHERE id = ?")
+            .bind(Utc::now().timestamp() - 1)
+            .bind(expired_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rejected = submit_import(
+            &app,
+            expired_secret,
+            import_payload("https://example.test/expired"),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn import_token_rate_limit_is_enforced() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let token = create_import_token(&app, &cookie).await;
+        let secret = token["secret"].as_str().unwrap();
+        for index in 0..20 {
+            let response = submit_import(
+                &app,
+                secret,
+                import_payload(&format!("https://example.test/{index}")),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        let limited =
+            submit_import(&app, secret, import_payload("https://example.test/limited")).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

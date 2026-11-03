@@ -159,6 +159,8 @@ mod tests {
         Recipe {
             id: id.into(),
             owner_id: "owner".into(),
+            is_owner: true,
+            author_nickname: None,
             title: title.into(),
             description: String::new(),
             instructions: String::new(),
@@ -171,6 +173,7 @@ mod tests {
                 })
                 .collect(),
             is_favorite: false,
+            source: None,
         }
     }
 

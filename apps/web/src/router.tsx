@@ -13,7 +13,14 @@ import { useMemo, useState } from 'react'
 import { useFieldArray, useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { ApiError, api } from './api'
-import type { PantryItem, PantryStatus, Recipe, RecommendationSettings } from './types'
+import type {
+  ImportDraft,
+  PantryItem,
+  PantryStatus,
+  Recipe,
+  RecommendationSettings,
+  User,
+} from './types'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -64,6 +71,16 @@ const settingsRoute = createRoute({
   path: '/settings',
   component: SettingsPage,
 })
+const importsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/imports',
+  component: ImportsPage,
+})
+const importDraftRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/imports/$draftId',
+  component: ImportDraftPage,
+})
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
@@ -74,6 +91,8 @@ const routeTree = rootRoute.addChildren([
   editRecipeRoute,
   pantryRoute,
   settingsRoute,
+  importsRoute,
+  importDraftRoute,
 ])
 
 export const router = createRouter({ routeTree, context: { queryClient: undefined! } })
@@ -103,7 +122,8 @@ function Root() {
           <Link to="/recommendations">Recommend</Link>
           <Link to="/recipes">Recipes</Link>
           <Link to="/pantry">Pantry</Link>
-          <Link to="/settings">Sources</Link>
+          <Link to="/imports">Imports</Link>
+          <Link to="/settings">Settings</Link>
         </nav>
         <button
           className="button ghost"
@@ -117,6 +137,7 @@ function Root() {
       <main id="main">
         <Outlet />
       </main>
+      {me.data && !me.data.onboardingCompleted && <ProfileSetup user={me.data} />}
     </div>
   )
 }
@@ -311,6 +332,7 @@ function RecipesPage() {
                 </button>
               </div>
               <p>{recipe.description || 'No description.'}</p>
+              <p className="byline">By {recipe.authorNickname ?? 'Anonymous user'}</p>
               <Link to="/recipes/$recipeId" params={{ recipeId: recipe.id }}>
                 Open recipe
               </Link>
@@ -325,7 +347,6 @@ function RecipesPage() {
 function RecipeDetailPage() {
   const { recipeId } = recipeRoute.useParams()
   const recipe = useQuery({ queryKey: ['recipe', recipeId], queryFn: () => api.recipe(recipeId) })
-  const me = useQuery({ queryKey: ['me'], queryFn: api.me })
   return (
     <Page title={recipe.data?.title ?? 'Recipe'} intro={recipe.data?.description ?? ''}>
       <QueryState query={recipe} empty="Recipe not found.">
@@ -333,12 +354,25 @@ function RecipeDetailPage() {
           <article className="detail-card">
             <div className="card-heading">
               <span className="status verify">{recipe.data.visibility}</span>
-              {recipe.data.ownerId === me.data?.id && (
+              {recipe.data.isOwner && (
                 <Link className="button secondary" to="/recipes/$recipeId/edit" params={{ recipeId }}>
                   Edit
                 </Link>
               )}
             </div>
+            <p className="byline">By {recipe.data.authorNickname ?? 'Anonymous user'}</p>
+            {recipe.data.source && (
+              <aside className="source-note">
+                <strong>Imported source</strong>
+                <a href={recipe.data.source.url} rel="noreferrer">
+                  {recipe.data.source.title ?? recipe.data.source.url}
+                </a>
+                {recipe.data.source.author && <span> by {recipe.data.source.author}</span>}
+                {recipe.data.source.warnings.map((warning) => (
+                  <p key={warning}>{warning}</p>
+                ))}
+              </aside>
+            )}
             <h2>Ingredients</h2>
             <ul>
               {recipe.data.ingredients.map((ingredient, index) => (
@@ -359,13 +393,12 @@ function RecipeDetailPage() {
 function EditRecipePage() {
   const { recipeId } = editRecipeRoute.useParams()
   const recipe = useQuery({ queryKey: ['recipe', recipeId], queryFn: () => api.recipe(recipeId) })
-  const me = useQuery({ queryKey: ['me'], queryFn: api.me })
   return (
     <Page title="Edit recipe" intro="Changes are only allowed for the recipe owner.">
       <QueryState query={recipe} empty="Recipe not found.">
-        {recipe.data && recipe.data.ownerId === me.data?.id ? (
+        {recipe.data && recipe.data.isOwner ? (
           <RecipeEditor recipe={recipe.data} />
-        ) : recipe.data && me.data ? (
+        ) : recipe.data ? (
           <StatePanel title="Owner access required" detail="Only the recipe owner can edit this recipe." />
         ) : null}
       </QueryState>
@@ -532,12 +565,310 @@ function PantryPage() {
 
 function SettingsPage() {
   const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings })
+  const me = useQuery({ queryKey: ['me'], queryFn: api.me })
   return (
-    <Page title="Recommendation sources" intro="Choose which recipe pools can appear. Private recipes remain owner-only.">
+    <Page title="Settings" intro="Manage your public profile, recommendation sources, and import access.">
+      {me.data && <ProfileSettings user={me.data} />}
       <QueryState query={settings} empty="Settings unavailable.">
         {settings.data && <SettingsForm initial={settings.data} />}
       </QueryState>
+      <ImportTokenSettings />
     </Page>
+  )
+}
+
+export function ProfileSetup({ user }: { user: User }) {
+  const queryClient = useQueryClient()
+  const [choice, setChoice] = useState<'anonymous' | 'suggested' | 'custom'>('anonymous')
+  const [custom, setCustom] = useState('')
+  const save = useMutation({
+    mutationFn: (nickname: string | null) => api.saveProfile(nickname),
+    onSuccess: async (value) => {
+      queryClient.setQueryData(['me'], value)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['recipes'] }),
+        queryClient.invalidateQueries({ queryKey: ['recipe'] }),
+        queryClient.invalidateQueries({ queryKey: ['recommendations'] }),
+      ])
+    },
+  })
+  return (
+    <Dialog.Root open>
+      <Dialog.Portal>
+        <Dialog.Overlay className="dialog-overlay" />
+        <Dialog.Content className="confirmation-sheet">
+          <Dialog.Title>Choose your public recipe name</Dialog.Title>
+          <Dialog.Description>
+            Your Google profile stays private. Only the nickname you explicitly choose is shown on public recipes.
+          </Dialog.Description>
+          <fieldset className="choice-list">
+            <label className="radio-pill">
+              <input
+                type="radio"
+                name="profile-choice"
+                checked={choice === 'anonymous'}
+                onChange={() => setChoice('anonymous')}
+              />
+              Anonymous user (default)
+            </label>
+            <label className="radio-pill">
+              <input
+                type="radio"
+                name="profile-choice"
+                checked={choice === 'suggested'}
+                onChange={() => setChoice('suggested')}
+              />
+              Use “{user.displayName}” publicly
+            </label>
+            <label className="radio-pill">
+              <input
+                type="radio"
+                name="profile-choice"
+                checked={choice === 'custom'}
+                onChange={() => setChoice('custom')}
+              />
+              Choose a custom nickname
+            </label>
+            {choice === 'custom' && (
+              <input
+                aria-label="Custom public nickname"
+                value={custom}
+                maxLength={40}
+                onChange={(event) => setCustom(event.target.value)}
+              />
+            )}
+          </fieldset>
+          <div className="dialog-actions">
+            <button className="button ghost" onClick={() => save.mutate(null)}>
+              Skip and stay anonymous
+            </button>
+            <button
+              className="button primary"
+              disabled={save.isPending || (choice === 'custom' && !custom.trim())}
+              onClick={() =>
+                save.mutate(choice === 'suggested' ? user.displayName : choice === 'custom' ? custom : null)
+              }
+            >
+              Save public profile
+            </button>
+          </div>
+          {save.error && <ErrorText error={save.error} />}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+function ProfileSettings({ user }: { user: User }) {
+  const queryClient = useQueryClient()
+  const [nickname, setNickname] = useState(user.nickname ?? '')
+  const save = useMutation({
+    mutationFn: () => api.saveProfile(nickname.trim() || null),
+    onSuccess: async (value) => {
+      queryClient.setQueryData(['me'], value)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['recipes'] }),
+        queryClient.invalidateQueries({ queryKey: ['recipe'] }),
+        queryClient.invalidateQueries({ queryKey: ['recommendations'] }),
+      ])
+    },
+  })
+  return (
+    <section className="settings-section">
+      <h2>Public profile</h2>
+      <p>Your sign-in email and Google display name are private. Empty nickname means Anonymous user.</p>
+      <form
+        className="settings-form"
+        onSubmit={(event) => {
+          event.preventDefault()
+          save.mutate()
+        }}
+      >
+        <label>
+          Public nickname
+          <input value={nickname} maxLength={40} onChange={(event) => setNickname(event.target.value)} />
+        </label>
+        <button className="button primary" disabled={save.isPending}>Save profile</button>
+        {save.isSuccess && <p role="status">Profile saved.</p>}
+        {save.error && <ErrorText error={save.error} />}
+      </form>
+    </section>
+  )
+}
+
+function ImportTokenSettings() {
+  const queryClient = useQueryClient()
+  const tokens = useQuery({ queryKey: ['import-tokens'], queryFn: api.importTokens })
+  const [name, setName] = useState('My AI client')
+  const [secret, setSecret] = useState<string | null>(null)
+  const create = useMutation({
+    mutationFn: () => api.createImportToken(name, 90),
+    onSuccess: async (created) => {
+      setSecret(created.secret)
+      await queryClient.invalidateQueries({ queryKey: ['import-tokens'] })
+    },
+  })
+  const revoke = useMutation({
+    mutationFn: api.revokeImportToken,
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['import-tokens'] }),
+  })
+  return (
+    <section className="settings-section">
+      <h2>AI recipe import tokens</h2>
+      <p>Tokens have only the recipes:import scope. Store the secret in your AI client secret store; it is shown once.</p>
+      <form
+        className="inline-form compact"
+        onSubmit={(event) => {
+          event.preventDefault()
+          create.mutate()
+        }}
+      >
+        <label>
+          Token name
+          <input value={name} onChange={(event) => setName(event.target.value)} required maxLength={80} />
+        </label>
+        <button className="button primary" disabled={create.isPending}>Create 90-day token</button>
+      </form>
+      {secret && (
+        <div className="secret-once" role="status">
+          <strong>Copy this secret now. It cannot be retrieved later.</strong>
+          <code>{secret}</code>
+          <button className="button ghost" onClick={() => setSecret(null)}>I saved it</button>
+        </div>
+      )}
+      <QueryState query={tokens} empty="No import tokens.">
+        <div className="card-list">
+          {tokens.data?.map((token) => (
+            <article className="recipe-card" key={token.id}>
+              <strong>{token.name}</strong>
+              <span>{token.prefix}… · {token.scope}</span>
+              <span>{token.revokedAt ? 'Revoked' : `Expires ${token.expiresAt ?? 'never'}`}</span>
+              {!token.revokedAt && (
+                <button className="button ghost" onClick={() => revoke.mutate(token.id)}>Revoke</button>
+              )}
+            </article>
+          ))}
+        </div>
+      </QueryState>
+      {create.error && <ErrorText error={create.error} />}
+      {revoke.error && <ErrorText error={revoke.error} />}
+    </section>
+  )
+}
+
+function ImportsPage() {
+  const drafts = useQuery({ queryKey: ['import-drafts'], queryFn: api.importDrafts })
+  return (
+    <Page title="Recipe import drafts" intro="AI output is untrusted. Review and edit every draft before creating a private recipe.">
+      <QueryState query={drafts} empty="No import drafts yet. Use the official Cook skill from your AI client.">
+        <div className="card-list">
+          {drafts.data?.map((draft) => (
+            <article className="recipe-card" key={draft.id}>
+              <span className="status verify">{draft.status}</span>
+              <h2>{draft.title}</h2>
+              <p>{draft.sourceTitle ?? draft.sourceUrl}</p>
+              <Link to="/imports/$draftId" params={{ draftId: draft.id }}>Review draft</Link>
+            </article>
+          ))}
+        </div>
+      </QueryState>
+    </Page>
+  )
+}
+
+function ImportDraftPage() {
+  const { draftId } = importDraftRoute.useParams()
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const draft = useQuery({ queryKey: ['import-draft', draftId], queryFn: () => api.importDraft(draftId) })
+  const accept = useMutation({
+    mutationFn: () => api.acceptImportDraft(draftId),
+    onSuccess: async (recipe) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['import-drafts'] }),
+        queryClient.invalidateQueries({ queryKey: ['recipes'] }),
+      ])
+      await navigate({ to: '/recipes/$recipeId', params: { recipeId: recipe.id } })
+    },
+  })
+  const discard = useMutation({
+    mutationFn: () => api.discardImportDraft(draftId),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['import-drafts'] })
+      await navigate({ to: '/imports' })
+    },
+  })
+  return (
+    <Page title="Review import draft" intro="Confirm the source, warnings, ingredients, and rewritten steps before accepting.">
+      <QueryState query={draft} empty="Import draft not found.">
+        {draft.data && (
+          <>
+            <ImportDraftEditor draft={draft.data} />
+            <section className="source-note">
+              <h2>Source and extraction warnings</h2>
+              <a href={draft.data.sourceUrl} rel="noreferrer">{draft.data.sourceTitle ?? draft.data.sourceUrl}</a>
+              {draft.data.sourceAuthor && <p>Source author: {draft.data.sourceAuthor}</p>}
+              <p>Confidence: {draft.data.confidence ?? 'not provided'}</p>
+              {draft.data.warnings.map((warning) => <p key={warning}>{warning}</p>)}
+            </section>
+            {draft.data.status === 'draft' && (
+              <div className="dialog-actions">
+                <button className="button ghost" onClick={() => discard.mutate()}>Discard</button>
+                <button className="button primary" onClick={() => accept.mutate()}>Accept as private recipe</button>
+              </div>
+            )}
+            {(accept.error || discard.error) && <ErrorText error={accept.error ?? discard.error} />}
+          </>
+        )}
+      </QueryState>
+    </Page>
+  )
+}
+
+function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
+  const queryClient = useQueryClient()
+  const form = useForm<RecipeForm>({
+    resolver: zodResolver(recipeSchema),
+    defaultValues: {
+      title: draft.title,
+      description: draft.description,
+      instructions: draft.instructions,
+      visibility: 'private',
+      ingredients: draft.ingredients,
+    },
+  })
+  const fields = useFieldArray({ control: form.control, name: 'ingredients' })
+  const save = useMutation({
+    mutationFn: (value: RecipeForm) =>
+      api.saveImportDraft(draft.id, {
+        title: value.title,
+        description: value.description,
+        instructions: value.instructions,
+        ingredients: value.ingredients,
+      }),
+    onSuccess: (value) => queryClient.setQueryData(['import-draft', draft.id], value),
+  })
+  if (draft.status !== 'draft') return <StatePanel title="Draft closed" detail={`This draft is ${draft.status}.`} />
+  return (
+    <form className="editor-form" onSubmit={form.handleSubmit((value) => save.mutate(value))}>
+      <label>Title<input {...form.register('title')} /></label>
+      <label>Description<textarea rows={3} {...form.register('description')} /></label>
+      <label>Instructions<textarea rows={10} {...form.register('instructions')} /></label>
+      <fieldset>
+        <legend>Ingredients</legend>
+        {fields.fields.map((field, index) => (
+          <div className="ingredient-row" key={field.id}>
+            <input aria-label={`Ingredient ${index + 1}`} {...form.register(`ingredients.${index}.name`)} />
+            <input aria-label={`Quantity ${index + 1}`} {...form.register(`ingredients.${index}.quantityNote`)} />
+            {fields.fields.length > 1 && <button type="button" className="button ghost" onClick={() => fields.remove(index)}>Remove</button>}
+          </div>
+        ))}
+        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '' })}>Add ingredient</button>
+      </fieldset>
+      <button className="button secondary" disabled={save.isPending}>Save draft changes</button>
+      {save.isSuccess && <p role="status">Draft saved.</p>}
+      {save.error && <ErrorText error={save.error} />}
+    </form>
   )
 }
 

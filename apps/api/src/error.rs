@@ -21,7 +21,11 @@ pub enum AppError {
     #[error("resource not found")]
     NotFound,
     #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
     Validation(String),
+    #[error("{0}")]
+    Data(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -49,8 +53,13 @@ impl IntoResponse for AppError {
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             Self::AuthUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "auth_unavailable"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+            Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
-            Self::Configuration(_) | Self::Database(_) | Self::Migration(_) | Self::Io(_) => {
+            Self::Configuration(_)
+            | Self::Data(_)
+            | Self::Database(_)
+            | Self::Migration(_)
+            | Self::Io(_) => {
                 tracing::error!(error = %self, "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
             }

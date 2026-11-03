@@ -78,6 +78,11 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .radio-pill { flex-direction: row; align-items: center; margin: .6rem 0; }
 .radio-pill input { width: auto; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: .75rem; }
+.byline { color: #53645a; font-size: .9rem; }
+.source-note, .settings-section, .secret-once { margin: 1.5rem 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: #f7f3e8; display: grid; gap: .65rem; }
+.secret-once code { overflow-wrap: anywhere; padding: .8rem; background: white; border-radius: .5rem; }
+.choice-list { display: grid; gap: .5rem; margin: 1.5rem 0; }
+.compact { grid-template-columns: minmax(220px, 1fr) auto; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 760px) {

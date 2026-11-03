@@ -1,6 +1,9 @@
 import type {
   PantryItem,
   Recipe,
+  CreatedImportToken,
+  ImportDraft,
+  ImportToken,
   Recommendation,
   RecommendationSettings,
   User,
@@ -41,9 +44,17 @@ export const api = {
       body: JSON.stringify({ displayName }),
     }),
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
+  saveProfile: (nickname: string | null) =>
+    request<User>('/api/settings/profile', {
+      method: 'PUT',
+      body: JSON.stringify({ nickname }),
+    }),
   recipes: () => request<Recipe[]>('/api/recipes'),
   recipe: (id: string) => request<Recipe>(`/api/recipes/${id}`),
-  saveRecipe: (value: Omit<Recipe, 'id' | 'ownerId' | 'isFavorite'>, id?: string) =>
+  saveRecipe: (
+    value: Pick<Recipe, 'title' | 'description' | 'instructions' | 'visibility' | 'ingredients'>,
+    id?: string,
+  ) =>
     request<Recipe>(id ? `/api/recipes/${id}` : '/api/recipes', {
       method: id ? 'PUT' : 'POST',
       body: JSON.stringify(value),
@@ -69,4 +80,26 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(value),
     }),
+  importTokens: () => request<ImportToken[]>('/api/settings/import-tokens'),
+  createImportToken: (name: string, expiresInDays: number | null) =>
+    request<CreatedImportToken>('/api/settings/import-tokens', {
+      method: 'POST',
+      body: JSON.stringify({ name, expiresInDays }),
+    }),
+  revokeImportToken: (id: string) =>
+    request<void>(`/api/settings/import-tokens/${id}`, { method: 'DELETE' }),
+  importDrafts: () => request<ImportDraft[]>('/api/import-drafts'),
+  importDraft: (id: string) => request<ImportDraft>(`/api/import-drafts/${id}`),
+  saveImportDraft: (
+    id: string,
+    value: Pick<ImportDraft, 'title' | 'description' | 'instructions' | 'ingredients'>,
+  ) =>
+    request<ImportDraft>(`/api/import-drafts/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(value),
+    }),
+  acceptImportDraft: (id: string) =>
+    request<Recipe>(`/api/import-drafts/${id}/accept`, { method: 'POST' }),
+  discardImportDraft: (id: string) =>
+    request<void>(`/api/import-drafts/${id}`, { method: 'DELETE' }),
 }

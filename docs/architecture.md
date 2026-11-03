@@ -39,3 +39,11 @@ Responses include available, verification, and missing lists plus human-readable
 ## Import boundary
 
 `LicensedRecipeImporter` accepts only structured recipes with source URL, license, and attribution. The included fixture returns no copied content. HowToCook prose and images are not stored in this repository.
+
+The AI-client import path is a separate, deliberately narrow boundary. The official skill uses browser or transcript capabilities already present in the user's client; Cook never fetches the submitted URL. A high-entropy Bearer token with only `recipes:import` scope authenticates `POST /api/import/drafts`, derives the Cook owner, and cannot authenticate ordinary session endpoints. Cook stores only its SHA-256 digest and non-secret prefix/metadata, supports expiry and revocation, and rate-limits each token.
+
+All imported fields are untrusted and validated before persistence. Drafts are owner-scoped, private, quota-limited, and retain source attribution, extraction warnings, and confidence. Web-session routes allow only that owner to list, edit, discard, or accept a draft. Acceptance creates a private recipe and marks the draft consumed in one SQLite transaction, preventing duplicate acceptance. The owner must use the normal recipe workflow for any later publication.
+
+## Public profile boundary
+
+OIDC email, display name, issuer, and subject are private. Public recipe DTOs contain a nullable opt-in nickname and an `isOwner` flag instead of the recipe owner's UUID. Null is the stable anonymous state; localized anonymous labels exist only in the UI. Recipe queries join the current nickname dynamically so a profile change updates prior public recipes without rewriting recipe rows.

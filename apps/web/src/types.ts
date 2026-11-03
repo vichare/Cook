@@ -4,6 +4,8 @@ export interface User {
   id: string
   email: string
   displayName: string
+  nickname: string | null
+  onboardingCompleted: boolean
 }
 
 export interface Ingredient {
@@ -13,13 +15,23 @@ export interface Ingredient {
 
 export interface Recipe {
   id: string
-  ownerId: string
+  isOwner: boolean
+  authorNickname: string | null
   title: string
   description: string
   instructions: string
   visibility: 'private' | 'public'
   ingredients: Ingredient[]
   isFavorite: boolean
+  source: RecipeSource | null
+}
+
+export interface RecipeSource {
+  url: string
+  title: string | null
+  author: string | null
+  warnings: string[]
+  confidence: number | null
 }
 
 export interface PantryItem {
@@ -45,4 +57,38 @@ export interface Recommendation {
   missing: string[]
   reasons: string[]
   score: number
+}
+
+export interface ImportToken {
+  id: string
+  name: string
+  prefix: string
+  scope: 'recipes:import'
+  createdAt: string
+  lastUsedAt: string | null
+  expiresAt: string | null
+  revokedAt: string | null
+}
+
+export interface CreatedImportToken {
+  token: ImportToken
+  secret: string
+}
+
+export interface ImportDraft {
+  id: string
+  sourceUrl: string
+  sourceTitle: string | null
+  sourceAuthor: string | null
+  title: string
+  description: string
+  instructions: string
+  ingredients: Ingredient[]
+  warnings: string[]
+  confidence: number | null
+  status: 'draft' | 'consumed' | 'discarded'
+  acceptedRecipeId: string | null
+  reviewUrl: string
+  createdAt: string
+  updatedAt: string
 }

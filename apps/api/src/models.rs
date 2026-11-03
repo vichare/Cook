@@ -6,6 +6,14 @@ pub struct User {
     pub id: String,
     pub email: String,
     pub display_name: String,
+    pub nickname: Option<String>,
+    pub onboarding_completed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileInput {
+    pub nickname: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -37,13 +45,27 @@ fn private_visibility() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct Recipe {
     pub id: String,
+    #[serde(skip_serializing)]
     pub owner_id: String,
+    pub is_owner: bool,
+    pub author_nickname: Option<String>,
     pub title: String,
     pub description: String,
     pub instructions: String,
     pub visibility: String,
     pub ingredients: Vec<IngredientInput>,
     pub is_favorite: bool,
+    pub source: Option<RecipeSource>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeSource {
+    pub url: String,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub warnings: Vec<String>,
+    pub confidence: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -131,4 +153,35 @@ pub fn normalize_ingredient(value: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+pub fn normalize_nickname(value: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > 40 {
+        return Err("nickname must be at most 40 characters");
+    }
+    let mut previous_space = false;
+    for character in value.chars() {
+        if character.is_control() {
+            return Err("nickname cannot contain control characters");
+        }
+        if character.is_whitespace() && character != ' ' {
+            return Err("nickname can only use regular spaces as whitespace");
+        }
+        if character == ' ' {
+            if previous_space {
+                return Err("nickname cannot contain repeated spaces");
+            }
+            previous_space = true;
+        } else {
+            previous_space = false;
+        }
+    }
+    Ok(Some(value.to_string()))
 }

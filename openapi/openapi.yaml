@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cook API
-  version: 0.1.0
+  version: 0.2.0
 servers:
   - url: https://cook.vichare.net
 paths:
@@ -18,6 +18,25 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/User" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/settings/profile:
+    put:
+      description: Updates the authenticated user's opt-in public nickname and completes profile onboarding. A null nickname is the locale-independent anonymous state.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProfileInput" }
+      responses:
+        "200":
+          description: Updated private current-user profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { description: JSON shape contains unsupported or invalid fields }
   /api/auth/config:
     get:
       responses:
@@ -183,9 +202,184 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Recommendation" }
+  /api/settings/import-tokens:
+    get:
+      description: Lists non-secret metadata for the authenticated user's import tokens. Token secrets are never returned.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Import token metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ImportToken" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      description: Creates a token with the fixed recipes:import scope. The secret is returned exactly once.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateImportTokenInput" }
+      responses:
+        "201":
+          description: One-time token secret and persistent metadata
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreatedImportToken" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { description: JSON shape contains unsupported or invalid fields }
+  /api/settings/import-tokens/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ImportTokenId"
+    delete:
+      description: Revokes an import token owned by the authenticated user.
+      security:
+        - sessionCookie: []
+      responses:
+        "204": { description: Token revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Missing or not owned }
+  /api/import/drafts:
+    post:
+      description: Token-only endpoint used by the official AI-client skill. The owner is derived from the token; the server does not fetch sourceUrl. Creates a private review draft, not a recipe.
+      security:
+        - importBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImportDraftSubmission" }
+            examples:
+              browserExtraction:
+                value:
+                  schemaVersion: "1.0"
+                  sourceUrl: https://example.com/recipes/tomato-pasta
+                  sourceTitle: Tomato pasta
+                  sourceAuthor: Example Kitchen
+                  title: Tomato pasta
+                  description: A concise summary rewritten from the source.
+                  ingredients:
+                    - name: pasta
+                      quantityNote: 200 g
+                    - name: tomato
+                      quantityNote: 3
+                  steps:
+                    - Boil the pasta until tender.
+                    - Cook the tomatoes into a sauce and combine.
+                  warnings:
+                    - The source did not specify the amount of salt.
+                  confidence: 0.86
+      responses:
+        "201":
+          description: Private draft ready for authenticated review
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportDraft" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { description: Missing, invalid, expired, revoked, or incorrectly scoped import token }
+        "429": { description: Per-token rate limit or per-account active-draft quota exceeded }
+        "422": { description: JSON shape contains unsupported or invalid fields }
+  /api/import-drafts:
+    get:
+      description: Lists the authenticated user's own import drafts.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Owner-scoped drafts
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ImportDraft" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/import-drafts/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ImportDraftId"
+    get:
+      description: Returns one import draft owned by the authenticated user.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Import draft
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportDraft" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Missing or not owned }
+    put:
+      description: Edits a pending import draft owned by the authenticated user.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImportDraftUpdate" }
+      responses:
+        "200":
+          description: Updated draft
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportDraft" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Missing or not owned }
+        "409": { description: Draft has already been consumed or discarded }
+        "422": { description: JSON shape contains unsupported or invalid fields }
+    delete:
+      description: Discards a pending import draft owned by the authenticated user.
+      security:
+        - sessionCookie: []
+      responses:
+        "204": { description: Draft discarded }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Missing, not owned, or no longer pending }
+  /api/import-drafts/{id}/accept:
+    parameters:
+      - $ref: "#/components/parameters/ImportDraftId"
+    post:
+      description: Transactionally creates a private recipe and consumes the draft exactly once.
+      security:
+        - sessionCookie: []
+      responses:
+        "201":
+          description: Private recipe created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Recipe" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Missing or not owned }
+        "409": { description: Draft has already been consumed or discarded }
 components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-cook_session
+    importBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: cook_imp
   parameters:
     RecipeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ImportTokenId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ImportDraftId:
       name: id
       in: path
       required: true
@@ -193,6 +387,11 @@ components:
   responses:
     Unauthorized:
       description: Host-only Cook session is absent or invalid
+    ValidationError:
+      description: Request failed server-side validation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
   requestBodies:
     RecipeInput:
       required: true
@@ -202,14 +401,26 @@ components:
   schemas:
     User:
       type: object
-      required: [id, email, displayName]
+      description: Private current-user DTO. It is never embedded as another recipe author's public profile.
+      required: [id, email, displayName, nickname, onboardingCompleted]
       properties:
         id: { type: string }
         email: { type: string, format: email }
         displayName: { type: string }
+        nickname: { type: [string, "null"], maxLength: 40 }
+        onboardingCompleted: { type: boolean }
+    ProfileInput:
+      type: object
+      additionalProperties: false
+      required: [nickname]
+      properties:
+        nickname:
+          type: [string, "null"]
+          maxLength: 40
+          description: Null selects anonymous. Values are trimmed and may not contain control characters, unusual whitespace, or repeated spaces.
     Ingredient:
       type: object
-      required: [name, quantityNote]
+      required: [name]
       properties:
         name: { type: string }
         quantityNote: { type: string }
@@ -229,11 +440,32 @@ components:
       allOf:
         - $ref: "#/components/schemas/RecipeInput"
         - type: object
-          required: [id, ownerId, isFavorite]
+          required: [id, isOwner, authorNickname, isFavorite, source]
           properties:
             id: { type: string, format: uuid }
-            ownerId: { type: string }
+            isOwner: { type: boolean }
+            authorNickname:
+              type: [string, "null"]
+              description: Opt-in public nickname. Null must be rendered as the locale's anonymous label.
             isFavorite: { type: boolean }
+            source:
+              oneOf:
+                - $ref: "#/components/schemas/RecipeSource"
+                - type: "null"
+    RecipeSource:
+      type: object
+      required: [url, title, author, warnings, confidence]
+      properties:
+        url: { type: string, format: uri }
+        title: { type: [string, "null"] }
+        author: { type: [string, "null"] }
+        warnings:
+          type: array
+          items: { type: string }
+        confidence:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
     PantryItemInput:
       type: object
       required: [name, status, quantityNote]
@@ -275,3 +507,108 @@ components:
         missing: { type: array, items: { type: string } }
         reasons: { type: array, items: { type: string } }
         score: { type: integer }
+    CreateImportTokenInput:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        expiresInDays:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 365
+    ImportToken:
+      type: object
+      required: [id, name, prefix, scope, createdAt, lastUsedAt, expiresAt, revokedAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string, description: Non-secret display prefix }
+        scope: { type: string, const: "recipes:import" }
+        createdAt: { type: string, format: date-time }
+        lastUsedAt: { type: [string, "null"], format: date-time }
+        expiresAt: { type: [string, "null"], format: date-time }
+        revokedAt: { type: [string, "null"], format: date-time }
+    CreatedImportToken:
+      type: object
+      required: [token, secret]
+      properties:
+        token: { $ref: "#/components/schemas/ImportToken" }
+        secret:
+          type: string
+          writeOnly: true
+          description: Returned once. Cook stores only its digest.
+    ImportDraftSubmission:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, sourceUrl, title, ingredients, steps]
+      properties:
+        schemaVersion: { type: string, const: "1.0" }
+        sourceUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Must use HTTP or HTTPS and include a host. Cook does not fetch it.
+        sourceTitle: { type: [string, "null"], maxLength: 200 }
+        sourceAuthor: { type: [string, "null"], maxLength: 200 }
+        title: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, maxLength: 2000, default: "" }
+        ingredients:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: "#/components/schemas/Ingredient" }
+        steps:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { type: string, minLength: 1, maxLength: 2000 }
+        warnings:
+          type: array
+          maxItems: 20
+          items: { type: string, minLength: 1, maxLength: 500 }
+        confidence:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+    ImportDraftUpdate:
+      type: object
+      additionalProperties: false
+      required: [title, description, instructions, ingredients]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        instructions: { type: string, minLength: 1, maxLength: 20000 }
+        ingredients:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: "#/components/schemas/Ingredient" }
+    ImportDraft:
+      allOf:
+        - $ref: "#/components/schemas/ImportDraftUpdate"
+        - type: object
+          required: [id, sourceUrl, sourceTitle, sourceAuthor, warnings, confidence, status, acceptedRecipeId, reviewUrl, createdAt, updatedAt]
+          properties:
+            id: { type: string, format: uuid }
+            sourceUrl: { type: string, format: uri }
+            sourceTitle: { type: [string, "null"] }
+            sourceAuthor: { type: [string, "null"] }
+            warnings:
+              type: array
+              items: { type: string }
+            confidence:
+              type: [number, "null"]
+              minimum: 0
+              maximum: 1
+            status: { type: string, enum: [draft, consumed, discarded] }
+            acceptedRecipeId: { type: [string, "null"], format: uuid }
+            reviewUrl: { type: string }
+            createdAt: { type: string, format: date-time }
+            updatedAt: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error: { type: string }
+        message: { type: string }
