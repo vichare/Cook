@@ -94,7 +94,7 @@ exit 0
 EOF
     cat >"$fixture/bin/curl" <<'EOF'
 #!/bin/sh
-exit 1
+printf '%s\n' '<!doctype html><title>Cook</title>'
 EOF
     cat >"$fixture/bin/sleep" <<'EOF'
 #!/bin/sh

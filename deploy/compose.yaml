@@ -22,7 +22,7 @@ services:
     ports:
       - "${COOK_HOST_HTTP_ADDRESS:-127.0.0.1:18080}:8080"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      test: ["CMD-SHELL", "[ \"$(curl -fsS http://127.0.0.1:8080/health)\" = ok ]"]
       interval: 15s
       timeout: 5s
       retries: 4

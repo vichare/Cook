@@ -59,7 +59,9 @@ The forced hook accepts only `deploy vX.Y.Z`. It logs into GHCR with the workflo
 2. pulls the immutable tag;
 3. creates and integrity-checks an online SQLite backup;
 4. starts the new release;
-5. waits up to 60 seconds for `http://127.0.0.1:18080/health`.
+5. waits up to 60 seconds for `http://127.0.0.1:18080/health` to return the exact API body `ok`.
+
+The image nginx configuration proxies exact `/health` requests to the API rather than the SPA fallback. The entrypoint supervises both the API and nginx; if either exits, it terminates and reaps the other process so the container exits and its restart policy can apply.
 
 If startup or health fails, the script restores the previous `.env`, stops the failed container, and restores the pre-upgrade database. It restarts the previous image only when `.env` contained a previous `COOK_IMAGE`. On a failed first deployment there is no prior release to start, so the failed container remains stopped and the hook reports that host bootstrap or configuration must be corrected before retrying. Review the reported deployment log and verify health after any automatic rollback.
 
@@ -75,14 +77,14 @@ For a manual restore, change to the configured production deployment directory a
 flock .maintenance.lock docker compose -f compose.yaml stop cook
 ./restore.sh backups/cook-YYYYMMDDTHHMMSSZ.db
 docker compose -f compose.yaml up -d
-curl -fsS http://127.0.0.1:18080/health
+test "$(curl -fsS http://127.0.0.1:18080/health)" = ok
 ```
 
 Store off-host encrypted copies and regularly test restoration. Deployment automation does not configure off-host transport.
 
 ## Post-deploy checks
 
-- `curl -fsS https://cook.vichare.net/health`
+- `test "$(curl -fsS https://cook.vichare.net/health)" = ok`
 - complete real Google login and current/all-device logout
 - verify private recipe and pantry isolation with two accounts
 - verify READY/VERIFY/SHOP/BLOCKED recommendations

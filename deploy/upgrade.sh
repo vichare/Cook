@@ -95,7 +95,12 @@ new_release_started=1
 docker compose -f compose.yaml up -d --no-deps cook
 
 attempt=0
-until curl -fsS -o /dev/null http://127.0.0.1:18080/health; do
+while :; do
+    health_response=""
+    if health_response="$(curl -fsS http://127.0.0.1:18080/health)" &&
+        [ "$health_response" = "ok" ]; then
+        break
+    fi
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 30 ]; then
         docker compose -f compose.yaml logs --tail=100 cook >&2 || true

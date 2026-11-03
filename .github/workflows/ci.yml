@@ -51,7 +51,14 @@ jobs:
           shellcheck deploy/*.sh deploy/tests/*.sh
           for script in deploy/*.sh deploy/tests/*.sh; do sh -n "$script"; done
       - name: Test deployment scripts
-        run: deploy/tests/upgrade_test.sh
+        run: |
+          deploy/tests/upgrade_test.sh
+          deploy/tests/image_runtime_test.sh
+      - name: Validate image nginx configuration
+        run: |
+          docker run --rm \
+            -v "$PWD/deploy/image-nginx.conf:/etc/nginx/nginx.conf:ro" \
+            nginx:1.28-bookworm nginx -t
       - name: Validate production Compose
         env:
           COOK_IMAGE: ghcr.io/vichare/cook:v0.0.0
