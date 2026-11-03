@@ -57,6 +57,7 @@ jobs:
       - name: Validate image nginx configuration
         run: |
           docker run --rm \
+            --tmpfs /run/nginx \
             -v "$PWD/deploy/image-nginx.conf:/etc/nginx/nginx.conf:ro" \
             nginx:1.28-bookworm nginx -t
       - name: Validate production Compose
