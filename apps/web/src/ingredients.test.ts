@@ -19,6 +19,8 @@ describe('ingredient input helpers', () => {
     expect(expirationShortcut(1, januaryEnd)).toBe('2026-02-01')
     expect(expirationShortcut(7, januaryEnd)).toBe('2026-02-07')
     expect(oneMonthAfter(januaryEnd)).toBe('2026-02-28')
+    expect(oneMonthAfter(new Date(2028, 0, 31, 15, 30))).toBe('2028-02-29')
+    expect(expirationShortcut(1, new Date(2028, 1, 28, 23, 30))).toBe('2028-02-29')
   })
 
   it('describes expiration status with text rather than color alone', () => {

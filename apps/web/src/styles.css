@@ -51,7 +51,7 @@ h2 { margin: .3rem 0 .6rem; }
 .card-list { display: grid; gap: 1rem; }
 .recipe-card, .recommendation-card, .detail-card { padding: 1.5rem; }
 .card-heading { display: flex; justify-content: space-between; align-items: start; gap: 1rem; }
-.status { display: inline-block; border-radius: 999px; padding: .35rem .7rem; font-size: .875rem; font-weight: 850; letter-spacing: .04em; text-transform: uppercase; }
+.status { display: inline-block; border-radius: 999px; padding: .35rem .7rem; font-size: 1.125rem; font-weight: 850; letter-spacing: .04em; text-transform: uppercase; }
 .ready { background: #dcefdc; color: #1d5b31; }
 .verify { background: #fff0bf; color: #775500; }
 .shop { background: #f9dfca; color: #7e3c11; }
@@ -66,8 +66,11 @@ input, textarea, select { width: 100%; min-height: 44px; border: 1px solid #7670
 fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .ingredient-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: .75rem; margin-bottom: .75rem; align-items: start; }
 .field-error, .error { color: var(--danger); }
+.error-summary { padding: 1rem; border: 2px solid var(--danger); border-radius: .75rem; background: #fff4f1; }
+.error-summary:focus { outline: 3px solid var(--focus); outline-offset: 3px; }
 .pantry-table { border: 1px solid var(--line); border-radius: 1rem; overflow: hidden; background: var(--cream); }
 .pantry-row { padding: 1rem; display: grid; grid-template-columns: minmax(140px, 1fr) auto minmax(150px, 1fr) minmax(190px, 1.2fr) auto auto; gap: 1rem; align-items: center; border-bottom: 1px solid var(--line); }
+.pantry-row > strong, .pantry-row > span { font-size: 1.125rem; }
 .pantry-row:last-child { border-bottom: 0; }
 .pre-line { white-space: pre-line; line-height: 1.65; }
 .state-panel { width: min(700px, calc(100% - 2rem)); margin: 4rem auto; padding: 2rem; text-align: center; border: 1px dashed #aaa394; border-radius: 1rem; }
@@ -96,6 +99,7 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .field-help, .combobox-status { margin: 0; color: #435248; font-size: .95rem; }
 .expiry-warning { color: #762f2a; font-weight: 750; }
 .ingredient-combobox { position: relative; display: grid; gap: .42rem; }
+.ingredient-undo { justify-self: start; }
 .ingredient-listbox { position: absolute; z-index: 15; top: calc(100% - 1.4rem); left: 0; right: 0; max-height: 19rem; overflow: auto; padding: .4rem; border: 2px solid var(--forest); border-radius: .75rem; background: white; box-shadow: var(--shadow); }
 .ingredient-option { width: 100%; min-height: 52px; padding: .7rem; border: 0; border-bottom: 1px solid var(--line); background: white; color: inherit; text-align: left; display: grid; gap: .15rem; cursor: pointer; }
 .ingredient-option:last-child { border-bottom: 0; }

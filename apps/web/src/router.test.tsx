@@ -127,6 +127,16 @@ describe('pantry confirmation', () => {
       fireEvent.click(screen.getByRole('button', { name: 'No expiration date' }))
       expect(onChange).toHaveBeenLastCalledWith(null)
     })
+
+    it('warns before saving a past date without clearing or changing pantry status', () => {
+      render(
+        <ExpirationEditor value="2026-01-30" onChange={() => undefined} now={new Date(2026, 0, 31, 12)} />,
+      )
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'This date is in the past. You can still save it',
+      )
+      expect(screen.getByLabelText('Choose a calendar date')).toHaveValue('2026-01-30')
+    })
   })
 })
 

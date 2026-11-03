@@ -9,7 +9,7 @@ import {
   useNavigate,
 } from '@tanstack/react-router'
 import { QueryClient, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useFieldArray, useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { ApiError, api } from './api'
@@ -603,6 +603,7 @@ type RecipeForm = z.infer<typeof recipeSchema>
 function RecipeEditor({ recipe }: { recipe?: Recipe }) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const errorSummaryRef = useRef<HTMLDivElement>(null)
   const form = useForm<RecipeForm>({
     resolver: zodResolver(recipeSchema),
     defaultValues: recipe ?? {
@@ -621,12 +622,39 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
       await navigate({ to: '/recipes/$recipeId', params: { recipeId: saved.id } })
     },
   })
+  const ingredientErrors = Array.isArray(form.formState.errors.ingredients)
+    ? form.formState.errors.ingredients
+    : []
+  const validationMessages = [
+    form.formState.errors.title?.message,
+    ...ingredientErrors.map((error, index) =>
+      error?.name?.message ? `Ingredient ${index + 1}: ${error.name.message}` : undefined,
+    ),
+  ].filter((message): message is string => Boolean(message))
   return (
-    <form className="editor-form" onSubmit={form.handleSubmit((value) => save.mutate(value))}>
+    <form
+      className="editor-form"
+      onSubmit={form.handleSubmit(
+        (value) => save.mutate(value),
+        () => window.requestAnimationFrame(() => errorSummaryRef.current?.focus()),
+      )}
+    >
+      {validationMessages.length > 0 && (
+        <div className="error-summary" role="alert" tabIndex={-1} ref={errorSummaryRef}>
+          <strong>Check the highlighted fields.</strong>
+          <ul>
+            {validationMessages.map((message) => <li key={message}>{message}</li>)}
+          </ul>
+        </div>
+      )}
       <label>
         Title
-        <input {...form.register('title')} />
-        <FieldError message={form.formState.errors.title?.message} />
+        <input
+          {...form.register('title')}
+          aria-invalid={Boolean(form.formState.errors.title)}
+          aria-describedby={form.formState.errors.title ? 'recipe-title-error' : undefined}
+        />
+        <FieldError id="recipe-title-error" message={form.formState.errors.title?.message} />
       </label>
       <label>
         Description
@@ -666,8 +694,17 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
                   }
                 }}
                 placeholder="Type or paste ingredients"
+                invalid={Boolean(form.formState.errors.ingredients?.[index]?.name)}
+                describedBy={
+                  form.formState.errors.ingredients?.[index]?.name
+                    ? `recipe-ingredient-${index}-error`
+                    : undefined
+                }
               />
-              <FieldError message={form.formState.errors.ingredients?.[index]?.name?.message} />
+              <FieldError
+                id={`recipe-ingredient-${index}-error`}
+                message={form.formState.errors.ingredients?.[index]?.name?.message}
+              />
             </div>
             <label>
               <span className="sr-only">Quantity note for ingredient {index + 1}</span>
@@ -829,9 +866,11 @@ export function ExpirationEditor({
   onChange: (value: string | null) => void
   now?: Date
 }) {
+  const today = localDateValue(now)
+  const isPast = value !== null && value < today
   const options = [
     ['No expiration date', null],
-    ['Today', localDateValue(now)],
+    ['Today', today],
     ['Tomorrow', expirationShortcut(1, now)],
     ['One week', expirationShortcut(7, now)],
     ['One month', oneMonthAfter(now)],
@@ -857,6 +896,11 @@ export function ExpirationEditor({
         ))}
       </div>
       <p className="field-help">Dates use your calendar day and do not include a time zone.</p>
+      {isPast && (
+        <p className="expiry-warning" role="alert">
+          This date is in the past. You can still save it, but Cook will require verification before recommending this ingredient.
+        </p>
+      )}
     </fieldset>
   )
 }
@@ -1521,8 +1565,8 @@ function IngredientSummary({ label, items }: { label: string; items: string[] })
   )
 }
 
-function FieldError({ message }: { message?: string }) {
-  return message ? <span className="field-error">{message}</span> : null
+function FieldError({ id, message }: { id?: string; message?: string }) {
+  return message ? <span className="field-error" id={id}>{message}</span> : null
 }
 
 function ErrorText({ error }: { error: unknown }) {

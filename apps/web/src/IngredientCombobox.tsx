@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import { api } from './api'
 import { splitIngredientList } from './ingredients'
 import type { IngredientReference, IngredientSuggestion } from './types'
@@ -19,6 +19,8 @@ export function IngredientCombobox({
   onPasteList,
   onCommit,
   placeholder,
+  invalid,
+  describedBy,
 }: {
   label: string
   value: IngredientReference
@@ -26,24 +28,38 @@ export function IngredientCombobox({
   onPasteList?: (values: string[]) => void
   onCommit?: (value: IngredientReference) => void
   placeholder?: string
+  invalid?: boolean
+  describedBy?: string
 }) {
   const id = useId()
   const listId = `${id}-listbox`
   const statusId = `${id}-status`
   const [open, setOpen] = useState(false)
   const [activeIndex, setActiveIndex] = useState(-1)
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(value.name.trim()), 150)
+    return () => window.clearTimeout(timer)
+  }, [value.name])
   const suggestions = useQuery({
-    queryKey: ['ingredient-suggestions', value.name],
-    queryFn: () => api.ingredientSuggestions(value.name),
-    enabled: value.name.trim().length > 0,
+    queryKey: ['ingredient-suggestions', debouncedQuery],
+    queryFn: () => api.ingredientSuggestions(debouncedQuery),
+    enabled: debouncedQuery.length > 0,
     staleTime: 30_000,
   })
-  const items = suggestions.data ?? []
+  const queryReady = debouncedQuery === value.name.trim()
+  const items = queryReady ? suggestions.data ?? [] : []
   const optionCount = items.length + 1
   const selected = useMemo(
     () => items.find((item) => item.canonicalIngredientId === value.canonicalIngredientId),
     [items, value.canonicalIngredientId],
   )
+  const activeStatus =
+    activeIndex >= 0
+      ? activeIndex < items.length
+        ? `Option ${activeIndex + 1} of ${optionCount}: ${value.name} → ${items[activeIndex].displayName}. ${reasonText[items[activeIndex].reason]}`
+        : `Option ${optionCount} of ${optionCount}: keep ${value.name} as unresolved input.`
+      : null
 
   function choose(suggestion: IngredientSuggestion) {
     const next = {
@@ -63,9 +79,12 @@ export function IngredientCombobox({
         id={id}
         role="combobox"
         aria-autocomplete="list"
+        aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={listId}
-        aria-describedby={statusId}
+        aria-describedby={[statusId, describedBy].filter(Boolean).join(' ')}
+        aria-invalid={invalid || undefined}
+        aria-busy={!queryReady || suggestions.isFetching}
         aria-activedescendant={activeIndex >= 0 ? `${id}-option-${activeIndex}` : undefined}
         autoComplete="off"
         placeholder={placeholder}
@@ -111,7 +130,8 @@ export function IngredientCombobox({
         }}
       />
       <div id={statusId} className="combobox-status" aria-live="polite">
-        {suggestions.isFetching
+        {activeStatus ??
+        (!queryReady || suggestions.isFetching
           ? 'Looking for ingredient matches.'
           : selected
             ? `Matched to ${selected.displayName}.`
@@ -121,8 +141,21 @@ export function IngredientCombobox({
                 ? `${items.length} suggestion${items.length === 1 ? '' : 's'} available.`
                 : value.name.trim()
                   ? 'No close catalog matches. You can keep your entry.'
-                  : ''}
+                  : '')}
       </div>
+      {value.canonicalIngredientId && (
+        <button
+          type="button"
+          className="button ghost ingredient-undo"
+          onClick={() => {
+            onChange({ name: value.name, canonicalIngredientId: null })
+            setOpen(value.name.trim().length > 0)
+            setActiveIndex(-1)
+          }}
+        >
+          Undo selected match
+        </button>
+      )}
       {open && value.name.trim() && (
         <div id={listId} role="listbox" className="ingredient-listbox" aria-label={`${label} suggestions`}>
           {items.map((item, index) => (
@@ -136,7 +169,9 @@ export function IngredientCombobox({
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => choose(item)}
             >
-              <strong>{item.displayName}</strong>
+              <strong>
+                {value.name} → {item.displayName}
+              </strong>
               <span>{reasonText[item.reason]}</span>
               {item.matchedText !== item.displayName && <small>Matched “{item.matchedText}”</small>}
             </button>
@@ -156,7 +191,7 @@ export function IngredientCombobox({
             }}
           >
             <strong>Keep “{value.name}” as entered</strong>
-            <span>Do not bind this entry to a suggestion.</span>
+            <span>Leave it unresolved or create it as a new ingredient; do not bind this entry to a suggestion.</span>
           </button>
           {suggestions.error && <p className="error">Suggestions are unavailable. Your typed value is preserved.</p>}
         </div>

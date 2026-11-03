@@ -35,7 +35,7 @@ Development uses the explicit capture Email OTP sender and loopback WebAuthn set
 - `docs`: architecture and operations
 - `deploy/nginx`: host reverse-proxy example
 
-See `docs/architecture.md` and `docs/deployment.md` for design and deployment details. Future product scope and unresolved decisions are tracked in `docs/product-roadmap.md`.
+See `docs/architecture.md` and `docs/deployment.md` for design and deployment details. Future product scope and unresolved decisions are tracked in `docs/product-roadmap.md`. The manual assistive-technology, zoom, contrast, performance, and typo-benchmark release gates are in `docs/accessibility-release-checklist.md`.
 
 ## AI-client recipe imports
 

@@ -22,6 +22,8 @@ Cook targets WCAG 2.2 AA, supports 200% text zoom and reflow, uses at least 16px
 
 Autocomplete follows the combobox/listbox ARIA pattern with keyboard navigation, Enter selection, Escape dismissal, result-count and selection announcements, explicit labels, and no hover-only behavior.
 
+Automated tests cover representative normalization, delimiter, high-risk non-substitution, date-boundary, and keyboard cases. They do not yet justify a broad Chinese/English Top-3 typo-quality claim or production-catalog latency claim. The assistive-technology matrix, 400%/320px reflow check, measured contrast, production-sized p95 latency, timezone boundary smoke tests, and any future typo benchmark are explicit release gates in `accessibility-release-checklist.md`.
+
 ### Public recipe nickname
 
 Google email, display name, issuer, and subject remain private authentication data and are never reused automatically as a public author identity. A user may opt into a non-unique Unicode nickname, clear it later, or remain in the language-independent anonymous state represented by a null nickname. The UI renders the anonymous label for the current locale.

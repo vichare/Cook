@@ -55,11 +55,18 @@ describe('ingredient combobox', () => {
     const input = screen.getByRole('combobox', { name: 'Ingredient' })
     fireEvent.focus(input)
     expect(input).toHaveAttribute('aria-expanded', 'true')
+    expect(input).toHaveAttribute('aria-haspopup', 'listbox')
+    expect(input).toHaveAttribute('aria-busy', 'true')
+    expect(ingredientSuggestions).not.toHaveBeenCalled()
     await screen.findByRole('option', { name: /Tomato/ })
+    expect(ingredientSuggestions).toHaveBeenCalledTimes(1)
+    expect(input).toHaveAttribute('aria-busy', 'false')
     expect(screen.getByText('1 suggestion available.')).toHaveAttribute('aria-live', 'polite')
 
     fireEvent.keyDown(input, { key: 'ArrowDown' })
     expect(input).toHaveAttribute('aria-activedescendant')
+    expect(screen.getByText(/Option 1 of 2: tom → Tomato/)).toBeInTheDocument()
+    expect(onCommit).not.toHaveBeenCalled()
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(onChange).toHaveBeenLastCalledWith({
       name: 'tom',
@@ -86,5 +93,14 @@ describe('ingredient combobox', () => {
       clipboardData: { getData: () => 'Milk，青菜；Rice\nmilk' },
     })
     expect(onPasteList).toHaveBeenCalledWith(['Milk', '青菜', 'Rice'])
+  })
+
+  it('lets the user undo an explicit canonical selection', async () => {
+    const { onChange } = renderCombobox({
+      value: { name: 'Tomato', canonicalIngredientId: 'tomato-id' },
+    })
+    await screen.findByRole('button', { name: 'Undo selected match' })
+    fireEvent.click(screen.getByRole('button', { name: 'Undo selected match' }))
+    expect(onChange).toHaveBeenCalledWith({ name: 'Tomato', canonicalIngredientId: null })
   })
 })
