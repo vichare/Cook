@@ -28,6 +28,12 @@ Recipes, import drafts, AI management payloads, and pending revisions may carry 
 
 These fields do not affect recommendation scores. Recipe-specific scaling by servings or primary-ingredient weight is future scope and remains **unverified**; Cook does not assume calories scale linearly.
 
+### Safe Markdown recipe editing
+
+Recipe descriptions and instructions remain Markdown source strings; Cook never stores rendered HTML. The requested MDXEditor spike confirmed React 19 peer support, but the editor was not adopted: its 659 KB unpacked package brings a broad Lexical, CodeMirror, MDX/JSX, directive, and code-oriented dependency surface that Cook would then need to disable for this constrained recipe editor. That cost and security surface were disproportionate to the required standard-Markdown subset.
+
+Cook instead uses an accessible source editor with text-labeled 44px formatting controls and a live safe preview. Rendering uses `react-markdown` with GFM tables, a strict element allowlist, raw HTML disabled, embedded images excluded, and HTTP/HTTPS-only links rendered with `noopener noreferrer`. The fallback passed React 19 StrictMode tests for Chinese, emoji, nested lists, tables, links, legacy plain text, malformed input, and source/preview synchronization. Its measured production bundle changed from 539.41 KB / 168.74 KB gzip before Markdown support to 708.91 KB / 220.40 KB gzip; route-level code splitting remains a future performance improvement rather than weakening the renderer.
+
 ### Older-adult accessibility baseline
 
 Cook targets WCAG 2.2 AA, supports 200% text zoom and reflow, uses at least 16px default body text and 44-by-44 CSS-pixel controls, provides visible keyboard focus and high contrast, and never communicates status only by color. Important forms retain entered values on recoverable errors, use plain-language recovery guidance, and do not impose short automatic timeouts. Destructive credential, token, and import-draft actions require confirmation.

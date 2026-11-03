@@ -1026,8 +1026,14 @@ components:
       required: [title, description, instructions, visibility, ingredients]
       properties:
         title: { type: string, minLength: 1, maxLength: 120 }
-        description: { type: string, maxLength: 2000 }
-        instructions: { type: string, maxLength: 20000 }
+        description:
+          type: string
+          maxLength: 2000
+          description: Markdown source. Raw HTML and embedded images are not rendered by Cook.
+        instructions:
+          type: string
+          maxLength: 20000
+          description: Markdown source. Raw HTML and embedded images are not rendered by Cook.
         visibility: { type: string, enum: [private, public], default: private }
         difficulty:
           type: [integer, "null"]

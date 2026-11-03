@@ -106,6 +106,17 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .recipe-metadata div { padding: .6rem .8rem; border: 1px solid var(--line); border-radius: .75rem; background: #f7f3e8; }
 .recipe-metadata dt { font-weight: 700; }
 .recipe-metadata dd { margin: .2rem 0 0; }
+.markdown-editor { display: grid; gap: .75rem; }
+.markdown-toolbar { display: flex; flex-wrap: wrap; gap: .5rem; }
+.markdown-toolbar .button { min-height: 44px; }
+.markdown-workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
+.markdown-workspace > div { min-width: 0; }
+.markdown-workspace textarea { width: 100%; margin-top: .5rem; }
+.markdown-preview { min-height: 12rem; padding: 1rem; border: 1px solid var(--line); border-radius: .75rem; background: #fff; overflow-wrap: anywhere; }
+.safe-markdown { overflow-wrap: anywhere; }
+.safe-markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+.safe-markdown th, .safe-markdown td { padding: .5rem; border: 1px solid var(--line); }
+.safe-markdown a { word-break: break-word; }
 .secret-once code { overflow-wrap: anywhere; padding: .8rem; background: white; border-radius: .5rem; }
 .secret-once section { min-width: 0; padding-top: .75rem; border-top: 1px solid var(--line); display: grid; gap: .65rem; }
 .secret-once a, .secret-once p, .secret-once input { overflow-wrap: anywhere; }
@@ -138,6 +149,7 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
   .metric-grid, .action-grid, .filter-panel, .inline-form, .security-grid { grid-template-columns: 1fr; }
   .page-header { align-items: start; flex-direction: column; }
   .ingredient-row, .pantry-row { grid-template-columns: 1fr; }
+  .markdown-workspace { grid-template-columns: 1fr; }
   .confirmation-sheet { top: auto; bottom: 0; height: auto; max-height: 88vh; border-radius: 1.5rem 1.5rem 0 0; }
 }
 

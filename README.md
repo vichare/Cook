@@ -8,6 +8,8 @@ Ingredient entry uses shared Unicode normalization, multilingual pasted-list spl
 
 Recipes may optionally include a 1–5 difficulty and an estimated total kcal value for the whole recipe. Both remain hidden when unset, flow through import drafts and scoped AI management, and do not affect recommendation scoring.
 
+Recipe descriptions and instructions remain Markdown source. The web editor provides text-labeled formatting controls and a live preview; rendering disables raw HTML and embedded images, allows only a small standard/GFM element set, and accepts only HTTP/HTTPS links.
+
 ## Stack
 
 - React 19, TypeScript strict, Vite, TanStack Router and Query

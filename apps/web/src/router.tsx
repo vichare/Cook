@@ -13,6 +13,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useFieldArray, useForm, type UseFormReturn } from 'react-hook-form'
 import { z } from 'zod'
 import { ApiError, api } from './api'
+import { MarkdownEditor, SafeMarkdown } from './MarkdownEditor'
 import type {
   ImportDraft,
   IngredientReference,
@@ -724,6 +725,7 @@ function RecipeDetailPage() {
                 ))}
               </aside>
             )}
+            {recipe.data.description && <SafeMarkdown value={recipe.data.description} />}
             <h2>{t('recipe.ingredients')}</h2>
             <ul>
               {recipe.data.ingredients.map((ingredient, index) => (
@@ -733,7 +735,11 @@ function RecipeDetailPage() {
               ))}
             </ul>
             <h2>{t('recipe.method')}</h2>
-            <p className="pre-line">{recipe.data.instructions || t('recipe.noInstructions')}</p>
+            {recipe.data.instructions ? (
+              <SafeMarkdown value={recipe.data.instructions} />
+            ) : (
+              <p>{t('recipe.noInstructions')}</p>
+            )}
             {recipe.data.isOwner && <RevisionReview recipeId={recipeId} />}
           </article>
         )}
@@ -816,7 +822,7 @@ function RevisionReview({ recipeId }: { recipeId: string }) {
               ))}
             </ul>
             <h4>{t('recipe.method')}</h4>
-            <p className="pre-line">{revision.instructions}</p>
+            <SafeMarkdown value={revision.instructions} />
           </details>
           <div className="button-row">
             <button
@@ -1059,10 +1065,13 @@ function RecipeEditor({ recipe }: { recipe?: Recipe }) {
         {t('recipe.description')}
         <textarea {...form.register('description')} rows={3} maxLength={2000} />
       </label>
-      <label>
-        {t('recipe.instructions')}
-        <textarea {...form.register('instructions')} rows={8} maxLength={20000} />
-      </label>
+      <MarkdownEditor
+        id="recipe-instructions"
+        label={t('recipe.instructions')}
+        value={form.watch('instructions')}
+        onChange={(instructions) => form.setValue('instructions', instructions, { shouldDirty: true })}
+        maxLength={20000}
+      />
       <label>
         {t('recipe.visibility')}
         <select {...form.register('visibility')}>
@@ -2481,7 +2490,13 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
     <form className="editor-form" onSubmit={form.handleSubmit((value) => save.mutate(value))}>
       <label>{t('recipe.title')}<input {...form.register('title')} /></label>
       <label>{t('recipe.description')}<textarea rows={3} {...form.register('description')} /></label>
-      <label>{t('recipe.instructions')}<textarea rows={10} {...form.register('instructions')} /></label>
+      <MarkdownEditor
+        id="import-instructions"
+        label={t('recipe.instructions')}
+        value={form.watch('instructions')}
+        onChange={(instructions) => form.setValue('instructions', instructions, { shouldDirty: true })}
+        maxLength={20000}
+      />
       <RecipeMetadataFields form={form} />
       <fieldset>
         <legend>{t('recipe.ingredients')}</legend>
