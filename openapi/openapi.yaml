@@ -594,7 +594,7 @@ paths:
         - sessionCookie: []
       parameters:
         - $ref: "#/components/parameters/RecipeIfMatch"
-        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CoverIdempotencyKey"
       requestBody:
         required: true
         content:
@@ -610,6 +610,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe missing or not owned }
         "409": { description: Recipe version changed }
+        "429": { description: Cover mutation rate or active replay-key capacity exceeded }
         "413": { description: Upload, decoded pixels, decoder allocation, or normalized bytes exceed the documented limit }
     put:
       description: Updates alt text and optional source/license/attribution for the authenticated owner's existing cover.
@@ -617,7 +618,7 @@ paths:
         - sessionCookie: []
       parameters:
         - $ref: "#/components/parameters/RecipeIfMatch"
-        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CoverIdempotencyKey"
       requestBody:
         required: true
         content:
@@ -633,13 +634,14 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe or cover missing or not owned }
         "409": { description: Recipe version changed }
+        "429": { description: Cover mutation rate or active replay-key capacity exceeded }
     delete:
       description: Removes the authenticated owner's cover image without deleting the recipe.
       security:
         - sessionCookie: []
       parameters:
         - $ref: "#/components/parameters/RecipeIfMatch"
-        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CoverIdempotencyKey"
       responses:
         "200":
           description: Cover image removed and recipe version incremented
@@ -649,6 +651,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe missing or not owned }
         "409": { description: Recipe version changed }
+        "429": { description: Cover mutation rate or active replay-key capacity exceeded }
   /api/recipe-images/{id}:
     get:
       description: Returns a normalized JPEG by random image ID. Public recipe images require cache revalidation on reuse so unpublish/delete can return 404; private images require the owner session or an owner token with recipes:read and use private, no-store caching.
@@ -995,6 +998,16 @@ components:
       in: header
       required: true
       schema: { type: string, minLength: 8, maxLength: 128 }
+    CoverIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated key in `<unix-seconds>.<random>` form. Exact cover mutation results replay for 24 hours; expired keys return 409 and must be replaced after reloading the recipe version.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: '^[0-9]+\.[A-Za-z0-9_.:-]+$'
     RecipeVersion:
       name: If-Match
       in: header

@@ -390,6 +390,77 @@ describe('shopping list', () => {
       )
     })
 
+    it('rejects an old replay result after a later external body update', async () => {
+      const file = new File(['cover'], 'cover.png', { type: 'image/png' })
+      recipeApi.mockResolvedValueOnce({
+        ...originalRecipe,
+        version: 6,
+        title: 'External body update',
+        coverImage: {
+          ...originalRecipe.coverImage!,
+          id: 'committed-cover',
+          version: 2,
+          altText: coverMetadata.altText,
+        },
+      })
+
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion: 4,
+        coverFile: file,
+        removeCover: false,
+        coverMetadata,
+        coverMutationKey: 'lost-upload-key',
+        acknowledgeVersion: vi.fn(),
+      })).rejects.toEqual(expect.objectContaining({
+        status: 409,
+        code: 'conflict',
+      }))
+      expect(uploadRecipeCover).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      ['metadata update', {
+        ...originalRecipe.coverImage!,
+        id: 'committed-cover',
+        version: 3,
+        altText: 'External metadata',
+      }],
+      ['replacement', {
+        ...originalRecipe.coverImage!,
+        id: 'external-cover',
+        version: 1,
+        altText: coverMetadata.altText,
+      }],
+      ['deletion', null],
+    ])('rejects an old replay result after a later external cover %s', async (_change, currentCover) => {
+      const file = new File(['cover'], 'cover.png', { type: 'image/png' })
+      const acknowledgeVersion = vi.fn()
+      recipeApi.mockResolvedValueOnce({
+        ...originalRecipe,
+        ...editedForm,
+        version: 6,
+        coverImage: currentCover,
+      })
+      uploadRecipeCover.mockResolvedValueOnce({ version: 5 })
+
+      await expect(persistRecipeEdit({
+        value: editedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion: 4,
+        coverFile: file,
+        removeCover: false,
+        coverMetadata,
+        coverMutationKey: 'lost-upload-key',
+        acknowledgeVersion,
+      })).rejects.toEqual(expect.objectContaining({
+        status: 409,
+        code: 'conflict',
+      }))
+      expect(acknowledgeVersion).not.toHaveBeenCalled()
+    })
+
     it('does not accept an external same-metadata cover as the attempted upload', async () => {
       const { ApiError } = await import('./api')
       const file = new File(['my-cover'], 'cover.png', { type: 'image/png' })

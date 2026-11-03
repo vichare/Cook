@@ -22,7 +22,7 @@ use image::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use url::Url;
 use uuid::Uuid;
 
@@ -39,6 +39,12 @@ pub const MAX_PIXELS: u64 = 20_000_000;
 pub const MAX_DIMENSION: u32 = 1_600;
 const MAX_DECODER_DIMENSION: u32 = 10_000;
 const MAX_DECODER_ALLOC: u64 = 128 * 1024 * 1024;
+const COVER_KEY_REPLAY_SECONDS: i64 = 24 * 60 * 60;
+const COVER_KEY_FUTURE_SKEW_SECONDS: i64 = 5 * 60;
+const COVER_RATE_WINDOW_SECONDS: i64 = 60 * 60;
+const COVER_RATE_LIMIT: i64 = 30;
+const MAX_ACTIVE_COVER_MUTATIONS_PER_RECIPE: i64 = 128;
+const COVER_MUTATION_CLEANUP_BATCH: i64 = 256;
 
 #[derive(Clone)]
 pub struct ImageMetadataInput {
@@ -296,7 +302,9 @@ pub(crate) async fn session_upload_image(
     Path(recipe_id): Path<String>,
     multipart: Multipart,
 ) -> AppResult<axum::Json<RecipeVersion>> {
-    let idempotency_key = cover_idempotency_key(&headers)?;
+    let now = Utc::now().timestamp();
+    let idempotency_key = cover_idempotency_key(&headers, now)?;
+    enforce_cover_rate_limit(&state.pool, &user.id, now).await?;
     let expected_version = expected_recipe_version(&headers)?;
     let image = parse_image_multipart(multipart).await?;
     let fingerprint = cover_mutation_fingerprint(
@@ -324,7 +332,8 @@ pub(crate) async fn session_upload_image(
                 .as_bytes(),
         ],
     );
-    let mut transaction = state.pool.begin().await?;
+    let mut transaction = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    cleanup_cover_mutations(&mut transaction, now).await?;
     if let Some(version) = replay_cover_mutation(
         &mut transaction,
         &user.id,
@@ -338,6 +347,7 @@ pub(crate) async fn session_upload_image(
         transaction.commit().await?;
         return Ok(axum::Json(RecipeVersion { version }));
     }
+    enforce_cover_mutation_capacity(&mut transaction, &user.id, &recipe_id, now).await?;
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
             .await?;
@@ -362,10 +372,13 @@ pub(crate) async fn session_delete_image(
     headers: HeaderMap,
     Path(recipe_id): Path<String>,
 ) -> AppResult<axum::Json<RecipeVersion>> {
-    let idempotency_key = cover_idempotency_key(&headers)?;
+    let now = Utc::now().timestamp();
+    let idempotency_key = cover_idempotency_key(&headers, now)?;
+    enforce_cover_rate_limit(&state.pool, &user.id, now).await?;
     let expected_version = expected_recipe_version(&headers)?;
     let fingerprint = cover_mutation_fingerprint("delete", &[]);
-    let mut transaction = state.pool.begin().await?;
+    let mut transaction = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    cleanup_cover_mutations(&mut transaction, now).await?;
     if let Some(version) = replay_cover_mutation(
         &mut transaction,
         &user.id,
@@ -379,6 +392,7 @@ pub(crate) async fn session_delete_image(
         transaction.commit().await?;
         return Ok(axum::Json(RecipeVersion { version }));
     }
+    enforce_cover_mutation_capacity(&mut transaction, &user.id, &recipe_id, now).await?;
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
             .await?;
@@ -404,7 +418,9 @@ pub(crate) async fn session_update_image_metadata(
     Path(recipe_id): Path<String>,
     axum::Json(input): axum::Json<ImageMetadataUpdate>,
 ) -> AppResult<axum::Json<RecipeVersion>> {
-    let idempotency_key = cover_idempotency_key(&headers)?;
+    let now = Utc::now().timestamp();
+    let idempotency_key = cover_idempotency_key(&headers, now)?;
+    enforce_cover_rate_limit(&state.pool, &user.id, now).await?;
     let expected_version = expected_recipe_version(&headers)?;
     let metadata = validate_metadata(
         &input.alt_text,
@@ -433,7 +449,8 @@ pub(crate) async fn session_update_image_metadata(
                 .as_bytes(),
         ],
     );
-    let mut transaction = state.pool.begin().await?;
+    let mut transaction = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    cleanup_cover_mutations(&mut transaction, now).await?;
     if let Some(version) = replay_cover_mutation(
         &mut transaction,
         &user.id,
@@ -447,6 +464,7 @@ pub(crate) async fn session_update_image_metadata(
         transaction.commit().await?;
         return Ok(axum::Json(RecipeVersion { version }));
     }
+    enforce_cover_mutation_capacity(&mut transaction, &user.id, &recipe_id, now).await?;
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
             .await?;
@@ -480,7 +498,7 @@ pub(crate) async fn session_update_image_metadata(
     Ok(axum::Json(RecipeVersion { version }))
 }
 
-fn cover_idempotency_key(headers: &HeaderMap) -> AppResult<String> {
+fn cover_idempotency_key(headers: &HeaderMap, now: i64) -> AppResult<String> {
     let key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
@@ -494,7 +512,94 @@ fn cover_idempotency_key(headers: &HeaderMap) -> AppResult<String> {
             "Idempotency-Key must contain 8 to 128 URL-safe characters".into(),
         ));
     }
+    let timestamp = key
+        .split_once('.')
+        .and_then(|(timestamp, _)| timestamp.parse::<i64>().ok())
+        .ok_or_else(|| {
+            AppError::Validation(
+                "Idempotency-Key must start with its Unix creation timestamp".into(),
+            )
+        })?;
+    if timestamp > now + COVER_KEY_FUTURE_SKEW_SECONDS {
+        return Err(AppError::Validation(
+            "Idempotency-Key creation timestamp is in the future".into(),
+        ));
+    }
+    if timestamp < now - COVER_KEY_REPLAY_SECONDS {
+        return Err(AppError::Conflict(
+            "Idempotency-Key replay window expired; create a new key and reload the recipe version"
+                .into(),
+        ));
+    }
     Ok(key.to_string())
+}
+
+async fn enforce_cover_rate_limit(pool: &SqlitePool, owner_id: &str, now: i64) -> AppResult<()> {
+    let window_started_at = now - now.rem_euclid(COVER_RATE_WINDOW_SECONDS);
+    let rate_key = format!("recipe-cover:{owner_id}");
+    let request_count: i64 = sqlx::query_scalar(
+        "INSERT INTO public_api_rate_limits (rate_key, window_started_at, request_count)
+         VALUES (?, ?, 1)
+         ON CONFLICT(rate_key) DO UPDATE SET
+           window_started_at = CASE
+             WHEN public_api_rate_limits.window_started_at < excluded.window_started_at
+             THEN excluded.window_started_at ELSE public_api_rate_limits.window_started_at END,
+           request_count = CASE
+             WHEN public_api_rate_limits.window_started_at < excluded.window_started_at
+             THEN 1 ELSE public_api_rate_limits.request_count + 1 END
+         RETURNING request_count",
+    )
+    .bind(rate_key)
+    .bind(window_started_at)
+    .fetch_one(pool)
+    .await?;
+    if request_count > COVER_RATE_LIMIT {
+        Err(AppError::RateLimited)
+    } else {
+        Ok(())
+    }
+}
+
+async fn cleanup_cover_mutations(
+    transaction: &mut Transaction<'_, Sqlite>,
+    now: i64,
+) -> AppResult<()> {
+    sqlx::query(
+        "DELETE FROM recipe_cover_mutations
+         WHERE rowid IN (
+           SELECT rowid FROM recipe_cover_mutations
+           WHERE created_at < ?
+           ORDER BY created_at
+           LIMIT ?
+         )",
+    )
+    .bind(now - COVER_KEY_REPLAY_SECONDS)
+    .bind(COVER_MUTATION_CLEANUP_BATCH)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn enforce_cover_mutation_capacity(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    recipe_id: &str,
+    now: i64,
+) -> AppResult<()> {
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recipe_cover_mutations
+         WHERE owner_id = ? AND recipe_id = ? AND created_at >= ?",
+    )
+    .bind(owner_id)
+    .bind(recipe_id)
+    .bind(now - COVER_KEY_REPLAY_SECONDS)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if active_count >= MAX_ACTIVE_COVER_MUTATIONS_PER_RECIPE {
+        Err(AppError::RateLimited)
+    } else {
+        Ok(())
+    }
 }
 
 fn cover_mutation_fingerprint(operation: &str, fields: &[&[u8]]) -> [u8; 32] {

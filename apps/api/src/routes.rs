@@ -2834,6 +2834,10 @@ mod tests {
         (format!("multipart/form-data; boundary={boundary}"), body)
     }
 
+    fn cover_key(label: &str) -> String {
+        format!("{}.{}", Utc::now().timestamp(), label)
+    }
+
     #[tokio::test]
     async fn private_recipe_is_not_visible_to_another_account() {
         let app = build_app(Config::test()).await.unwrap();
@@ -4333,7 +4337,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", &owner_cookie)
                     .header("if-match", "\"recipe-v2\"")
-                    .header("idempotency-key", "metadata-private-image")
+                    .header("idempotency-key", cover_key("metadata-private-image"))
                     .body(Body::from(
                         json!({
                             "altText": "Updated blue soup",
@@ -4980,6 +4984,7 @@ mod tests {
         assert_eq!(stale_browser.status(), StatusCode::CONFLICT);
 
         let (content_type, body) = multipart_image(&test_png());
+        let upload_key = cover_key("interactive-upload");
         let upload = app
             .clone()
             .oneshot(
@@ -4987,7 +4992,7 @@ mod tests {
                     .header("content-type", content_type)
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v3\"")
-                    .header("idempotency-key", "interactive-upload")
+                    .header("idempotency-key", upload_key.as_str())
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -5003,7 +5008,7 @@ mod tests {
                     .header("content-type", replay_content_type)
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v3\"")
-                    .header("idempotency-key", "interactive-upload")
+                    .header("idempotency-key", upload_key.as_str())
                     .body(Body::from(replay_body))
                     .unwrap(),
             )
@@ -5020,7 +5025,7 @@ mod tests {
                     .header("content-type", different_content_type)
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v4\"")
-                    .header("idempotency-key", "interactive-upload")
+                    .header("idempotency-key", upload_key.as_str())
                     .body(Body::from(different_body))
                     .unwrap(),
             )
@@ -5047,6 +5052,7 @@ mod tests {
             "sourceLicense": "",
             "sourceAttribution": ""
         });
+        let metadata_key = cover_key("interactive-metadata");
         let metadata_update = app
             .clone()
             .oneshot(
@@ -5054,7 +5060,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v4\"")
-                    .header("idempotency-key", "interactive-metadata")
+                    .header("idempotency-key", metadata_key.as_str())
                     .body(Body::from(metadata.to_string()))
                     .unwrap(),
             )
@@ -5069,7 +5075,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v4\"")
-                    .header("idempotency-key", "interactive-metadata")
+                    .header("idempotency-key", metadata_key.as_str())
                     .body(Body::from(metadata.to_string()))
                     .unwrap(),
             )
@@ -5084,20 +5090,21 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v4\"")
-                    .header("idempotency-key", "stale-interactive-metadata")
+                    .header("idempotency-key", cover_key("stale-interactive-metadata"))
                     .body(Body::from(metadata.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(stale_metadata.status(), StatusCode::CONFLICT);
+        let delete_key = cover_key("interactive-delete");
         let deleted = app
             .clone()
             .oneshot(
                 Request::delete(format!("/api/recipes/{recipe_id}/cover"))
                     .header("cookie", &cookie)
                     .header("if-match", "\"recipe-v5\"")
-                    .header("idempotency-key", "interactive-delete")
+                    .header("idempotency-key", delete_key.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5110,7 +5117,7 @@ mod tests {
                 Request::delete(format!("/api/recipes/{recipe_id}/cover"))
                     .header("cookie", cookie)
                     .header("if-match", "\"recipe-v5\"")
-                    .header("idempotency-key", "interactive-delete")
+                    .header("idempotency-key", delete_key.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5118,6 +5125,263 @@ mod tests {
             .unwrap();
         assert_eq!(delete_replay.status(), StatusCode::OK);
         assert_eq!(response_json(delete_replay).await["version"], 6);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cover_mutations_converge_by_idempotency_key() {
+        let path = std::env::temp_dir().join(format!("cook-cover-race-{}.db", Uuid::new_v4()));
+        let mut config = Config::test();
+        config.database_url = format!("sqlite://{}", path.display());
+        let app = build_app(config.clone()).await.unwrap();
+        let pool = crate::db::connect(&config.database_url).await.unwrap();
+        let cookie = login(&app, "Cover race owner").await;
+        let recipe = create_recipe(&app, &cookie, "private").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+
+        let upload_key = cover_key("concurrent-upload");
+        let (upload_type_a, upload_body_a) = multipart_image(&test_png());
+        let (upload_type_b, upload_body_b) = multipart_image(&test_png());
+        let (upload_a, upload_b) = tokio::join!(
+            app.clone().oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", upload_type_a)
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .header("idempotency-key", upload_key.as_str())
+                    .body(Body::from(upload_body_a))
+                    .unwrap()
+            ),
+            app.clone().oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", upload_type_b)
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .header("idempotency-key", upload_key.as_str())
+                    .body(Body::from(upload_body_b))
+                    .unwrap()
+            )
+        );
+        for response in [upload_a.unwrap(), upload_b.unwrap()] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_json(response).await["version"], 2);
+        }
+
+        let metadata = json!({
+            "altText": "Concurrent metadata",
+            "sourceUrl": "",
+            "sourceLicense": "",
+            "sourceAttribution": ""
+        });
+        let metadata_key = cover_key("concurrent-metadata");
+        let (metadata_a, metadata_b) = tokio::join!(
+            app.clone().oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v2\"")
+                    .header("idempotency-key", metadata_key.as_str())
+                    .body(Body::from(metadata.to_string()))
+                    .unwrap()
+            ),
+            app.clone().oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v2\"")
+                    .header("idempotency-key", metadata_key.as_str())
+                    .body(Body::from(metadata.to_string()))
+                    .unwrap()
+            )
+        );
+        for response in [metadata_a.unwrap(), metadata_b.unwrap()] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_json(response).await["version"], 3);
+        }
+
+        let delete_key = cover_key("concurrent-delete");
+        let (delete_a, delete_b) = tokio::join!(
+            app.clone().oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v3\"")
+                    .header("idempotency-key", delete_key.as_str())
+                    .body(Body::empty())
+                    .unwrap()
+            ),
+            app.clone().oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v3\"")
+                    .header("idempotency-key", delete_key.as_str())
+                    .body(Body::empty())
+                    .unwrap()
+            )
+        );
+        for response in [delete_a.unwrap(), delete_b.unwrap()] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_json(response).await["version"], 4);
+        }
+
+        let changed_key = cover_key("concurrent-changed-upload");
+        let (changed_type_a, changed_body_a) =
+            multipart_image_with_alt(&test_png(), "First concurrent cover");
+        let (changed_type_b, changed_body_b) =
+            multipart_image_with_alt(&test_png(), "Second concurrent cover");
+        let (changed_a, changed_b) = tokio::join!(
+            app.clone().oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", changed_type_a)
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v4\"")
+                    .header("idempotency-key", changed_key.as_str())
+                    .body(Body::from(changed_body_a))
+                    .unwrap()
+            ),
+            app.clone().oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("content-type", changed_type_b)
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v4\"")
+                    .header("idempotency-key", changed_key.as_str())
+                    .body(Body::from(changed_body_b))
+                    .unwrap()
+            )
+        );
+        let mut statuses = [changed_a.unwrap().status(), changed_b.unwrap().status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+        let version: i64 = sqlx::query_scalar("SELECT version FROM recipes WHERE id = ?")
+            .bind(recipe_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 5);
+    }
+
+    #[tokio::test]
+    async fn cover_mutation_retention_capacity_and_rate_limit_are_bounded() {
+        let (app, _, pool) = app_with_runtime().await;
+        let cookie = login(&app, "Cover limits owner").await;
+        let recipe = create_recipe(&app, &cookie, "private").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        let owner_id: String = sqlx::query_scalar("SELECT owner_id FROM recipes WHERE id = ?")
+            .bind(recipe_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+
+        let expired = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .header("idempotency-key", format!("{}.expired-key", now - 86_401))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::CONFLICT);
+
+        let mut transaction = pool.begin().await.unwrap();
+        for index in 0..300 {
+            sqlx::query(
+                "INSERT INTO recipe_cover_mutations
+                 (owner_id, recipe_id, idempotency_key, operation, request_fingerprint,
+                  result_version, created_at)
+                 VALUES (?, ?, ?, 'delete', X'00', 1, ?)",
+            )
+            .bind(&owner_id)
+            .bind(recipe_id)
+            .bind(format!("expired-{index}"))
+            .bind(now - 86_401)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+        transaction.commit().await.unwrap();
+
+        let valid_delete = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .header("idempotency-key", cover_key("cleanup-delete"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid_delete.status(), StatusCode::OK);
+        let expired_remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM recipe_cover_mutations WHERE created_at < ?")
+                .bind(now - 86_400)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(expired_remaining, 44);
+
+        let mut transaction = pool.begin().await.unwrap();
+        for index in 0..127 {
+            sqlx::query(
+                "INSERT INTO recipe_cover_mutations
+                 (owner_id, recipe_id, idempotency_key, operation, request_fingerprint,
+                  result_version, created_at)
+                 VALUES (?, ?, ?, 'delete', X'01', 2, ?)",
+            )
+            .bind(&owner_id)
+            .bind(recipe_id)
+            .bind(format!("active-{index}"))
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+        transaction.commit().await.unwrap();
+        let capped = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v2\"")
+                    .header("idempotency-key", cover_key("capacity-delete"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capped.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let rate_cookie = login(&app, "Cover rate owner").await;
+        let rate_recipe = create_recipe(&app, &rate_cookie, "private").await;
+        let rate_recipe_id = rate_recipe["id"].as_str().unwrap();
+        for index in 0..31 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::delete(format!("/api/recipes/{rate_recipe_id}/cover"))
+                        .header("cookie", &rate_cookie)
+                        .header("if-match", "\"recipe-v1\"")
+                        .header(
+                            "idempotency-key",
+                            cover_key(&format!("rate-delete-{index}")),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if index == 0 {
+                assert_eq!(response.status(), StatusCode::OK);
+            } else if index < 30 {
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+            } else {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
     }
 
     #[tokio::test]

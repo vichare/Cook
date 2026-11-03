@@ -1201,6 +1201,10 @@ function coverIsUnchanged(current: Recipe, original: Recipe): boolean {
     && current.coverImage?.version === original.coverImage?.version
 }
 
+function newCoverMutationKey(): string {
+  return `${Math.floor(Date.now() / 1000)}.${crypto.randomUUID()}`
+}
+
 async function persistCoverMutation({
   saved,
   original,
@@ -1208,6 +1212,7 @@ async function persistCoverMutation({
   removeCover,
   coverMetadata,
   expectedVersion,
+  reconcileVersion,
   idempotencyKey,
   acknowledgeVersion,
 }: {
@@ -1217,6 +1222,7 @@ async function persistCoverMutation({
   removeCover: boolean
   coverMetadata: CoverMetadata
   expectedVersion: number
+  reconcileVersion?: number
   idempotencyKey: string
   acknowledgeVersion: (version: number) => void
 }): Promise<Recipe> {
@@ -1228,11 +1234,17 @@ async function persistCoverMutation({
       expectedVersion,
       idempotencyKey,
     )
+    if (reconcileVersion !== undefined && result.version !== reconcileVersion) {
+      throw new ApiError('Recipe changed after the cover operation completed', 409, 'conflict')
+    }
     acknowledgeVersion(result.version)
     return { ...saved, version: result.version }
   }
   if (removeCover && original?.coverImage) {
     const result = await api.deleteRecipeCover(saved.id, expectedVersion, idempotencyKey)
+    if (reconcileVersion !== undefined && result.version !== reconcileVersion) {
+      throw new ApiError('Recipe changed after the cover operation completed', 409, 'conflict')
+    }
     acknowledgeVersion(result.version)
     return { ...saved, version: result.version, coverImage: null }
   }
@@ -1243,6 +1255,9 @@ async function persistCoverMutation({
       expectedVersion,
       idempotencyKey,
     )
+    if (reconcileVersion !== undefined && result.version !== reconcileVersion) {
+      throw new ApiError('Recipe changed after the cover operation completed', 409, 'conflict')
+    }
     acknowledgeVersion(result.version)
     return { ...saved, version: result.version }
   }
@@ -1294,6 +1309,7 @@ export async function persistRecipeEdit({
           removeCover,
           coverMetadata,
           expectedVersion: acknowledgedVersion,
+          reconcileVersion: current.version,
           idempotencyKey: coverMutationKey,
           acknowledgeVersion,
         })
@@ -1333,7 +1349,7 @@ export function RecipeEditorForm({
   const [removeCover, setRemoveCover] = useState(false)
   const [coverPreview, setCoverPreview] = useState<string | null>(recipe?.coverImage?.url ?? null)
   const [acknowledgedVersion, setAcknowledgedVersion] = useState(recipe?.version)
-  const [coverMutationKey, setCoverMutationKey] = useState(() => crypto.randomUUID())
+  const [coverMutationKey, setCoverMutationKey] = useState(newCoverMutationKey)
   const [coverMetadata, setCoverMetadata] = useState({
     altText: recipe?.coverImage?.altText ?? '',
     sourceUrl: recipe?.coverImage?.sourceUrl ?? '',
@@ -1441,18 +1457,18 @@ export function RecipeEditorForm({
         metadata={coverMetadata}
         onMetadataChange={(metadata) => {
           setCoverMetadata(metadata)
-          setCoverMutationKey(crypto.randomUUID())
+          setCoverMutationKey(newCoverMutationKey())
         }}
         onFile={(file) => {
           setCoverFile(file)
-          setCoverMutationKey(crypto.randomUUID())
+          setCoverMutationKey(newCoverMutationKey())
           if (file) setRemoveCover(false)
         }}
         onRemove={() => {
           setCoverFile(null)
           setCoverPreview(null)
           setRemoveCover(Boolean(recipe?.coverImage))
-          setCoverMutationKey(crypto.randomUUID())
+          setCoverMutationKey(newCoverMutationKey())
         }}
       />
       <fieldset>
