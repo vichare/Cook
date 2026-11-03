@@ -1,0 +1,277 @@
+openapi: 3.1.0
+info:
+  title: Cook API
+  version: 0.1.0
+servers:
+  - url: https://cook.vichare.net
+paths:
+  /health:
+    get:
+      responses:
+        "200": { description: Healthy }
+  /api/me:
+    get:
+      responses:
+        "200":
+          description: Current Cook user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/auth/config:
+    get:
+      responses:
+        "200":
+          description: Available browser sign-in mode
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mode]
+                properties:
+                  mode: { type: string, enum: [development, google] }
+  /api/auth/dev-login:
+    post:
+      description: Development and test only. Production returns 404.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [displayName]
+              properties:
+                displayName: { type: string }
+      responses:
+        "200": { description: Development session created }
+        "404": { description: Development authentication is disabled }
+  /api/auth/google/start:
+    get:
+      description: Starts backend Google Authorization Code OIDC with S256 PKCE, state, and nonce.
+      responses:
+        "307":
+          description: Redirect to Google and set an HttpOnly OAuth state cookie
+        "404": { description: Google authentication is disabled }
+        "429": { description: Login start rate limited }
+  /api/auth/google/callback:
+    get:
+      description: Backend-only callback. Authorization codes and tokens are never returned to frontend JavaScript.
+      parameters:
+        - name: state
+          in: query
+          schema: { type: string }
+        - name: code
+          in: query
+          schema: { type: string }
+        - name: error
+          in: query
+          schema: { type: string }
+      responses:
+        "303":
+          description: Cook session issued with a Host-only HttpOnly cookie and browser redirected home
+        "401": { description: Invalid, expired, denied, or replayed login attempt }
+        "503": { description: Google or authentication persistence unavailable }
+  /api/auth/logout:
+    post:
+      responses:
+        "204": { description: Current server-side session revoked and cookies cleared }
+  /api/auth/logout-all:
+    post:
+      responses:
+        "204": { description: Every active session for the authenticated Cook user revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/recipes:
+    get:
+      responses:
+        "200":
+          description: Owned recipes and other users' public recipes
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Recipe" }
+    post:
+      requestBody:
+        $ref: "#/components/requestBodies/RecipeInput"
+      responses:
+        "201":
+          description: Recipe created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Recipe" }
+  /api/recipes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/RecipeId"
+    get:
+      responses:
+        "200":
+          description: Owned or public recipe
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Recipe" }
+        "404": { description: Missing or not visible }
+    put:
+      description: Owner only
+      requestBody:
+        $ref: "#/components/requestBodies/RecipeInput"
+      responses:
+        "200": { description: Recipe updated }
+        "404": { description: Missing or not owned }
+    delete:
+      description: Owner only
+      responses:
+        "204": { description: Recipe deleted }
+        "404": { description: Missing or not owned }
+  /api/recipes/{id}/favorite:
+    parameters:
+      - $ref: "#/components/parameters/RecipeId"
+    put:
+      responses:
+        "204": { description: Favorited }
+    delete:
+      responses:
+        "204": { description: Unfavorited }
+  /api/pantry:
+    get:
+      responses:
+        "200":
+          description: Current account pantry only
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PantryItem" }
+    put:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              maxItems: 100
+              items: { $ref: "#/components/schemas/PantryItemInput" }
+      responses:
+        "200": { description: Updated account pantry }
+  /api/settings/recommendations:
+    get:
+      responses:
+        "200":
+          description: Current account recommendation settings
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecommendationSettings" }
+    put:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecommendationSettings" }
+      responses:
+        "200": { description: Settings saved }
+  /api/recommendations:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecommendationRequest" }
+      responses:
+        "200":
+          description: Deterministic recommendations with ingredient explanations
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Recommendation" }
+components:
+  parameters:
+    RecipeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Unauthorized:
+      description: Host-only Cook session is absent or invalid
+  requestBodies:
+    RecipeInput:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/RecipeInput" }
+  schemas:
+    User:
+      type: object
+      required: [id, email, displayName]
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        displayName: { type: string }
+    Ingredient:
+      type: object
+      required: [name, quantityNote]
+      properties:
+        name: { type: string }
+        quantityNote: { type: string }
+    RecipeInput:
+      type: object
+      required: [title, description, instructions, visibility, ingredients]
+      properties:
+        title: { type: string }
+        description: { type: string }
+        instructions: { type: string }
+        visibility: { type: string, enum: [private, public], default: private }
+        ingredients:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/Ingredient" }
+    Recipe:
+      allOf:
+        - $ref: "#/components/schemas/RecipeInput"
+        - type: object
+          required: [id, ownerId, isFavorite]
+          properties:
+            id: { type: string, format: uuid }
+            ownerId: { type: string }
+            isFavorite: { type: boolean }
+    PantryItemInput:
+      type: object
+      required: [name, status, quantityNote]
+      properties:
+        name: { type: string }
+        status: { type: string, enum: [have, out, unknown] }
+        quantityNote: { type: string }
+    PantryItem:
+      allOf:
+        - $ref: "#/components/schemas/PantryItemInput"
+        - type: object
+          required: [id]
+          properties:
+            id: { type: string, format: uuid }
+            confirmedAt: { type: [string, "null"], format: date-time }
+    RecommendationSettings:
+      type: object
+      required: [includeFavorites, includeOwn, includePublic, verificationDays]
+      properties:
+        includeFavorites: { type: boolean }
+        includeOwn: { type: boolean }
+        includePublic: { type: boolean }
+        verificationDays: { type: integer, minimum: 1, maximum: 90 }
+    RecommendationRequest:
+      type: object
+      properties:
+        preferred: { type: array, items: { type: string } }
+        required: { type: array, items: { type: string } }
+        excluded: { type: array, items: { type: string } }
+        pantryOnly: { type: boolean }
+    Recommendation:
+      type: object
+      required: [recipe, status, available, verify, missing, reasons, score]
+      properties:
+        recipe: { $ref: "#/components/schemas/Recipe" }
+        status: { type: string, enum: [READY, VERIFY, SHOP, BLOCKED] }
+        available: { type: array, items: { type: string } }
+        verify: { type: array, items: { type: string } }
+        missing: { type: array, items: { type: string } }
+        reasons: { type: array, items: { type: string } }
+        score: { type: integer }

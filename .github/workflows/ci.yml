@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cook-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.12
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  deployment-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate shell scripts
+        run: |
+          shellcheck deploy/*.sh
+          for script in deploy/*.sh; do sh -n "$script"; done
+      - name: Validate production Compose
+        env:
+          COOK_IMAGE: ghcr.io/vichare/cook:v0.0.0
+          COOK_DOMAIN: cook.vichare.net
+          GOOGLE_CLIENT_ID: placeholder
+          GOOGLE_CLIENT_SECRET: placeholder
+          OAUTH_STATE_DIGEST_KEY: 0101010101010101010101010101010101010101010101010101010101010101
+          APP_SESSION_DIGEST_KEY: 0202020202020202020202020202020202020202020202020202020202020202
+        run: |
+          cp deploy/.env.example deploy/.env
+          printf '\nCOOK_IMAGE=%s\n' "$COOK_IMAGE" >> deploy/.env
+          docker compose -f deploy/compose.yaml config --quiet
+          rm deploy/.env

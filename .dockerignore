@@ -1,0 +1,16 @@
+.git
+.github
+.env
+**/.env
+target
+node_modules
+**/node_modules
+**/dist
+data
+deploy/data
+deploy/backups
+deploy/logs
+*.db
+*.db-shm
+*.db-wal
+coverage

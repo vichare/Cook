@@ -1,0 +1,29 @@
+[workspace]
+members = ["apps/api"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.89"
+
+[workspace.dependencies]
+axum = "0.8.1"
+axum-extra = { version = "0.10.0", features = ["cookie"] }
+async-trait = "0.1.86"
+chrono = { version = "0.4.39", features = ["serde"] }
+cookie = "0.18.1"
+http = "1.2.0"
+rust-web-auth-core = { git = "https://github.com/vichare/rust-web-auth", rev = "113d1f607f8e99efba5e888204facd53304d5b7f" }
+rust-web-auth-google = { git = "https://github.com/vichare/rust-web-auth", rev = "113d1f607f8e99efba5e888204facd53304d5b7f" }
+rust-web-auth-http = { git = "https://github.com/vichare/rust-web-auth", rev = "113d1f607f8e99efba5e888204facd53304d5b7f" }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
+sha2 = "0.10.8"
+sqlx = { version = "0.8.3", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+thiserror = "2.0.11"
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tower-http = { version = "0.6.2", features = ["cors", "trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+uuid = { version = "1.12.1", features = ["v4", "serde"] }

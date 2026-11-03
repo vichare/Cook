@@ -1,0 +1,14 @@
+{
+  "name": "cook",
+  "private": true,
+  "workspaces": ["apps/web"],
+  "scripts": {
+    "dev": "npm run dev --workspace @cook/web",
+    "build": "npm run build --workspace @cook/web",
+    "test": "npm run test --workspace @cook/web"
+  },
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.9.0"
+  }
+}

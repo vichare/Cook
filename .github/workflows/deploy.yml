@@ -1,0 +1,54 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      release:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Release tag to deploy or roll back to, for example v1.2.3
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: cook-production-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Validate release tag
+        env:
+          RELEASE: ${{ inputs.release }}
+        run: printf '%s\n' "$RELEASE" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+'
+      - name: Configure restricted SSH key
+        env:
+          COOK_DEPLOY_SSH_KEY: ${{ secrets.COOK_DEPLOY_SSH_KEY }}
+          COOK_DEPLOY_KNOWN_HOSTS: ${{ secrets.COOK_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$COOK_DEPLOY_SSH_KEY" > ~/.ssh/cook_deploy
+          chmod 600 ~/.ssh/cook_deploy
+          printf '%s\n' "$COOK_DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Deploy release
+        env:
+          RELEASE: ${{ inputs.release }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COOK_DEPLOY_HOST: ${{ vars.COOK_DEPLOY_HOST }}
+          COOK_DEPLOY_PORT: ${{ vars.COOK_DEPLOY_PORT }}
+          COOK_DEPLOY_USER: ${{ vars.COOK_DEPLOY_USER }}
+        run: |
+          printf '%s\n%s\n' "$GITHUB_ACTOR" "$REGISTRY_TOKEN" |
+            ssh -i ~/.ssh/cook_deploy -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o RequestTTY=no \
+              -o ClearAllForwardings=yes -o ServerAliveInterval=30 \
+              -p "${COOK_DEPLOY_PORT:-22}" \
+              "${COOK_DEPLOY_USER}@${COOK_DEPLOY_HOST}" "deploy ${RELEASE}"

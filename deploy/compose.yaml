@@ -1,0 +1,29 @@
+name: cook
+
+services:
+  cook:
+    image: ${COOK_IMAGE:?set COOK_IMAGE in .env; release deployments set it}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_ENV: production
+      AUTH_MODE: google
+      API_BIND: 127.0.0.1:8081
+      DATABASE_URL: sqlite:///data/cook.db
+      PUBLIC_ORIGIN: https://${COOK_DOMAIN:?set COOK_DOMAIN in .env}
+    volumes:
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    stop_grace_period: 60s
+    ports:
+      - "${COOK_HOST_HTTP_ADDRESS:-127.0.0.1:18080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
