@@ -6,7 +6,7 @@ This document records future product direction separately from the shipped MVP. 
 
 ### Pantry expiration
 
-Each pantry item has one optional date-only expiration value using ISO `YYYY-MM-DD`. The value can be set, replaced, or cleared without timezone conversion. The UI provides a native date field plus large shortcuts for no date, today, tomorrow, one week, and one month. Expired and expiring-today items remain pantry items rather than being changed to “used up,” but recommendation results require verification and explain the date concern; pantry-only results are blocked until the user confirms a suitable item.
+Each pantry item has one optional date-only expiration value using ISO `YYYY-MM-DD`. The canonical API and database value can be set, replaced, or cleared without timezone conversion. The UI does not use a date picker: it asks how many local calendar days from today the item expires, offers large shortcuts for none, 0, 1, 3, 7, 14, and 30 days, and shows the calculated absolute date for confirmation. Limited negative values preserve and correct already-expired dates. Expired and expiring-today items remain pantry items rather than being changed to “used up,” but recommendation results require verification and explain the date concern; pantry-only results are blocked until the user confirms a suitable item.
 
 The current scope intentionally models one pantry item with at most one expiration date. Multiple batches of the same ingredient with different quantities or expiration dates are future scope and remain **unverified**.
 

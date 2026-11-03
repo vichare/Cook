@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   expirationLabel,
+  expirationRelativeDays,
   expirationShortcut,
   normalizeIngredient,
-  oneMonthAfter,
   splitIngredientList,
 } from './ingredients'
 import { formatDateValue, translateMessage } from './i18n'
@@ -20,14 +20,16 @@ describe('ingredient input helpers', () => {
     expect(splitIngredientList(' Ｍｉｌｋ，milk、青菜;\n Rice；')).toEqual(['Milk', '青菜', 'Rice'])
   })
 
-  it('uses local calendar values for date shortcuts and clamps month ends', () => {
+  it('uses local calendar arithmetic across month, year, leap-day, DST, and midnight boundaries', () => {
     const januaryEnd = new Date(2026, 0, 31, 15, 30)
     expect(expirationShortcut(0, januaryEnd)).toBe('2026-01-31')
     expect(expirationShortcut(1, januaryEnd)).toBe('2026-02-01')
     expect(expirationShortcut(7, januaryEnd)).toBe('2026-02-07')
-    expect(oneMonthAfter(januaryEnd)).toBe('2026-02-28')
-    expect(oneMonthAfter(new Date(2028, 0, 31, 15, 30))).toBe('2028-02-29')
+    expect(expirationShortcut(1, new Date(2026, 11, 31, 23, 59))).toBe('2027-01-01')
     expect(expirationShortcut(1, new Date(2028, 1, 28, 23, 30))).toBe('2028-02-29')
+    expect(expirationShortcut(1, new Date(2026, 9, 4, 0, 30))).toBe('2026-10-05')
+    expect(expirationRelativeDays('2026-10-05', new Date(2026, 9, 4, 23, 59, 59))).toBe(1)
+    expect(expirationRelativeDays('2026-01-30', januaryEnd)).toBe(-1)
   })
 
   it('describes expiration status with text rather than color alone', () => {

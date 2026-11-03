@@ -51,6 +51,8 @@ On `409`, re-read the recipe and ask the user how to reconcile their newer edits
 
 For bulk work, call the per-recipe endpoints one item at a time rather than inventing a batch route. Use one stable idempotency key per creation, continue only according to the user's requested failure policy, and never silently skip an item. Finish with created, updated, skipped, and failed counts plus each recipe ID or URL and any error.
 
+If a future user-authorized operation supplies a relative pantry expiry such as “7 days from today,” convert it to canonical `expiresOn: YYYY-MM-DD` using the user's local calendar date. Never derive date-only values from the Cook server's timezone or by adding fixed 24-hour millisecond intervals. This skill currently has no pantry scope or pantry endpoint.
+
 ## Cover images
 
 Never ask Cook to fetch an image URL. Before upload, ask the user to confirm that they own the local image or have permission to use it. Do not automatically copy a webpage or video thumbnail. Upload only local JPEG, PNG, or WebP bytes to `/api/ai/recipes/{id}/cover`, provide useful alt text, and include known source URL, license, and attribution. Send `If-Match: "recipe-v<version>"`.

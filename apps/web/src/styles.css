@@ -110,6 +110,8 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .expiration-editor { display: grid; gap: .8rem; }
 .pantry-form .expiration-editor, .pantry-form .form-actions { grid-column: 1 / -1; }
 .expiration-editor .selected { box-shadow: inset 0 0 0 2px var(--forest); }
+.relative-days-control { display: grid; grid-template-columns: minmax(44px, auto) minmax(7rem, 12rem) minmax(44px, auto); gap: .65rem; align-items: center; }
+.relative-days-control input { min-width: 0; text-align: center; font-size: 1.125rem; }
 .field-help, .combobox-status { margin: 0; color: #435248; font-size: .95rem; }
 .expiry-warning { color: #762f2a; font-weight: 750; }
 .ingredient-combobox { position: relative; display: grid; gap: .42rem; }

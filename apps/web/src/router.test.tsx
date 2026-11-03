@@ -231,7 +231,7 @@ describe('pantry confirmation', () => {
   })
 
   describe('expiration editor', () => {
-    it('offers large explicit shortcuts and can clear the date', () => {
+    it('offers relative-day shortcuts, custom integer input, and clearing without a date picker', () => {
       const onChange = vi.fn()
       render(
         <Providers>
@@ -239,22 +239,46 @@ describe('pantry confirmation', () => {
         </Providers>,
       )
       expect(screen.getByRole('button', { name: 'Today' })).toHaveAttribute('aria-pressed', 'true')
-      fireEvent.click(screen.getByRole('button', { name: 'One month' }))
-      expect(onChange).toHaveBeenLastCalledWith('2026-02-28')
+      expect(screen.queryByDisplayValue('2026-01-31')).not.toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: '30 days' }))
+      expect(onChange).toHaveBeenLastCalledWith('2026-03-02')
+      const input = screen.getByRole('spinbutton', { name: 'Expires this many days from today' })
+      fireEvent.change(input, { target: { value: '14' } })
+      expect(onChange).toHaveBeenLastCalledWith('2026-02-14')
+      fireEvent.click(screen.getByRole('button', { name: 'Increase days until expiration' }))
+      expect(onChange).toHaveBeenLastCalledWith('2026-02-15')
       fireEvent.click(screen.getByRole('button', { name: 'No expiration date' }))
       expect(onChange).toHaveBeenLastCalledWith(null)
     })
 
-    it('warns before saving a past date without clearing or changing pantry status', () => {
+    it('preserves past dates and rejects non-integer or out-of-range pasted values', () => {
+      const onChange = vi.fn()
       render(
         <Providers>
-          <ExpirationEditor value="2026-01-30" onChange={() => undefined} now={new Date(2026, 0, 31, 12)} />
+          <ExpirationEditor value="2026-01-30" onChange={onChange} now={new Date(2026, 0, 31, 12)} />
         </Providers>,
       )
+      expect(screen.getByRole('spinbutton')).toHaveValue(-1)
+      expect(screen.getByText(/Expired 1 day ago/)).toBeVisible()
       expect(screen.getByRole('alert')).toHaveTextContent(
         'This date is in the past. You can still save it',
       )
-      expect(screen.getByLabelText('Choose a calendar date')).toHaveValue('2026-01-30')
+      const input = screen.getByRole('spinbutton')
+      fireEvent.change(input, { target: { value: '1.5' } })
+      expect(screen.getByText('Enter a whole number of days.')).toHaveAttribute('role', 'alert')
+      fireEvent.change(input, { target: { value: '4000' } })
+      expect(screen.getByText('Enter a number from -3650 to 3650.')).toHaveAttribute('role', 'alert')
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('localizes the relative confirmation in Simplified Chinese', () => {
+      render(
+        <Providers locale="zh-CN">
+          <ExpirationEditor value="2026-11-11" onChange={() => undefined} now={new Date(2026, 10, 4, 23, 59)} />
+        </Providers>,
+      )
+      expect(screen.getByRole('spinbutton', { name: '从今天起多少天后过期' })).toHaveValue(7)
+      expect(screen.getByText(/从今天起 7 天后/)).toBeVisible()
     })
   })
 })

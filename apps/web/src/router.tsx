@@ -27,9 +27,9 @@ import type {
 import { IngredientCombobox } from './IngredientCombobox'
 import {
   expirationLabel,
+  expirationRelativeDays,
   expirationShortcut,
   localDateValue,
-  oneMonthAfter,
   splitIngredientList,
 } from './ingredients'
 import { createPasskey, getPasskey } from './webauthn'
@@ -1230,38 +1230,123 @@ export function ExpirationEditor({
   onChange: (value: string | null) => void
   now?: Date
 }) {
-  const { t } = useI18n()
-  const today = localDateValue(now)
-  const isPast = value !== null && value < today
+  const { formatDate, t } = useI18n()
+  const relativeDays = value === null ? null : expirationRelativeDays(value, now)
+  const [daysText, setDaysText] = useState(() => relativeDays?.toString() ?? '')
+  const [daysError, setDaysError] = useState<string | null>(null)
+  const minimumDays = -3650
+  const maximumDays = 3650
+  useEffect(() => {
+    setDaysText(relativeDays?.toString() ?? '')
+    setDaysError(null)
+  }, [relativeDays])
   const options = [
     [t('expiry.none'), null],
-    [t('expiry.today'), today],
-    [t('expiry.tomorrow'), expirationShortcut(1, now)],
-    [t('expiry.oneWeek'), expirationShortcut(7, now)],
-    [t('expiry.oneMonth'), oneMonthAfter(now)],
+    [t('expiry.today'), 0],
+    [t('expiry.tomorrow'), 1],
+    [t('expiry.threeDays'), 3],
+    [t('expiry.sevenDays'), 7],
+    [t('expiry.fourteenDays'), 14],
+    [t('expiry.thirtyDays'), 30],
   ] as const
+  function applyDays(input: string) {
+    setDaysText(input)
+    if (!/^-?\d+$/.test(input)) {
+      setDaysError(input ? t('expiry.integerError') : null)
+      return
+    }
+    const days = Number(input)
+    if (!Number.isSafeInteger(days) || days < minimumDays || days > maximumDays) {
+      setDaysError(t('expiry.rangeError', { minimum: minimumDays, maximum: maximumDays }))
+      return
+    }
+    setDaysError(null)
+    onChange(expirationShortcut(days, now))
+  }
+  function adjustDays(delta: number) {
+    const parsed = /^-?\d+$/.test(daysText) ? Number(daysText) : (relativeDays ?? 0)
+    const next = Math.max(minimumDays, Math.min(maximumDays, parsed + delta))
+    applyDays(next.toString())
+  }
+  let confirmation: string | null = null
+  if (value !== null && relativeDays !== null) {
+    if (relativeDays === 0) {
+      confirmation = t('expiry.confirmToday', { date: formatDate(value) })
+    } else if (relativeDays === 1) {
+      confirmation = t('expiry.confirmTomorrow', { date: formatDate(value) })
+    } else if (relativeDays < 0) {
+      confirmation = t('expiry.confirmPast', {
+        days: Math.abs(relativeDays) === 1
+          ? t('common.day')
+          : t('common.days', { count: Math.abs(relativeDays) }),
+        date: formatDate(value),
+      })
+    } else {
+      confirmation = t('expiry.confirmFuture', {
+        days: t('common.days', { count: relativeDays }),
+        date: formatDate(value),
+      })
+    }
+  }
   return (
     <fieldset className="expiration-editor">
       <legend>{t('expiry.optional')}</legend>
-      <label>
-        {t('expiry.chooseDate')}
-        <input type="date" value={value ?? ''} onChange={(event) => onChange(event.target.value || null)} />
-      </label>
       <div className="date-shortcuts" role="group" aria-label={t('expiry.shortcuts')}>
-        {options.map(([label, date]) => (
+        {options.map(([label, days]) => (
           <button
             type="button"
-            className={value === date ? 'button secondary selected' : 'button ghost'}
-            aria-pressed={value === date}
+            className={relativeDays === days ? 'button secondary selected' : 'button ghost'}
+            aria-pressed={relativeDays === days}
             key={label}
-            onClick={() => onChange(date)}
+            onClick={() => {
+              if (days === null) {
+                setDaysText('')
+                setDaysError(null)
+                onChange(null)
+              } else {
+                applyDays(days.toString())
+              }
+            }}
           >
             {label}
           </button>
         ))}
       </div>
-      <p className="field-help">{t('expiry.dateOnlyHelp')}</p>
-      {isPast && (
+      <label htmlFor="expiration-relative-days">{t('expiry.daysPrompt')}</label>
+      <div className="relative-days-control">
+        <button
+          type="button"
+          className="button secondary"
+          aria-label={t('expiry.decreaseDays')}
+          onClick={() => adjustDays(-1)}
+        >
+          −
+        </button>
+        <input
+          id="expiration-relative-days"
+          type="number"
+          inputMode="numeric"
+          min={minimumDays}
+          max={maximumDays}
+          step={1}
+          value={daysText}
+          aria-invalid={Boolean(daysError)}
+          aria-describedby={daysError ? 'expiration-days-error' : 'expiration-days-help'}
+          onChange={(event) => applyDays(event.target.value)}
+        />
+        <button
+          type="button"
+          className="button secondary"
+          aria-label={t('expiry.increaseDays')}
+          onClick={() => adjustDays(1)}
+        >
+          +
+        </button>
+      </div>
+      {daysError && <p id="expiration-days-error" className="error" role="alert">{daysError}</p>}
+      {confirmation && <output className="field-help" aria-live="polite">{confirmation}</output>}
+      <p id="expiration-days-help" className="field-help">{t('expiry.dateOnlyHelp')}</p>
+      {relativeDays !== null && relativeDays < 0 && (
         <p className="expiry-warning" role="alert">
           {t('expiry.pastWarning')}
         </p>

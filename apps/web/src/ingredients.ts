@@ -41,11 +41,11 @@ export function expirationShortcut(days: number, from = new Date()): string {
   return localDateValue(date)
 }
 
-export function oneMonthAfter(from = new Date()): string {
-  const targetMonth = from.getMonth() + 1
-  const lastDay = new Date(from.getFullYear(), targetMonth + 1, 0).getDate()
-  const date = new Date(from.getFullYear(), targetMonth, Math.min(from.getDate(), lastDay))
-  return localDateValue(date)
+export function expirationRelativeDays(expiresOn: string, from = new Date()): number {
+  const [expiryYear, expiryMonth, expiryDay] = expiresOn.split('-').map(Number)
+  const today = Date.UTC(from.getFullYear(), from.getMonth(), from.getDate())
+  const expiry = Date.UTC(expiryYear, expiryMonth - 1, expiryDay)
+  return Math.round((expiry - today) / 86_400_000)
 }
 
 export function expirationLabel(
