@@ -1327,10 +1327,26 @@ components:
           properties:
             statusBase: { type: integer, enum: [0, 250, 500, 750] }
             source: { type: integer, minimum: 0, maximum: 100 }
-            availability: { type: integer, minimum: 0, maximum: 80 }
-            desired: { type: integer, minimum: 0, maximum: 40 }
-            certainty: { type: integer, minimum: 0, maximum: 20 }
-            simplicity: { type: integer, minimum: 0, maximum: 9 }
+            availability:
+              type: integer
+              minimum: 0
+              maximum: 80
+              description: Confirmed-available recipe-ingredient coverage scaled to 80.
+            desired:
+              type: integer
+              minimum: 0
+              maximum: 40
+              description: Requested desired-ingredient hit coverage scaled to 40; zero when no desired ingredients were requested.
+            certainty:
+              type: integer
+              minimum: 0
+              maximum: 20
+              description: Confirmed, unexpired recipe-ingredient share scaled to 20.
+            simplicity:
+              type: integer
+              minimum: 0
+              maximum: 9
+              description: Nine minus the missing ingredient count, bounded to this range.
         primarySource: { $ref: "#/components/schemas/RecommendationSource" }
         matchedSources:
           type: array

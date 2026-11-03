@@ -221,23 +221,23 @@ pub fn recommend(
                 .map(|ingredient| ingredient.name.clone())
                 .collect::<Vec<_>>();
             let preferred_matches = i32::try_from(desired_matches.len()).unwrap_or(i32::MAX);
+            let preferred_count = i32::try_from(preferred.len()).unwrap_or(i32::MAX);
             let ingredient_count = i32::try_from(recipe.ingredients.len())
                 .unwrap_or(i32::MAX)
                 .max(1);
+            let available_count = i32::try_from(available.len()).unwrap_or(i32::MAX);
+            let missing_count = i32::try_from(missing.len()).unwrap_or(i32::MAX);
             let breakdown = ScoreBreakdown {
                 status_base: status_base(status),
                 source: source_points(primary_source),
-                availability: (i32::try_from(available.len()).unwrap_or(i32::MAX) * 80
-                    / ingredient_count)
-                    .clamp(0, 80),
-                desired: (preferred_matches * 10).clamp(0, 40),
-                certainty: match status {
-                    RecommendationStatus::Ready => 20,
-                    RecommendationStatus::Verify => 10,
-                    RecommendationStatus::Shop => 5,
-                    RecommendationStatus::Blocked => 0,
+                availability: (available_count * 80 / ingredient_count).clamp(0, 80),
+                desired: if preferred_count == 0 {
+                    0
+                } else {
+                    (preferred_matches * 40 / preferred_count).clamp(0, 40)
                 },
-                simplicity: (10 - ingredient_count).clamp(0, 9),
+                certainty: (available_count * 20 / ingredient_count).clamp(0, 20),
+                simplicity: (9 - missing_count).clamp(0, 9),
             };
             let score = breakdown.status_base
                 + breakdown.source
@@ -508,6 +508,17 @@ mod tests {
         assert_eq!(results[0].status, RecommendationStatus::Verify);
         assert_eq!(results[0].available, vec!["egg"]);
         assert_eq!(results[0].verify, vec!["bread"]);
+        assert_eq!(
+            results[0].score_breakdown,
+            ScoreBreakdown {
+                status_base: 500,
+                source: 100,
+                availability: 40,
+                desired: 40,
+                certainty: 10,
+                simplicity: 9,
+            }
+        );
     }
 
     #[test]

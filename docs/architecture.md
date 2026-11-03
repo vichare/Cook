@@ -41,7 +41,7 @@ The recommendation engine is deterministic:
    - stale `have` or `unknown`: verify;
    - absent or `out`: missing.
 4. Classify recipes as `READY`, `VERIFY`, `SHOP`, or `BLOCKED`. Pantry-only mode marks recipes with any missing or not-yet-confirmed ingredient as `BLOCKED`.
-5. Score on a fixed 0–999 scale. Status bases (`READY` 750, `VERIFY` 500, `SHOP` 250, `BLOCKED` 0) dominate all extras. Source contributes at most 100, availability 80, desired ingredients 40, certainty 20, and simplicity 9.
+5. Score on a fixed 0–999 scale. Status bases (`READY` 750, `VERIFY` 500, `SHOP` 250, `BLOCKED` 0) dominate all extras. Source contributes at most 100; availability is the confirmed-available recipe-ingredient share scaled to 80; desired is the requested desired-ingredient hit share scaled to 40; certainty is the confirmed, unexpired share scaled to 20; and simplicity is `9 - missing ingredient count`, bounded to 0–9.
 6. Sort by status, score descending, normalized title, then stable recipe ID.
 
 Responses include available, verification, and missing lists, structured ingredient reason codes, matched sources, applied controls, and a localized-client score breakdown. Saved-recipe and favorite-account overlap preserves both source labels but contributes only one 75-point favorite source score.

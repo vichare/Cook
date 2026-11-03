@@ -27,6 +27,8 @@ CREATE TABLE favorite_accounts (
 );
 CREATE INDEX favorite_accounts_author_viewer
     ON favorite_accounts(author_id, viewer_id);
+CREATE INDEX recipes_owner_visibility_created
+    ON recipes(owner_id, visibility, created_at DESC, id DESC);
 
 CREATE TABLE public_api_rate_limits (
     rate_key TEXT PRIMARY KEY,
