@@ -109,7 +109,7 @@ paths:
       responses:
         "303":
           description: Cook session issued with a Host-only HttpOnly cookie and browser redirected home, or unsafe identity linking rejected and redirected to a generic recovery message
-        "401": { description: Invalid, expired, denied, or replayed login attempt }
+        "401": { description: "Invalid, expired, denied, or replayed login attempt" }
         "503": { description: Google or authentication persistence unavailable }
   /api/auth/email/request:
     post:
@@ -136,7 +136,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/User" }
-        "401": { description: Invalid, expired, exhausted, or replayed challenge }
+        "401": { description: "Invalid, expired, exhausted, or replayed challenge" }
         "429": { description: Challenge or client-address rate limit exceeded }
   /api/auth/passkey/start:
     post:
@@ -173,7 +173,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/User" }
-        "401": { description: Invalid, expired, replayed, or failed WebAuthn ceremony }
+        "401": { description: "Invalid, expired, replayed, or failed WebAuthn ceremony" }
   /api/auth/logout:
     post:
       responses:
@@ -223,7 +223,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/SecuritySettings" }
-        "401": { description: Invalid, expired, exhausted, replayed, or wrong-user challenge }
+        "401": { description: "Invalid, expired, exhausted, replayed, or wrong-user challenge" }
         "409": { description: Email identity is already linked to another Cook account }
   /api/settings/security/passkeys/register/start:
     post:
@@ -264,7 +264,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Passkey" }
-        "401": { description: Invalid, expired, replayed, or wrong-user ceremony }
+        "401": { description: "Invalid, expired, replayed, or wrong-user ceremony" }
         "409": { description: Credential ID already belongs to an account }
   /api/settings/security/passkeys/{id}:
     delete:
@@ -388,7 +388,7 @@ paths:
             schema: { $ref: "#/components/schemas/ShoppingItemInput" }
       responses:
         "200": { description: Updated private shopping list }
-        "404": { description: Missing, cross-account, or not manually editable }
+        "404": { description: "Missing, cross-account, or not manually editable" }
     delete:
       description: >
         Idempotently remove every persisted manual or recipe source for this exact concrete or
@@ -439,7 +439,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ShoppingPurchaseResponse" }
-        "409": { description: Optimistic version, pantry resolution, or idempotency conflict }
+        "409": { description: "Optimistic version, pantry resolution, or idempotency conflict" }
         "429": { description: Purchase rate or retained-action limit reached }
   /api/shopping-list/purchases/{id}/undo:
     parameters:
@@ -659,7 +659,7 @@ paths:
         "404": { description: Recipe missing or not owned }
         "409": { description: Recipe version changed }
         "429": { description: New cover mutation rate or active replay-key capacity exceeded; exact committed replays are exempt }
-        "413": { description: Upload, decoded pixels, decoder allocation, or normalized bytes exceed the documented limit }
+        "413": { description: "Upload, decoded pixels, decoder allocation, or normalized bytes exceed the documented limit" }
     put:
       description: Updates alt text and optional source/license/attribution for the authenticated owner's existing cover.
       security:
@@ -719,7 +719,7 @@ paths:
             image/jpeg:
               schema: { type: string, format: binary }
         "304": { description: ETag matched }
-        "401": { description: A supplied Bearer token is invalid, expired, or revoked }
+        "401": { description: "A supplied bearer token is invalid, expired, or revoked" }
         "404": { description: Image missing or private image not owned }
   /api/ai/capabilities:
     get:
@@ -732,7 +732,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AiCapabilities" }
-        "401": { description: Invalid, expired, or revoked token }
+        "401": { description: "Invalid, expired, or revoked token" }
         "429": { description: Capability inspection rate limit exceeded }
   /api/ai/recipes:
     get:
@@ -747,7 +747,7 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Recipe" }
-        "401": { description: Invalid, expired, or revoked token }
+        "401": { description: "Invalid, expired, or revoked token" }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
       description: Creates a recipe for the token principal. The default visibility is private; public requires recipes:publish in addition to recipes:write. The recipes:write bucket allows 600 requests per token per hour. An Idempotency-Key is required, and retries with the same token/key return the original recipe.
@@ -774,12 +774,12 @@ paths:
                 - name: noodles
                   quantityNote: 200 g
                 - name: tomato
-                  quantityNote: 3
+                  quantityNote: "3"
       responses:
-        "201": { description: Recipe created, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
-        "200": { description: Idempotent replay of the original creation, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "201": { description: "Recipe created", content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "200": { description: "Idempotent replay of the original creation", content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
         "400": { $ref: "#/components/responses/ValidationError" }
-        "401": { description: Invalid, expired, or revoked token }
+        "401": { description: "Invalid, expired, or revoked token" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "429": { description: Token rate limit exceeded }
   /api/ai/recipes/{id}:
@@ -790,8 +790,8 @@ paths:
       security:
         - importBearer: []
       responses:
-        "200": { description: Owned recipe, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
-        "401": { description: Invalid, expired, or revoked token }
+        "200": { description: "Owned recipe", content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "401": { description: "Invalid, expired, or revoked token" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: Recipe missing or not owned }
     put:
@@ -811,12 +811,12 @@ paths:
                 - name: noodles
                   quantityNote: 200 g
                 - name: tomato
-                  quantityNote: 4
+                  quantityNote: "4"
               expectedVersion: 3
       responses:
-        "200": { description: Direct owned update or pending public revision, depending on scopes, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "200": { description: "Direct owned update or pending public revision, depending on scopes", content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
         "400": { $ref: "#/components/responses/ValidationError" }
-        "401": { description: Invalid, expired, or revoked token }
+        "401": { description: "Invalid, expired, or revoked token" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: Recipe missing or not owned }
         "409": { description: Recipe version is stale or a pending revision already exists }
@@ -834,9 +834,9 @@ paths:
           multipart/form-data:
             schema: { $ref: "#/components/schemas/RecipeImageUpload" }
       responses:
-        "200": { description: Direct owned image update or pending public revision, depending on scopes, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "200": { description: "Direct owned image update or pending public revision, depending on scopes", content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
         "400": { $ref: "#/components/responses/ValidationError" }
-        "401": { description: Invalid, expired, or revoked token }
+        "401": { description: "Invalid, expired, or revoked token" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: Recipe missing or not owned }
         "409": { description: Recipe version is stale or a pending revision already exists }
@@ -846,8 +846,8 @@ paths:
       security:
         - importBearer: []
       responses:
-        "200": { description: Direct owned image removal or pending public revision, depending on scopes, content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
-        "401": { description: Invalid, expired, or revoked token }
+        "200": { description: "Direct owned image removal or pending public revision, depending on scopes", content: { application/json: { schema: { $ref: "#/components/schemas/AiRecipeMutation" } } } }
+        "401": { description: "Invalid, expired, or revoked token" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: Recipe missing or not owned }
         "409": { description: Recipe version is stale or a pending revision already exists }
@@ -877,7 +877,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/RecipeRevisionId"
       responses:
-        "200": { description: Updated live recipe, content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
+        "200": { description: "Updated live recipe", content: { application/json: { schema: { $ref: "#/components/schemas/Recipe" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Revision missing or not owned }
         "409": { description: Live recipe changed after the revision was created }
@@ -944,7 +944,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ImportDraft" }
         "400": { $ref: "#/components/responses/ValidationError" }
-        "401": { description: Missing, invalid, expired, revoked, or incorrectly scoped import token }
+        "401": { description: "Missing, invalid, expired, revoked, or incorrectly scoped import token" }
         "429": { description: Per-token rate limit or per-account active-draft quota exceeded }
         "422": { description: JSON shape contains unsupported or invalid fields }
   /api/import-drafts:
@@ -1003,7 +1003,7 @@ paths:
       responses:
         "204": { description: Draft discarded }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { description: Missing, not owned, or no longer pending }
+        "404": { description: "Missing, not owned, or no longer pending" }
   /api/import-drafts/{id}/accept:
     parameters:
       - $ref: "#/components/parameters/ImportDraftId"
@@ -1054,7 +1054,7 @@ paths:
                 credential: { type: object, additionalProperties: true }
       responses:
         "200": { description: Content moderator capability assigned }
-        "404": { description: Claim is unavailable, expired, or already consumed }
+        "404": { description: "Claim is unavailable, expired, or already consumed" }
         "409": { description: Capability is already assigned }
   /api/recipes/{id}/reports:
     parameters: [{ $ref: "#/components/parameters/RecipeId" }]
@@ -1169,7 +1169,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ModerationCaseDetail" }
         "403": { $ref: "#/components/responses/AdminReauthRequired" }
-        "404": { description: Moderator capability absent, case missing, or self-moderation denied }
+        "404": { description: "Moderator capability absent, case missing, or self-moderation denied" }
   /api/admin/moderation/cases/{id}/evidence-image:
     parameters:
       - { $ref: "#/components/parameters/ModerationCaseId" }
@@ -1183,7 +1183,7 @@ paths:
             image/jpeg:
               schema: { type: string, format: binary }
         "403": { $ref: "#/components/responses/AdminReauthRequired" }
-        "404": { description: Moderator capability absent, image/case missing, or self-moderation denied }
+        "404": { description: "Moderator capability absent, image/case missing, or self-moderation denied" }
   /api/admin/moderation/recipes/{id}/review:
     parameters:
       - { $ref: "#/components/parameters/RecipeId" }

@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cook.vichare.net/schemas/ai-recipe-v2.schema.json",
+  "$comment": "Shipped with Cook v0.6.0; the schema contract remains v2.",
   "title": "Cook AI recipe create or update v2",
   "type": "object",
   "additionalProperties": false,

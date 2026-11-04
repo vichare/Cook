@@ -116,12 +116,12 @@ describe('import token reveal', () => {
     expect(prompt).toContain('COOK_IMPORT_TOKEN')
     expect(prompt).toContain(`${baseUrl}/api/import/drafts`)
     expect(prompt).not.toContain(secret)
-    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.5.0/skills/')
+    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.6.0/skills/')
     expect(installInstructions).toContain(
-      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.5.0',
+      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.6.0',
     )
     expect(installInstructions).toContain(
-      'gh skill preview vichare/Cook cook-recipe-import@v0.5.0',
+      'gh skill preview vichare/Cook cook-recipe-import@v0.6.0',
     )
     expect(installInstructions).toContain('Do not copy only SKILL.md')
     expect(installInstructions).not.toContain('install skill from GitHub URL')

@@ -5,6 +5,8 @@ description: Import authorized recipes into Cook review drafts, manage owned rec
 
 # Cook recipe import and management
 
+This contract ships with Cook v0.6.0. Import schema versions 1.0 and 2.0 remain accepted for compatibility; the release does not add a separate bulk-importer capability.
+
 Use this skill only for content the user is authorized to access. Prefer the safest task: create a private review draft. Manage owned recipes only with the matching scopes, and publish only when the user explicitly selected the high-risk publish preset.
 
 ## Configuration and capability check

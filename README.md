@@ -4,6 +4,8 @@ Cook is a deployable recipe and private-pantry recommendation MVP. It combines u
 
 Cook v0.6.0 adds post-publication content moderation without giving moderators edit access to author content. Public eligibility is author intent `public` plus platform state `clear`; restricted recipes remain editable by their owner but disappear from every other public detail, list, search, recommendation, favorite-account, ingredient, shopping, and image surface. Logged-in users can report eligible recipes, owners receive in-app restriction/appeal notifications, and a least-privilege content moderator uses Passkey step-up for sensitive case and enforcement actions.
 
+Recommendation filters now use shareable `rv=1` URL state and automatic refresh with cancellation and race guards. `intent-v2` applies scope, must-use, and excluded ingredients as hard filters, prioritizes desired matches, and ranks owned/saved/favorite-account recipes above other public recipes. Keyboard- and touch-accessible Move menus transfer ingredients atomically among desired, must-use, and excluded buckets. Drag-and-drop ordering, system-wide ingredient aliases, and a separate bulk-importer capability remain future work and are not part of v0.6.0.
+
 Pantry items can carry one optional date-only expiration and a default-off automatic-restock setting. Only an explicit `out` status derives a private shopping-list item; unknown or expired items are not silently changed to out. Manual, recipe, and automatic sources deduplicate by confirmed canonical identity or owner-normalized input and remain isolated per account. Every active source combination uses the same Bought workflow to update pantry state and either remove all shopping sources or keep them for a partial purchase, with optimistic concurrency, idempotent retries, and safe atomic undo.
 
 Ingredient entry uses shared Unicode normalization, multilingual pasted-list splitting, explicit canonical selections, and accessible suggestions; fuzzy matches are advisory and never silently alter recommendation hard filters. Expired items are explained as verification concerns rather than being changed to “used up.”
@@ -58,8 +60,8 @@ Store the one-time token as the `COOK_IMPORT_TOKEN` environment variable, never 
 GitHub CLI 2.90+ can preview and install the full Skill, including schema assets:
 
 ```powershell
-gh skill preview vichare/Cook cook-recipe-import@v0.5.0
-gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.5.0
+gh skill preview vichare/Cook cook-recipe-import@v0.6.0
+gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.6.0
 ```
 
 Manual fallback: copy the entire `skills/cook-recipe-import` directory to `~/.copilot/skills/cook-recipe-import` or `~/.agents/skills/cook-recipe-import`; copying only `SKILL.md` omits required schemas. Customize > Skills manages skills after they exist in a supported location; the GitHub source link is for review, not a paste-to-install URL.

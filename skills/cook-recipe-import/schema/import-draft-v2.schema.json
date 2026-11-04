@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cook.vichare.net/schemas/import-draft-v2.schema.json",
+  "$comment": "Shipped with Cook v0.6.0; import schemaVersion remains 2.0.",
   "title": "Cook recipe import draft v2",
   "type": "object",
   "additionalProperties": false,

@@ -184,6 +184,7 @@ async fn merge_pantry_catalog_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     #[tokio::test]
     async fn migrations_are_recorded_and_safe_to_reopen() {
@@ -198,6 +199,114 @@ mod tests {
         assert_eq!(applied.0, 17);
         pool.close().await;
 
+        let reopened = connect(&url).await.unwrap();
+        reopened.close().await;
+        drop(reopened);
+        let mut last_error = None;
+        for _ in 0..10 {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            panic!("failed to remove test database {}: {error}", path.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn moderation_migration_upgrades_populated_v05_database() {
+        let path = std::env::temp_dir().join(format!("cook-v05-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}", path.display());
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let pre_moderation = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version < 17)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        pre_moderation.run(&pool).await.unwrap();
+
+        sqlx::query("INSERT INTO users (id, email, display_name) VALUES ('u', 'u@test', 'U')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO recipes
+             (id, owner_id, title, description, instructions, visibility)
+             VALUES
+             ('public', 'u', 'Public', '', '', 'public'),
+             ('private', 'u', 'Private', '', '', 'private')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        MIGRATOR.run(&pool).await.unwrap();
+
+        let recipes: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT id, publication_intent, moderation_state, moderation_review_state
+             FROM recipes ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recipes,
+            vec![
+                (
+                    "private".into(),
+                    "private".into(),
+                    "clear".into(),
+                    "unreviewed".into()
+                ),
+                (
+                    "public".into(),
+                    "public".into(),
+                    "clear".into(),
+                    "unreviewed".into()
+                ),
+            ]
+        );
+        let public_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM public_eligible_recipes ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(public_ids, vec!["public"]);
+        let minimum_release: Option<String> =
+            sqlx::query_scalar("SELECT minimum_release FROM release_compatibility WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(minimum_release, None);
+        let inconsistent_update =
+            sqlx::query("UPDATE recipes SET moderation_state = 'restricted' WHERE id = 'public'")
+                .execute(&pool)
+                .await;
+        assert!(inconsistent_update.is_err());
+
+        pool.close().await;
         let reopened = connect(&url).await.unwrap();
         reopened.close().await;
         drop(reopened);
