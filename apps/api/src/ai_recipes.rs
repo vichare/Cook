@@ -176,16 +176,17 @@ pub async fn create_ai_recipe(
     let recipe_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO recipes
-         (id, owner_id, title, description, instructions, visibility, difficulty,
+         (id, owner_id, title, description, instructions, visibility, publication_intent, difficulty,
           estimated_calories, source_url, source_title, source_author, source_license,
           source_attribution, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(&recipe_id)
     .bind(&principal.owner_id)
     .bind(recipe_input.title.trim())
     .bind(recipe_input.description.trim())
     .bind(recipe_input.instructions.trim())
+    .bind(&recipe_input.visibility)
     .bind(&recipe_input.visibility)
     .bind(recipe_input.difficulty)
     .bind(recipe_input.estimated_calories)
@@ -248,7 +249,7 @@ pub async fn update_ai_recipe(
         .expected_version
         .ok_or_else(|| AppError::Validation("expectedVersion is required".into()))?;
     let mut transaction = state.pool.begin().await?;
-    let current_visibility = owned_recipe_visibility(
+    let access = owned_recipe_access(
         &mut transaction,
         &principal.owner_id,
         &recipe_id,
@@ -278,9 +279,9 @@ pub async fn update_ai_recipe(
         input
             .visibility
             .as_deref()
-            .unwrap_or(current_visibility.as_str()),
+            .unwrap_or(access.publication_intent.as_str()),
     )?;
-    if current_visibility == "public" && target_visibility == "private" {
+    if access.publication_intent == "public" && target_visibility == "private" {
         return Err(AppError::Validation(
             "AI tokens cannot make a public recipe private".into(),
         ));
@@ -288,7 +289,7 @@ pub async fn update_ai_recipe(
     let recipe_input = recipe_input(&input, target_visibility);
     validate_recipe(&recipe_input)?;
     let can_publish = principal_can_publish(&principal);
-    if current_visibility == "private" {
+    if access.publication_intent == "private" {
         if target_visibility == "public" && !can_publish {
             return Err(AppError::Forbidden);
         }
@@ -297,7 +298,7 @@ pub async fn update_ai_recipe(
             &principal,
             &recipe_id,
             expected_version,
-            &current_visibility,
+            &access,
             &recipe_input,
         )
         .await?;
@@ -312,7 +313,7 @@ pub async fn update_ai_recipe(
             &principal,
             &recipe_id,
             expected_version,
-            &current_visibility,
+            &access,
             &recipe_input,
         )
         .await?;
@@ -386,15 +387,16 @@ async fn mutate_ai_image(
     image: Option<ProcessedImage>,
 ) -> AppResult<AiRecipeMutation> {
     let mut transaction = state.pool.begin().await?;
-    let visibility = owned_recipe_visibility(
+    let access = owned_recipe_access(
         &mut transaction,
         &principal.owner_id,
         &recipe_id,
         expected_version,
     )
     .await?;
-    let direct_public_update = visibility == "public" && principal_can_publish(&principal);
-    if visibility == "private" || direct_public_update {
+    let direct_public_update =
+        access.publication_intent == "public" && principal_can_publish(&principal);
+    if access.publication_intent == "private" || direct_public_update {
         match image_action {
             "replace" => {
                 upsert_image(
@@ -410,12 +412,16 @@ async fn mutate_ai_image(
             _ => return Err(AppError::Validation("invalid image action".into())),
         }
         let updated = sqlx::query(
-            "UPDATE recipes SET version = version + 1, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ? AND owner_id = ? AND visibility = ? AND version = ?",
+            "UPDATE recipes
+             SET version = version + 1,
+                 moderation_review_state = 'unreviewed',
+                 moderation_version = moderation_version + 1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND owner_id = ? AND publication_intent = ? AND version = ?",
         )
         .bind(&recipe_id)
         .bind(&principal.owner_id)
-        .bind(&visibility)
+        .bind(&access.publication_intent)
         .bind(expected_version)
         .execute(&mut *transaction)
         .await?;
@@ -519,6 +525,8 @@ pub(crate) async fn accept_revision(
            difficulty = ?, estimated_calories = ?, source_url = ?, source_title = ?,
            source_author = ?, source_license = ?, source_attribution = ?,
            version = version + 1,
+           moderation_review_state = 'unreviewed',
+           moderation_version = moderation_version + 1,
            updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ? AND version = ?",
     )
@@ -654,20 +662,28 @@ async fn update_recipe_direct(
     principal: &TokenPrincipal,
     recipe_id: &str,
     expected_version: i64,
-    current_visibility: &str,
+    access: &OwnedRecipeAccess,
     input: &RecipeInput,
 ) -> AppResult<()> {
     let result = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?,
-           visibility = ?, difficulty = ?, estimated_calories = ?,
+           visibility = ?, publication_intent = ?, difficulty = ?, estimated_calories = ?,
            source_url = ?, source_title = ?, source_author = ?, source_license = ?,
            source_attribution = ?,
-           version = version + 1, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND owner_id = ? AND visibility = ? AND version = ?",
+           version = version + 1,
+           moderation_review_state = 'unreviewed',
+           moderation_version = moderation_version + 1,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND owner_id = ? AND publication_intent = ? AND version = ?",
     )
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(input.instructions.trim())
+    .bind(if access.moderation_state == "restricted" {
+        "private"
+    } else {
+        input.visibility.as_str()
+    })
     .bind(&input.visibility)
     .bind(input.difficulty)
     .bind(input.estimated_calories)
@@ -678,7 +694,7 @@ async fn update_recipe_direct(
     .bind(crate::routes::optional_text(&input.source_attribution))
     .bind(recipe_id)
     .bind(&principal.owner_id)
-    .bind(current_visibility)
+    .bind(&access.publication_intent)
     .bind(expected_version)
     .execute(&mut **transaction)
     .await?;
@@ -693,7 +709,7 @@ async fn update_recipe_direct(
         transaction,
         principal,
         if input.visibility == "public" {
-            if current_visibility == "private" {
+            if access.publication_intent == "private" {
                 "recipe.publish"
             } else {
                 "recipe.publish.update"
@@ -786,24 +802,35 @@ async fn create_revision(
     Ok(id)
 }
 
-async fn owned_recipe_visibility(
+struct OwnedRecipeAccess {
+    publication_intent: String,
+    moderation_state: String,
+}
+
+async fn owned_recipe_access(
     transaction: &mut Transaction<'_, Sqlite>,
     owner_id: &str,
     recipe_id: &str,
     expected_version: i64,
-) -> AppResult<String> {
-    let row = sqlx::query("SELECT visibility, version FROM recipes WHERE id = ? AND owner_id = ?")
-        .bind(recipe_id)
-        .bind(owner_id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(AppError::NotFound)?;
+) -> AppResult<OwnedRecipeAccess> {
+    let row = sqlx::query(
+        "SELECT publication_intent, moderation_state, version
+         FROM recipes WHERE id = ? AND owner_id = ?",
+    )
+    .bind(recipe_id)
+    .bind(owner_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
     if row.get::<i64, _>("version") != expected_version {
         return Err(AppError::Conflict(
             "recipe changed; reload and retry".into(),
         ));
     }
-    Ok(row.get("visibility"))
+    Ok(OwnedRecipeAccess {
+        publication_intent: row.get("publication_intent"),
+        moderation_state: row.get("moderation_state"),
+    })
 }
 
 async fn load_owned_recipe(pool: &SqlitePool, owner_id: &str, id: &str) -> AppResult<Recipe> {

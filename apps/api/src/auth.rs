@@ -69,6 +69,7 @@ pub struct AuthRuntime {
     pub sessions: Arc<SessionService>,
     pub session_cookie: CookiePolicy,
     pub state_cookie: CookiePolicy,
+    pub admin_reauth_cookie: CookiePolicy,
     pub passwordless: PasswordlessRuntime,
     store: Arc<SqliteAuthStore>,
 }
@@ -147,6 +148,8 @@ pub fn build_auth(config: &Config, pool: &SqlitePool) -> AppResult<AuthRuntime> 
             .map_err(|error| AppError::configuration(error.to_string()))?,
         state_cookie: CookiePolicy::new(config.auth_environment(), "cook_oauth_state")
             .map_err(|error| AppError::configuration(error.to_string()))?,
+        admin_reauth_cookie: CookiePolicy::new(config.auth_environment(), "cook_admin_reauth")
+            .map_err(|error| AppError::configuration(error.to_string()))?,
         passwordless,
         store,
     })
@@ -178,6 +181,7 @@ pub async fn upsert_development_user(pool: &SqlitePool, display_name: &str) -> A
         nickname: None,
         onboarding_completed: false,
         locale: None,
+        capabilities: Vec::new(),
     };
     sqlx::query(
         "INSERT INTO users (id, email, profile_email, display_name) VALUES (?, ?, ?, ?)
@@ -206,6 +210,21 @@ pub async fn load_user(pool: &SqlitePool, user_id: &UserId) -> AppResult<User> {
     .await?;
     let (id, email, display_name, nickname, onboarding_completed, locale) =
         row.ok_or(AppError::Unauthorized)?;
+    let capabilities = if sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+           SELECT 1 FROM capability_assignments
+           WHERE user_id = ? AND capability = 'content_moderation' AND revoked_at IS NULL
+         )",
+    )
+    .bind(&id)
+    .fetch_one(pool)
+    .await?
+        != 0
+    {
+        vec!["content_moderation".into()]
+    } else {
+        Vec::new()
+    };
     Ok(User {
         id,
         email,
@@ -213,6 +232,7 @@ pub async fn load_user(pool: &SqlitePool, user_id: &UserId) -> AppResult<User> {
         nickname,
         onboarding_completed,
         locale,
+        capabilities,
     })
 }
 
@@ -347,8 +367,11 @@ impl SessionStore for SqliteAuthStore {
         }
         sqlx::query(
             "INSERT INTO auth_sessions
-             (session_id, user_id, token_digest, created_at, last_activity_at, expires_at, revoked_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (session_id, user_id, token_digest, created_at, last_activity_at, expires_at,
+              revoked_at, version, authorization_version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, (
+               SELECT authorization_version FROM users WHERE id = ?
+             ))",
         )
         .bind(session.session_id.to_string())
         .bind(session.user_id.as_str())
@@ -358,6 +381,7 @@ impl SessionStore for SqliteAuthStore {
         .bind(session.expires_at.timestamp())
         .bind(session.revoked_at.map(|value| value.timestamp()))
         .bind(i64::try_from(session.version).map_err(|_| StorageError)?)
+        .bind(session.user_id.as_str())
         .execute(&self.pool)
         .await
         .map_err(storage_error)?;
@@ -369,9 +393,11 @@ impl SessionStore for SqliteAuthStore {
         token_digest: &[u8; 32],
     ) -> Result<Option<SessionRecord>, StorageError> {
         let row = sqlx::query(
-            "SELECT session_id, user_id, token_digest, created_at, last_activity_at,
-                    expires_at, revoked_at, version
-             FROM auth_sessions WHERE token_digest = ?",
+            "SELECT s.session_id, s.user_id, s.token_digest, s.created_at, s.last_activity_at,
+                    s.expires_at, s.revoked_at, s.version
+             FROM auth_sessions s
+             JOIN users u ON u.id = s.user_id
+             WHERE s.token_digest = ? AND s.authorization_version = u.authorization_version",
         )
         .bind(token_digest.as_slice())
         .fetch_optional(&self.pool)
@@ -385,9 +411,11 @@ impl SessionStore for SqliteAuthStore {
         session_id: SessionId,
     ) -> Result<Option<SessionRecord>, StorageError> {
         let row = sqlx::query(
-            "SELECT session_id, user_id, token_digest, created_at, last_activity_at,
-                    expires_at, revoked_at, version
-             FROM auth_sessions WHERE session_id = ?",
+            "SELECT s.session_id, s.user_id, s.token_digest, s.created_at, s.last_activity_at,
+                    s.expires_at, s.revoked_at, s.version
+             FROM auth_sessions s
+             JOIN users u ON u.id = s.user_id
+             WHERE s.session_id = ? AND s.authorization_version = u.authorization_version",
         )
         .bind(session_id.to_string())
         .fetch_optional(&self.pool)
@@ -579,8 +607,11 @@ async fn insert_session(
 ) -> Result<(), StorageError> {
     sqlx::query(
         "INSERT INTO auth_sessions
-         (session_id, user_id, token_digest, created_at, last_activity_at, expires_at, revoked_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (session_id, user_id, token_digest, created_at, last_activity_at, expires_at,
+          revoked_at, version, authorization_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, (
+           SELECT authorization_version FROM users WHERE id = ?
+         ))",
     )
     .bind(session.session_id.to_string())
     .bind(user_id)
@@ -590,6 +621,7 @@ async fn insert_session(
     .bind(session.expires_at.timestamp())
     .bind(session.revoked_at.map(|value| value.timestamp()))
     .bind(i64::try_from(session.version).map_err(|_| StorageError)?)
+    .bind(user_id)
     .execute(&mut **transaction)
     .await
     .map_err(storage_error)?;

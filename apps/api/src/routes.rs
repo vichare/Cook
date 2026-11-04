@@ -35,6 +35,7 @@ use crate::{
         LocaleInput, PantryItem, PantryItemInput, PantryStatus, ProfileInput, Recipe, RecipeImage,
         RecipeInput, RecipeSource, RecommendationRequest, RecommendationSettings, User,
     },
+    moderation,
     passwordless::{
         email_address, map_email_error, map_passkey_error, normalize_email, purpose,
         PasskeySummary, EMAIL_LINK_PURPOSE, EMAIL_SIGN_IN_PURPOSE,
@@ -147,6 +148,66 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/import-drafts", get(imports::list_import_drafts))
         .route(
+            "/api/capability-claims/content-moderator/passkey/start",
+            post(moderation::claim_start),
+        )
+        .route(
+            "/api/capability-claims/content-moderator/passkey/finish",
+            post(moderation::claim_finish),
+        )
+        .route("/api/recipes/{id}/reports", post(moderation::report_recipe))
+        .route("/api/notifications", get(moderation::list_notifications))
+        .route(
+            "/api/notifications/{id}/read",
+            put(moderation::read_notification),
+        )
+        .route(
+            "/api/recipes/{id}/appeals",
+            get(moderation::list_appeals).post(moderation::create_appeal),
+        )
+        .route(
+            "/api/admin/reauth/passkey/start",
+            post(moderation::reauth_start),
+        )
+        .route(
+            "/api/admin/reauth/passkey/finish",
+            post(moderation::reauth_finish),
+        )
+        .route("/api/admin/moderation/queue", get(moderation::queue))
+        .route(
+            "/api/admin/moderation/cases/{id}",
+            get(moderation::case_detail),
+        )
+        .route(
+            "/api/admin/moderation/cases/{id}/evidence-image",
+            get(moderation::case_evidence_image),
+        )
+        .route(
+            "/api/admin/moderation/recipes/{id}/review",
+            post(moderation::mark_reviewed),
+        )
+        .route(
+            "/api/admin/moderation/recipes/{id}/restrict",
+            post(moderation::restrict),
+        )
+        .route(
+            "/api/admin/moderation/recipes/{id}/reinstate",
+            post(moderation::reinstate),
+        )
+        .route(
+            "/api/admin/moderation/appeals/{id}/resolve",
+            post(moderation::resolve_appeal),
+        )
+        .route("/api/admin/audit-events", get(moderation::audit_events))
+        .route(
+            "/api/admin/audit-events/{id}",
+            get(moderation::audit_detail),
+        )
+        .route(
+            "/api/admin/audit-events/export",
+            get(moderation::audit_export),
+        )
+        .route(
             "/api/import-drafts/{id}",
             get(imports::get_import_draft)
                 .put(imports::update_import_draft)
@@ -253,7 +314,7 @@ async fn public_author_profile(
     let rows: Vec<(String, String)> = if let Some((created_at, recipe_id)) = cursor {
         sqlx::query_as(
             "SELECT id, created_at FROM recipes
-             WHERE owner_id = ? AND visibility = 'public'
+             WHERE owner_id = ? AND id IN (SELECT id FROM public_eligible_recipes)
                AND (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT 21",
         )
@@ -266,7 +327,7 @@ async fn public_author_profile(
     } else {
         sqlx::query_as(
             "SELECT id, created_at FROM recipes
-             WHERE owner_id = ? AND visibility = 'public'
+             WHERE owner_id = ? AND id IN (SELECT id FROM public_eligible_recipes)
              ORDER BY created_at DESC, id DESC LIMIT 21",
         )
         .bind(&author.0)
@@ -513,7 +574,7 @@ struct IngredientSuggestion {
 pub(crate) struct CurrentUser(pub User);
 
 #[derive(Clone)]
-struct CurrentAuth(AuthenticatedContext);
+pub(crate) struct CurrentAuth(pub AuthenticatedContext);
 
 async fn auth_config(State(state): State<AppState>) -> Json<AuthConfig> {
     Json(AuthConfig {
@@ -1215,13 +1276,20 @@ async fn update_recipe(
     input.ingredients = expand_ingredient_inputs(input.ingredients);
     validate_recipe(&input)?;
     let mut transaction = state.pool.begin().await?;
-    let previous_visibility: String =
-        sqlx::query_scalar("SELECT visibility FROM recipes WHERE id = ? AND owner_id = ?")
-            .bind(&id)
-            .bind(&user.id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(AppError::NotFound)?;
+    let previous: (String, String) = sqlx::query_as(
+        "SELECT visibility, moderation_state FROM recipes WHERE id = ? AND owner_id = ?",
+    )
+    .bind(&id)
+    .bind(&user.id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let previous_visibility = previous.0;
+    let effective_visibility = if previous.1 == "restricted" {
+        "private"
+    } else {
+        input.visibility.as_str()
+    };
     if input.ingredient_groups.is_none() {
         let requires_groups: i64 = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -1243,6 +1311,8 @@ async fn update_recipe(
     }
     let result = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?, visibility = ?,
+         publication_intent = ?, moderation_review_state = 'unreviewed',
+         moderation_version = moderation_version + 1,
          difficulty = ?, estimated_calories = ?, source_url = ?, source_title = ?,
          source_author = ?, source_license = ?, source_attribution = ?,
          version = version + 1,
@@ -1252,6 +1322,7 @@ async fn update_recipe(
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(input.instructions.trim())
+    .bind(effective_visibility)
     .bind(&input.visibility)
     .bind(input.difficulty)
     .bind(input.estimated_calories)
@@ -1273,7 +1344,7 @@ async fn update_recipe(
     }
     let groups = effective_ingredient_groups(&input)?;
     replace_ingredient_groups(&mut transaction, &id, &user.id, &groups).await?;
-    if previous_visibility == "public" && input.visibility == "private" {
+    if previous_visibility == "public" && effective_visibility == "private" {
         sqlx::query(
             "UPDATE recipe_images SET id = ?, version = version + 1, updated_at = ?
              WHERE recipe_id = ?",
@@ -1311,14 +1382,7 @@ async fn delete_recipe(
     Extension(CurrentUser(user)): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
-    let result = sqlx::query("DELETE FROM recipes WHERE id = ? AND owner_id = ?")
-        .bind(id)
-        .bind(user.id)
-        .execute(&state.pool)
-        .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound);
-    }
+    moderation::delete_owned_recipe(&state, &user.id, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1374,14 +1438,14 @@ async fn ingredient_suggestions(
              FROM recipe_ingredients ri
              JOIN recipes r ON r.id = ri.recipe_id
              WHERE ri.canonical_ingredient_id = c.id
-               AND (r.owner_id = ? OR r.visibility = 'public')
+               AND (r.owner_id = ? OR r.id IN (SELECT id FROM public_eligible_recipes))
          ) OR EXISTS (
              SELECT 1
              FROM recipe_ingredient_alternatives ria
              JOIN recipe_ingredient_groups rig ON rig.id = ria.group_id
              JOIN recipes r ON r.id = rig.recipe_id
              WHERE ria.canonical_ingredient_id = c.id
-               AND (r.owner_id = ? OR r.visibility = 'public')
+               AND (r.owner_id = ? OR r.id IN (SELECT id FROM public_eligible_recipes))
          ) OR EXISTS (
              SELECT 1 FROM ingredient_aliases a
              WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?
@@ -2217,13 +2281,17 @@ async fn canonical_ingredient_is_visible(
              SELECT 1 FROM recipe_ingredients ri
              JOIN recipes r ON r.id = ri.recipe_id
              WHERE ri.canonical_ingredient_id = c.id
-               AND (r.owner_id = ? OR r.visibility = 'public')
+               AND (r.owner_id = ? OR EXISTS (
+                 SELECT 1 FROM public_eligible_recipes p WHERE p.id = r.id
+               ))
            ) OR EXISTS (
              SELECT 1 FROM recipe_ingredient_alternatives ria
              JOIN recipe_ingredient_groups rig ON rig.id = ria.group_id
              JOIN recipes r ON r.id = rig.recipe_id
              WHERE ria.canonical_ingredient_id = c.id
-               AND (r.owner_id = ? OR r.visibility = 'public')
+               AND (r.owner_id = ? OR EXISTS (
+                 SELECT 1 FROM public_eligible_recipes p WHERE p.id = r.id
+               ))
            ) OR EXISTS (
              SELECT 1 FROM ingredient_aliases a
              WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?
@@ -2364,14 +2432,18 @@ async fn canonical_ingredient_is_visible_pool(
            OR EXISTS (
              SELECT 1 FROM recipe_ingredients ri JOIN recipes r ON r.id = ri.recipe_id
              WHERE ri.canonical_ingredient_id = c.id
-               AND (r.owner_id = ? OR r.visibility = 'public')
+               AND (r.owner_id = ? OR EXISTS (
+                 SELECT 1 FROM public_eligible_recipes p WHERE p.id = r.id
+               ))
            )
            OR EXISTS (
              SELECT 1 FROM recipe_ingredient_alternatives ria
              JOIN recipe_ingredient_groups rig ON rig.id = ria.group_id
              JOIN recipes r ON r.id = rig.recipe_id
              WHERE ria.canonical_ingredient_id = c.id
-               AND (r.owner_id = ? OR r.visibility = 'public')
+               AND (r.owner_id = ? OR EXISTS (
+                 SELECT 1 FROM public_eligible_recipes p WHERE p.id = r.id
+               ))
            )
            OR EXISTS (SELECT 1 FROM ingredient_aliases a
                       WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?)
@@ -2417,16 +2489,18 @@ async fn save_recipe(
     let mut transaction = pool.begin().await?;
     sqlx::query(
         "INSERT INTO recipes
-         (id, owner_id, title, description, instructions, visibility, difficulty,
+         (id, owner_id, title, description, instructions, visibility, publication_intent,
+          difficulty,
           estimated_calories, source_url, source_title, source_author, source_license,
           source_attribution)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(owner_id)
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(input.instructions.trim())
+    .bind(&input.visibility)
     .bind(&input.visibility)
     .bind(input.difficulty)
     .bind(input.estimated_calories)
@@ -2582,6 +2656,8 @@ pub(crate) async fn load_visible_recipes(
     let rows = if let Some(id) = id {
         sqlx::query(
             "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
+               r.publication_intent, r.moderation_state, r.moderation_review_state,
+               r.moderation_version,
                r.difficulty, r.estimated_calories, r.version,
                u.public_handle, u.public_nickname, r.source_url, r.source_title, r.source_author,
                r.source_license, r.source_attribution, r.source_warnings, r.source_confidence,
@@ -2589,7 +2665,9 @@ pub(crate) async fn load_visible_recipes(
                EXISTS(SELECT 1 FROM favorite_accounts fa
                       WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id) AS is_favorite_author
              FROM recipes r JOIN users u ON u.id = r.owner_id
-             WHERE r.id = ? AND (r.owner_id = ? OR r.visibility = 'public')",
+             WHERE r.id = ? AND (
+               r.owner_id = ? OR r.id IN (SELECT id FROM public_eligible_recipes)
+             )",
         )
         .bind(user_id)
         .bind(user_id)
@@ -2600,6 +2678,8 @@ pub(crate) async fn load_visible_recipes(
     } else {
         sqlx::query(
             "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
+               r.publication_intent, r.moderation_state, r.moderation_review_state,
+               r.moderation_version,
                r.difficulty, r.estimated_calories, r.version,
                u.public_handle, u.public_nickname, r.source_url, r.source_title, r.source_author,
                r.source_license, r.source_attribution, r.source_warnings, r.source_confidence,
@@ -2607,7 +2687,8 @@ pub(crate) async fn load_visible_recipes(
                EXISTS(SELECT 1 FROM favorite_accounts fa
                       WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id) AS is_favorite_author
              FROM recipes r JOIN users u ON u.id = r.owner_id
-             WHERE r.owner_id = ? OR r.visibility = 'public' ORDER BY r.updated_at DESC",
+             WHERE r.owner_id = ? OR r.id IN (SELECT id FROM public_eligible_recipes)
+             ORDER BY r.updated_at DESC",
         )
         .bind(user_id)
         .bind(user_id)
@@ -2667,6 +2748,10 @@ pub(crate) async fn load_visible_recipes(
             description: row.get("description"),
             instructions: row.get("instructions"),
             visibility: row.get("visibility"),
+            publication_intent: row.get("publication_intent"),
+            moderation_state: row.get("moderation_state"),
+            moderation_review_state: row.get("moderation_review_state"),
+            moderation_version: row.get("moderation_version"),
             difficulty: row.get("difficulty"),
             estimated_calories: row.get("estimated_calories"),
             version: row.get("version"),
@@ -2714,7 +2799,9 @@ async fn load_candidate_recipes(
 ) -> AppResult<Vec<Recipe>> {
     let rows = sqlx::query(
         "SELECT r.id, r.owner_id, r.title, r.visibility, r.difficulty,
-                r.estimated_calories, r.version, u.public_handle, u.public_nickname,
+                r.estimated_calories, r.version, r.publication_intent, r.moderation_state,
+                r.moderation_review_state, r.moderation_version,
+                u.public_handle, u.public_nickname,
                 EXISTS(SELECT 1 FROM favorites f
                        WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite,
                 EXISTS(SELECT 1 FROM favorite_accounts fa
@@ -2724,11 +2811,11 @@ async fn load_candidate_recipes(
          WHERE (? AND r.owner_id = ?)
             OR (? AND EXISTS(SELECT 1 FROM favorites f
                              WHERE f.user_id = ? AND f.recipe_id = r.id)
-                    AND (r.owner_id = ? OR r.visibility = 'public'))
-            OR (? AND r.visibility = 'public'
+                    AND (r.owner_id = ? OR r.id IN (SELECT id FROM public_eligible_recipes)))
+            OR (? AND r.id IN (SELECT id FROM public_eligible_recipes)
                     AND EXISTS(SELECT 1 FROM favorite_accounts fa
                                WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id))
-            OR (? AND r.owner_id <> ? AND r.visibility = 'public')
+            OR (? AND r.owner_id <> ? AND r.id IN (SELECT id FROM public_eligible_recipes))
          ORDER BY r.id
          LIMIT ?",
     )
@@ -2758,11 +2845,11 @@ async fn load_candidate_recipes(
            WHERE (? AND r.owner_id = ?)
               OR (? AND EXISTS(SELECT 1 FROM favorites f
                                WHERE f.user_id = ? AND f.recipe_id = r.id)
-                      AND (r.owner_id = ? OR r.visibility = 'public'))
-              OR (? AND r.visibility = 'public'
+                      AND (r.owner_id = ? OR r.id IN (SELECT id FROM public_eligible_recipes)))
+              OR (? AND r.id IN (SELECT id FROM public_eligible_recipes)
                       AND EXISTS(SELECT 1 FROM favorite_accounts fa
                                  WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id))
-              OR (? AND r.owner_id <> ? AND r.visibility = 'public')
+              OR (? AND r.owner_id <> ? AND r.id IN (SELECT id FROM public_eligible_recipes))
            ORDER BY r.id
            LIMIT ?
          )
@@ -2807,11 +2894,11 @@ async fn load_candidate_recipes(
            WHERE (? AND r.owner_id = ?)
               OR (? AND EXISTS(SELECT 1 FROM favorites f
                                WHERE f.user_id = ? AND f.recipe_id = r.id)
-                      AND (r.owner_id = ? OR r.visibility = 'public'))
-              OR (? AND r.visibility = 'public'
+                      AND (r.owner_id = ? OR r.id IN (SELECT id FROM public_eligible_recipes)))
+              OR (? AND r.id IN (SELECT id FROM public_eligible_recipes)
                       AND EXISTS(SELECT 1 FROM favorite_accounts fa
                                  WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id))
-              OR (? AND r.owner_id <> ? AND r.visibility = 'public')
+              OR (? AND r.owner_id <> ? AND r.id IN (SELECT id FROM public_eligible_recipes))
            ORDER BY r.id
            LIMIT ?
          )
@@ -2895,6 +2982,10 @@ async fn load_candidate_recipes(
                 description: String::new(),
                 instructions: String::new(),
                 visibility: row.get("visibility"),
+                publication_intent: row.get("publication_intent"),
+                moderation_state: row.get("moderation_state"),
+                moderation_review_state: row.get("moderation_review_state"),
+                moderation_version: row.get("moderation_version"),
                 difficulty: row.get("difficulty"),
                 estimated_calories: row.get("estimated_calories"),
                 version: row.get("version"),
@@ -2928,7 +3019,7 @@ async fn hydrate_recommendation_recipes(
          WHERE (r.owner_id = ",
     );
     query.push_bind(user_id);
-    query.push(" OR r.visibility = 'public') AND r.id IN (");
+    query.push(" OR r.id IN (SELECT id FROM public_eligible_recipes)) AND r.id IN (");
     {
         let mut separated = query.separated(", ");
         for recommendation in recommendations.iter() {
@@ -3011,7 +3102,7 @@ async fn discard_unauthorized_recommendations(
     }
     let mut query = QueryBuilder::<Sqlite>::new("SELECT id FROM recipes WHERE (owner_id = ");
     query.push_bind(user_id);
-    query.push(" OR visibility = 'public') AND id IN (");
+    query.push(" OR id IN (SELECT id FROM public_eligible_recipes)) AND id IN (");
     {
         let mut separated = query.separated(", ");
         for recommendation in recommendations.iter() {
@@ -3120,7 +3211,9 @@ pub(crate) async fn load_ingredient_groups(
 
 async fn ensure_visible_recipe(pool: &SqlitePool, user_id: &str, recipe_id: &str) -> AppResult<()> {
     let exists: Option<(i64,)> = sqlx::query_as(
-        "SELECT 1 FROM recipes WHERE id = ? AND (owner_id = ? OR visibility = 'public')",
+        "SELECT 1 FROM recipes WHERE id = ? AND (
+           owner_id = ? OR id IN (SELECT id FROM public_eligible_recipes)
+         )",
     )
     .bind(recipe_id)
     .bind(user_id)
@@ -3361,6 +3454,1272 @@ mod tests {
     async fn response_json(response: axum::response::Response) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn grant_fresh_moderator(pool: &SqlitePool, display_name: &str) -> String {
+        let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE display_name = ?")
+            .bind(display_name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO capability_assignments (id, user_id, capability, created_at)
+             VALUES (?, ?, 'content_moderation', ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&user_id)
+        .bind(Utc::now().timestamp())
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE auth_sessions SET passkey_verified_at = ? WHERE user_id = ?")
+            .bind(Utc::now().timestamp())
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        user_id
+    }
+
+    async fn report_recipe(app: &axum::Router, reporter_cookie: &str, recipe_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/reports"))
+                    .header("content-type", "application/json")
+                    .header("cookie", reporter_cookie)
+                    .body(Body::from(
+                        json!({"reason": "misleading", "details": "incorrect claim"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response_json(response).await
+    }
+
+    async fn admin_recipe_mutation(
+        app: &axum::Router,
+        cookie: &str,
+        recipe_id: &str,
+        action: &str,
+        key: &str,
+        body: &Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/admin/moderation/recipes/{recipe_id}/{action}"
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .header("origin", "http://localhost")
+                .header("idempotency-key", key)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn moderation_enforces_anonymity_step_up_idempotency_and_public_removal() {
+        let (app, _auth, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Moderation owner").await;
+        let reporter_cookie = login(&app, "Moderation reporter").await;
+        let moderator_cookie = login(&app, "Moderation moderator").await;
+        let recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+
+        let self_report = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/reports"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({"reason": "spam", "details": ""}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(self_report.status(), StatusCode::NOT_FOUND);
+
+        let report = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/reports"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &reporter_cookie)
+                    .body(Body::from(
+                        json!({"reason": "misleading", "details": "<script>alert(1)</script>"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.status(), StatusCode::CREATED);
+
+        let non_moderator_queue = app
+            .clone()
+            .oneshot(
+                Request::get("/api/admin/moderation/queue")
+                    .header("cookie", &reporter_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_moderator_queue.status(), StatusCode::NOT_FOUND);
+
+        let moderator_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE display_name = 'Moderation moderator'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let assignment_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO capability_assignments (id, user_id, capability, created_at)
+             VALUES (?, ?, 'content_moderation', ?)",
+        )
+        .bind(&assignment_id)
+        .bind(&moderator_id)
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let key = Uuid::new_v4().to_string();
+        let restriction_without_case_version = json!({
+            "expectedRecipeVersion": recipe["version"],
+            "expectedModerationVersion": recipe["moderationVersion"],
+            "expectedCaseVersion": null,
+            "reasonCode": "policy_violation"
+        });
+        let expired_step_up = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/admin/moderation/recipes/{recipe_id}/restrict"
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &moderator_cookie)
+                .header("origin", "http://localhost")
+                .header("idempotency-key", &key)
+                .body(Body::from(restriction_without_case_version.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired_step_up.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(expired_step_up).await["error"],
+            "admin_passkey_reauth_required"
+        );
+
+        sqlx::query("UPDATE auth_sessions SET passkey_verified_at = ? WHERE user_id = ?")
+            .bind(Utc::now().timestamp())
+            .bind(&moderator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let active_case_version: i64 = sqlx::query_scalar(
+            "SELECT version FROM moderation_cases
+                 WHERE recipe_id = ? AND status = 'open'",
+        )
+        .bind(recipe_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let missing_case_version = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/admin/moderation/recipes/{recipe_id}/restrict"
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &moderator_cookie)
+                .header("origin", "http://localhost")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(restriction_without_case_version.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_case_version.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(missing_case_version).await["caseVersion"],
+            active_case_version
+        );
+        let restriction = json!({
+            "expectedRecipeVersion": recipe["version"],
+            "expectedModerationVersion": recipe["moderationVersion"],
+            "expectedCaseVersion": active_case_version,
+            "reasonCode": "policy_violation"
+        });
+        sqlx::query(
+            "INSERT INTO recipe_images
+             (id, recipe_id, media_type, image_bytes, width, height, sha256, alt_text, updated_at)
+             VALUES ('old-public-image', ?, 'image/jpeg', X'0102', 1, 1, zeroblob(32), 'cover', ?)",
+        )
+        .bind(recipe_id)
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let restricted = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/admin/moderation/recipes/{recipe_id}/restrict"
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &moderator_cookie)
+                .header("origin", "http://localhost")
+                .header("idempotency-key", &key)
+                .body(Body::from(restriction.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restricted.status(), StatusCode::OK);
+        let restricted_body = response_json(restricted).await;
+
+        let replayed = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/admin/moderation/recipes/{recipe_id}/restrict"
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &moderator_cookie)
+                .header("origin", "http://localhost")
+                .header("idempotency-key", &key)
+                .body(Body::from(restriction.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.status(), StatusCode::OK);
+        assert_eq!(response_json(replayed).await, restricted_body);
+
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/admin/moderation/recipes/{recipe_id}/restrict"
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &moderator_cookie)
+                .header("origin", "http://localhost")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(restriction.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale_body = response_json(stale).await;
+        assert_eq!(stale_body["recipeVersion"], recipe["version"]);
+        assert_eq!(
+            stale_body["moderationVersion"],
+            restricted_body["moderationVersion"]
+        );
+
+        let hidden_recipe = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &reporter_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hidden_recipe.status(), StatusCode::NOT_FOUND);
+        let owner_recipe = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_recipe.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(owner_recipe).await["publicationIntent"],
+            "public"
+        );
+
+        let old_image = app
+            .clone()
+            .oneshot(
+                Request::get("/api/recipe-images/old-public-image")
+                    .header("cookie", &reporter_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_image.status(), StatusCode::NOT_FOUND);
+
+        let case_id = restricted_body["caseId"].as_str().unwrap();
+        let case_detail = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/admin/moderation/cases/{case_id}"))
+                    .header("cookie", &moderator_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(case_detail.status(), StatusCode::OK);
+        let case_body = response_json(case_detail).await;
+        assert_eq!(
+            case_body["reports"][0]["details"],
+            "<script>alert(1)</script>"
+        );
+        assert!(case_body["reports"][0].get("reporterUserId").is_none());
+        assert!(case_body.get("assignmentId").is_none());
+
+        let audit_id: String = sqlx::query_scalar("SELECT id FROM moderation_audit_events LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query(
+            "UPDATE moderation_audit_events SET event_type = 'changed' WHERE id = ?"
+        )
+        .bind(&audit_id)
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(
+            sqlx::query("DELETE FROM moderation_audit_events WHERE id = ?")
+                .bind(audit_id)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let case_status: String =
+            sqlx::query_scalar("SELECT status FROM moderation_cases WHERE id = ?")
+                .bind(case_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(case_status, "content_removed");
+    }
+
+    #[tokio::test]
+    async fn moderation_idempotency_is_resource_bound_and_review_closes_open_case() {
+        let (app, _auth, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Resource owner").await;
+        let reporter_cookie = login(&app, "Resource reporter").await;
+        let moderator_cookie = login(&app, "Resource moderator").await;
+        grant_fresh_moderator(&pool, "Resource moderator").await;
+
+        let first = create_recipe(&app, &owner_cookie, "public").await;
+        let second = create_recipe(&app, &owner_cookie, "public").await;
+        let shared_key = Uuid::new_v4().to_string();
+        let review_without_case = json!({
+            "expectedRecipeVersion": 1,
+            "expectedModerationVersion": 1,
+            "expectedCaseVersion": null,
+            "reasonCode": "no_action_needed"
+        });
+        let first_review = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            first["id"].as_str().unwrap(),
+            "review",
+            &shared_key,
+            &review_without_case,
+        )
+        .await;
+        assert_eq!(first_review.status(), StatusCode::OK);
+        let cross_resource_reuse = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            second["id"].as_str().unwrap(),
+            "review",
+            &shared_key,
+            &review_without_case,
+        )
+        .await;
+        assert_eq!(cross_resource_reuse.status(), StatusCode::CONFLICT);
+
+        let reported = create_recipe(&app, &owner_cookie, "public").await;
+        let reported_id = reported["id"].as_str().unwrap();
+        report_recipe(&app, &reporter_cookie, reported_id).await;
+        let case_row = sqlx::query(
+            "SELECT id, version FROM moderation_cases
+             WHERE recipe_id = ? AND status = 'open'",
+        )
+        .bind(reported_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let review_report = json!({
+            "expectedRecipeVersion": reported["version"],
+            "expectedModerationVersion": reported["moderationVersion"],
+            "expectedCaseVersion": case_row.get::<i64, _>("version"),
+            "reasonCode": "report_resolved"
+        });
+        let reviewed = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            reported_id,
+            "review",
+            &Uuid::new_v4().to_string(),
+            &review_report,
+        )
+        .await;
+        assert_eq!(reviewed.status(), StatusCode::OK);
+        let reviewed_body = response_json(reviewed).await;
+        assert_eq!(reviewed_body["caseId"], case_row.get::<String, _>("id"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM moderation_cases WHERE id = ?")
+                .bind(case_row.get::<String, _>("id"))
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "resolved"
+        );
+        let queue = app
+            .clone()
+            .oneshot(
+                Request::get("/api/admin/moderation/queue")
+                    .header("cookie", &moderator_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.status(), StatusCode::OK);
+        assert!(response_json(queue).await["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["recipeId"] != reported_id));
+    }
+
+    #[tokio::test]
+    async fn restricted_edits_refresh_evidence_and_invalidate_stale_reinstate() {
+        let (app, _auth, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Evidence owner").await;
+        let reporter_cookie = login(&app, "Evidence reporter").await;
+        let moderator_cookie = login(&app, "Evidence moderator").await;
+        grant_fresh_moderator(&pool, "Evidence moderator").await;
+        let recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        report_recipe(&app, &reporter_cookie, recipe_id).await;
+        let initial_case_version: i64 = sqlx::query_scalar(
+            "SELECT version FROM moderation_cases
+             WHERE recipe_id = ? AND status = 'open'",
+        )
+        .bind(recipe_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let restrict_body = json!({
+            "expectedRecipeVersion": recipe["version"],
+            "expectedModerationVersion": recipe["moderationVersion"],
+            "expectedCaseVersion": initial_case_version,
+            "reasonCode": "policy_violation"
+        });
+        let restricted = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            recipe_id,
+            "restrict",
+            &Uuid::new_v4().to_string(),
+            &restrict_body,
+        )
+        .await;
+        assert_eq!(restricted.status(), StatusCode::OK);
+        let restricted = response_json(restricted).await;
+
+        let owner_update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .body(Body::from(
+                        json!({
+                            "title": "Corrected restricted soup",
+                            "description": "current evidence",
+                            "instructions": "Use the corrected method.",
+                            "visibility": "public",
+                            "ingredients": [{"name": "water", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_update.status(), StatusCode::OK);
+        let owner_update = response_json(owner_update).await;
+        let evidence = sqlx::query(
+            "SELECT e.recipe_version, e.title, c.version AS case_version
+             FROM moderation_evidence_snapshots e
+             JOIN moderation_cases c ON c.id = e.case_id
+             WHERE e.recipe_id = ? AND c.status = 'restricted'",
+        )
+        .bind(recipe_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            evidence.get::<i64, _>("recipe_version"),
+            owner_update["version"]
+        );
+        assert_eq!(
+            evidence.get::<String, _>("title"),
+            "Corrected restricted soup"
+        );
+        assert!(
+            evidence.get::<i64, _>("case_version") > restricted["caseVersion"].as_i64().unwrap()
+        );
+
+        let stale_reinstate = json!({
+            "expectedRecipeVersion": restricted["recipeVersion"],
+            "expectedModerationVersion": restricted["moderationVersion"],
+            "expectedCaseVersion": restricted["caseVersion"],
+            "reasonCode": "appeal_reviewed"
+        });
+        let stale = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            recipe_id,
+            "reinstate",
+            &Uuid::new_v4().to_string(),
+            &stale_reinstate,
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let appeal = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/appeals"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({"reason": "Please review the corrected version."}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(appeal.status(), StatusCode::CREATED);
+        let appeal = response_json(appeal).await;
+        let current_reinstate = json!({
+            "resolution": "reinstate",
+            "expectedRecipeVersion": owner_update["version"],
+            "expectedModerationVersion": owner_update["moderationVersion"],
+            "expectedCaseVersion": evidence.get::<i64, _>("case_version"),
+            "expectedAppealVersion": appeal["version"],
+            "reasonCode": "appeal_reviewed"
+        });
+        let reinstated = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/admin/moderation/appeals/{}/resolve",
+                    appeal["id"].as_str().unwrap()
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &moderator_cookie)
+                .header("origin", "http://localhost")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(current_reinstate.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reinstated.status(), StatusCode::OK);
+        let public_recipe = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &reporter_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_recipe.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(public_recipe).await["title"],
+            "Corrected restricted soup"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_case_edits_refresh_evidence_before_review_or_restriction() {
+        let (app, _auth, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Open evidence owner").await;
+        let reporter_cookie = login(&app, "Open evidence reporter").await;
+        let moderator_cookie = login(&app, "Open evidence moderator").await;
+        grant_fresh_moderator(&pool, "Open evidence moderator").await;
+
+        let review_recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let review_recipe_id = review_recipe["id"].as_str().unwrap();
+        report_recipe(&app, &reporter_cookie, review_recipe_id).await;
+        let stale_case_version: i64 = sqlx::query_scalar(
+            "SELECT version FROM moderation_cases
+             WHERE recipe_id = ? AND status = 'open'",
+        )
+        .bind(review_recipe_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let review_update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{review_recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .body(Body::from(
+                        json!({
+                            "title": "Open case v2",
+                            "description": "current open evidence",
+                            "instructions": "Review this version.",
+                            "visibility": "public",
+                            "ingredients": [{"name": "water", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(review_update.status(), StatusCode::OK);
+        let review_update = response_json(review_update).await;
+        let review_evidence = sqlx::query(
+            "SELECT e.recipe_version, e.title, c.version AS case_version
+             FROM moderation_evidence_snapshots e
+             JOIN moderation_cases c ON c.id = e.case_id
+             WHERE e.recipe_id = ? AND c.status = 'open'",
+        )
+        .bind(review_recipe_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            review_evidence.get::<i64, _>("recipe_version"),
+            review_update["version"]
+        );
+        assert_eq!(review_evidence.get::<String, _>("title"), "Open case v2");
+        assert!(review_evidence.get::<i64, _>("case_version") > stale_case_version);
+        let stale_review = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            review_recipe_id,
+            "review",
+            &Uuid::new_v4().to_string(),
+            &json!({
+                "expectedRecipeVersion": review_update["version"],
+                "expectedModerationVersion": review_update["moderationVersion"],
+                "expectedCaseVersion": stale_case_version,
+                "reasonCode": "report_resolved"
+            }),
+        )
+        .await;
+        assert_eq!(stale_review.status(), StatusCode::CONFLICT);
+        let reviewed = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            review_recipe_id,
+            "review",
+            &Uuid::new_v4().to_string(),
+            &json!({
+                "expectedRecipeVersion": review_update["version"],
+                "expectedModerationVersion": review_update["moderationVersion"],
+                "expectedCaseVersion": review_evidence.get::<i64, _>("case_version"),
+                "reasonCode": "report_resolved"
+            }),
+        )
+        .await;
+        assert_eq!(reviewed.status(), StatusCode::OK);
+
+        let restrict_recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let restrict_recipe_id = restrict_recipe["id"].as_str().unwrap();
+        report_recipe(&app, &reporter_cookie, restrict_recipe_id).await;
+        let restrict_update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{restrict_recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .body(Body::from(
+                        json!({
+                            "title": "Restrict current v2",
+                            "description": "current restriction evidence",
+                            "instructions": "Restrict this version.",
+                            "visibility": "public",
+                            "ingredients": [{"name": "water", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restrict_update.status(), StatusCode::OK);
+        let restrict_update = response_json(restrict_update).await;
+        let current_case_version: i64 = sqlx::query_scalar(
+            "SELECT version FROM moderation_cases
+             WHERE recipe_id = ? AND status = 'open'",
+        )
+        .bind(restrict_recipe_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let restricted = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            restrict_recipe_id,
+            "restrict",
+            &Uuid::new_v4().to_string(),
+            &json!({
+                "expectedRecipeVersion": restrict_update["version"],
+                "expectedModerationVersion": restrict_update["moderationVersion"],
+                "expectedCaseVersion": current_case_version,
+                "reasonCode": "policy_violation"
+            }),
+        )
+        .await;
+        assert_eq!(restricted.status(), StatusCode::OK);
+        let restricted = response_json(restricted).await;
+        let reinstated = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            restrict_recipe_id,
+            "reinstate",
+            &Uuid::new_v4().to_string(),
+            &json!({
+                "expectedRecipeVersion": restricted["recipeVersion"],
+                "expectedModerationVersion": restricted["moderationVersion"],
+                "expectedCaseVersion": restricted["caseVersion"],
+                "reasonCode": "appeal_reviewed"
+            }),
+        )
+        .await;
+        assert_eq!(reinstated.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn moderation_evidence_image_requires_fresh_non_owner_case_access() {
+        let (app, _auth, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Image evidence owner").await;
+        let reporter_cookie = login(&app, "Image evidence reporter").await;
+        let moderator_cookie = login(&app, "Image evidence moderator").await;
+        let moderator_id = grant_fresh_moderator(&pool, "Image evidence moderator").await;
+        let recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        sqlx::query(
+            "INSERT INTO recipe_images
+             (id, recipe_id, media_type, image_bytes, width, height, sha256, alt_text, updated_at)
+             VALUES ('evidence-public-image', ?, 'image/jpeg', X'0102', 1, 1,
+                     zeroblob(32), 'evidence cover', ?)",
+        )
+        .bind(recipe_id)
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+        report_recipe(&app, &reporter_cookie, recipe_id).await;
+        let case_version: i64 = sqlx::query_scalar(
+            "SELECT version FROM moderation_cases
+             WHERE recipe_id = ? AND status = 'open'",
+        )
+        .bind(recipe_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let restricted = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            recipe_id,
+            "restrict",
+            &Uuid::new_v4().to_string(),
+            &json!({
+                "expectedRecipeVersion": recipe["version"],
+                "expectedModerationVersion": recipe["moderationVersion"],
+                "expectedCaseVersion": case_version,
+                "reasonCode": "policy_violation"
+            }),
+        )
+        .await;
+        assert_eq!(restricted.status(), StatusCode::OK);
+        let restricted = response_json(restricted).await;
+        let case_id = restricted["caseId"].as_str().unwrap();
+        let private_image_id: String = sqlx::query_scalar(
+            "SELECT image_id FROM moderation_evidence_snapshots WHERE case_id = ?",
+        )
+        .bind(case_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let ordinary_image = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipe-images/{private_image_id}"))
+                    .header("cookie", &reporter_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_image.status(), StatusCode::NOT_FOUND);
+
+        let evidence_image = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/moderation/cases/{case_id}/evidence-image"
+                ))
+                .header("cookie", &moderator_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence_image.status(), StatusCode::OK);
+        assert_eq!(
+            evidence_image.headers()["cache-control"],
+            "private, no-store"
+        );
+        assert_eq!(
+            to_bytes(evidence_image.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            &[1, 2][..]
+        );
+        let reinstated = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            recipe_id,
+            "reinstate",
+            &Uuid::new_v4().to_string(),
+            &json!({
+                "expectedRecipeVersion": restricted["recipeVersion"],
+                "expectedModerationVersion": restricted["moderationVersion"],
+                "expectedCaseVersion": restricted["caseVersion"],
+                "reasonCode": "appeal_reviewed"
+            }),
+        )
+        .await;
+        assert_eq!(reinstated.status(), StatusCode::OK);
+        sqlx::query(
+            "UPDATE recipe_images
+             SET id = 'replacement-image', image_bytes = X'0304', sha256 = zeroblob(32)
+             WHERE recipe_id = ?",
+        )
+        .bind(recipe_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let after_replacement = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/moderation/cases/{case_id}/evidence-image"
+                ))
+                .header("cookie", &moderator_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_replacement.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(after_replacement.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            &[1, 2][..]
+        );
+        let deleted_cover = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}/cover"))
+                    .header("cookie", &owner_cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .header("idempotency-key", cover_key("evidence-delete"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted_cover.status(), StatusCode::OK);
+        let retained_evidence = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/moderation/cases/{case_id}/evidence-image"
+                ))
+                .header("cookie", &moderator_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained_evidence.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(retained_evidence.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            &[1, 2][..]
+        );
+        let retained_row = sqlx::query(
+            "SELECT length(image_bytes) AS byte_count, length(image_sha256) AS digest_size
+             FROM moderation_evidence_snapshots WHERE case_id = ?",
+        )
+        .bind(case_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_row.get::<i64, _>("byte_count"), 2);
+        assert_eq!(retained_row.get::<i64, _>("digest_size"), 32);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM recipe_images WHERE recipe_id = ?",)
+                .bind(recipe_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let non_moderator = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/moderation/cases/{case_id}/evidence-image"
+                ))
+                .header("cookie", &reporter_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_moderator.status(), StatusCode::NOT_FOUND);
+        sqlx::query("UPDATE auth_sessions SET passkey_verified_at = ? WHERE user_id = ?")
+            .bind(Utc::now().timestamp() - 11 * 60)
+            .bind(&moderator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale_moderator = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/moderation/cases/{case_id}/evidence-image"
+                ))
+                .header("cookie", &moderator_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_moderator.status(), StatusCode::FORBIDDEN);
+
+        grant_fresh_moderator(&pool, "Image evidence owner").await;
+        let self_moderation = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/moderation/cases/{case_id}/evidence-image"
+                ))
+                .header("cookie", &owner_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(self_moderation.status(), StatusCode::NOT_FOUND);
+        sqlx::query("DELETE FROM moderation_cases WHERE id = ?")
+            .bind(case_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM moderation_evidence_snapshots WHERE case_id = ?",
+            )
+            .bind(case_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn recipe_delete_preserves_active_case_image_evidence_and_rolls_back_atomically() {
+        let (app, _auth, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Delete evidence owner").await;
+        let reporter_cookie = login(&app, "Delete evidence reporter").await;
+        let moderator_cookie = login(&app, "Delete evidence moderator").await;
+        grant_fresh_moderator(&pool, "Delete evidence moderator").await;
+        let recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        sqlx::query(
+            "INSERT INTO recipe_images
+             (id, recipe_id, media_type, image_bytes, width, height, sha256, alt_text, updated_at)
+             VALUES ('delete-evidence-image', ?, 'image/jpeg', X'0102', 1, 1,
+                     zeroblob(32), 'delete evidence cover', ?)",
+        )
+        .bind(recipe_id)
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+        report_recipe(&app, &reporter_cookie, recipe_id).await;
+        let case_version: i64 = sqlx::query_scalar(
+            "SELECT version FROM moderation_cases
+             WHERE recipe_id = ? AND status = 'open'",
+        )
+        .bind(recipe_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let restricted = admin_recipe_mutation(
+            &app,
+            &moderator_cookie,
+            recipe_id,
+            "restrict",
+            &Uuid::new_v4().to_string(),
+            &json!({
+                "expectedRecipeVersion": recipe["version"],
+                "expectedModerationVersion": recipe["moderationVersion"],
+                "expectedCaseVersion": case_version,
+                "reasonCode": "policy_violation"
+            }),
+        )
+        .await;
+        assert_eq!(restricted.status(), StatusCode::OK);
+        let restricted = response_json(restricted).await;
+        let case_id = restricted["caseId"].as_str().unwrap();
+        let appeal = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/appeals"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({"reason": "Preserve this evidence during deletion."}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(appeal.status(), StatusCode::CREATED);
+        let appeal_id = response_json(appeal).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = sqlx::query(
+            "SELECT title, image_id, image_bytes, image_media_type, image_sha256
+             FROM moderation_evidence_snapshots WHERE case_id = ?",
+        )
+        .bind(case_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let evidence_image_id: String = before.get("image_id");
+        let evidence_bytes: Vec<u8> = before.get("image_bytes");
+        let evidence_media_type: String = before.get("image_media_type");
+        let evidence_digest: Vec<u8> = before.get("image_sha256");
+
+        sqlx::query(
+            "CREATE TRIGGER fail_recipe_delete_for_evidence
+             BEFORE DELETE ON recipes
+             BEGIN
+               SELECT RAISE(ABORT, 'forced recipe delete failure');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let failed_delete = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed_delete.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM moderation_cases WHERE id = ?")
+                .bind(case_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "restricted"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM moderation_appeals WHERE id = ?")
+                .bind(&appeal_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "active"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM recipes WHERE id = ?")
+                .bind(recipe_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query("DROP TRIGGER fail_recipe_delete_for_evidence")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM moderation_cases WHERE id = ?")
+                .bind(case_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "content_removed"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM moderation_appeals WHERE id = ?")
+                .bind(&appeal_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "content_removed"
+        );
+        let after = sqlx::query(
+            "SELECT title, image_id, image_bytes, image_media_type, image_sha256
+             FROM moderation_evidence_snapshots WHERE case_id = ?",
+        )
+        .bind(case_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after.get::<String, _>("title"),
+            before.get::<String, _>("title")
+        );
+        assert_eq!(after.get::<String, _>("image_id"), evidence_image_id);
+        assert_eq!(after.get::<Vec<u8>, _>("image_bytes"), evidence_bytes);
+        assert_eq!(
+            after.get::<String, _>("image_media_type"),
+            evidence_media_type
+        );
+        assert_eq!(after.get::<Vec<u8>, _>("image_sha256"), evidence_digest);
+        let evidence_image = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/moderation/cases/{case_id}/evidence-image"
+                ))
+                .header("cookie", &moderator_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence_image.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(evidence_image.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            &[1, 2][..]
+        );
+        let ordinary_image = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipe-images/{evidence_image_id}"))
+                    .header("cookie", &reporter_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_image.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deleted_recipe_case_still_rejects_self_moderation() {
+        let (app, _auth, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Deleted case owner").await;
+        let reporter_cookie = login(&app, "Deleted case reporter").await;
+        let recipe = create_recipe(&app, &owner_cookie, "public").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        report_recipe(&app, &reporter_cookie, recipe_id).await;
+        let case_id: String =
+            sqlx::query_scalar("SELECT id FROM moderation_cases WHERE recipe_id = ?")
+                .bind(recipe_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        grant_fresh_moderator(&pool, "Deleted case owner").await;
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let self_case = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/admin/moderation/cases/{case_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(self_case.status(), StatusCode::NOT_FOUND);
     }
 
     async fn save_profile(app: &axum::Router, cookie: &str, nickname: Option<&str>) -> Value {
@@ -3751,11 +5110,15 @@ mod tests {
                 .contains(&json!("FAVORITE_ACCOUNT"))
         }));
 
-        sqlx::query("UPDATE recipes SET visibility = 'private' WHERE id = ?")
-            .bind(second["id"].as_str().unwrap())
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE recipes
+             SET visibility = 'private', publication_intent = 'private'
+             WHERE id = ?",
+        )
+        .bind(second["id"].as_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
         let recommendations = response_json(
             app.oneshot(
                 Request::post("/api/recommendations")
@@ -3819,11 +5182,15 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), hook.selected.notified())
             .await
             .expect("recommendation selection did not reach test hook");
-        sqlx::query("UPDATE recipes SET visibility = 'private' WHERE id = ?")
-            .bind(&recipe_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE recipes
+             SET visibility = 'private', publication_intent = 'private'
+             WHERE id = ?",
+        )
+        .bind(&recipe_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         hook.resume.notify_one();
         let response = request.await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -3871,10 +5238,11 @@ mod tests {
                SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 10000
              )
              INSERT INTO recipes
-               (id, owner_id, title, description, instructions, visibility, created_at, updated_at)
+               (id, owner_id, title, description, instructions, visibility,
+                publication_intent, created_at, updated_at)
              SELECT printf('scale-recipe-%05d', x),
                     printf('scale-author-%04d', ((x - 1) % 500) + 1),
-                    printf('Scale recipe %05d', x), '', '', 'public',
+                    printf('Scale recipe %05d', x), '', '', 'public', 'public',
                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
              FROM seq",
         )
@@ -3912,9 +5280,10 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO recipes
-               (id, owner_id, title, description, instructions, visibility, created_at, updated_at)
+               (id, owner_id, title, description, instructions, visibility,
+                publication_intent, created_at, updated_at)
              VALUES ('scale-recipe-over-limit', 'scale-author-0001', 'Over limit',
-                     '', '', 'public', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                     '', '', 'public', 'public', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .execute(&pool)
         .await

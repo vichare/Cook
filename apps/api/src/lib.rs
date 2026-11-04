@@ -8,6 +8,7 @@ pub mod importer;
 pub mod imports;
 pub mod ingredients;
 pub mod models;
+pub mod moderation;
 pub mod passwordless;
 pub mod recommendation;
 pub mod routes;

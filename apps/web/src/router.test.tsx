@@ -32,12 +32,14 @@ import {
   RecommendationsPage,
   ShoppingListPage,
   persistRecipeEdit,
+  moderationMutationInput,
+  moderationEvidenceImageUrl,
   pantryStatusForIngredient,
   recipeSchema,
 } from './router'
 import type { RecipeForm } from './router'
 import { LocaleProvider, useI18n, type Locale } from './i18n'
-import type { PantryItem, Recipe, Recommendation } from './types'
+import type { ModerationQueueItem, PantryItem, Recipe, Recommendation } from './types'
 
 const storedLocale = { value: null as string | null }
 const testStorage = {
@@ -54,6 +56,38 @@ function Providers({ children, locale = 'en' }: { children: React.ReactNode; loc
     </LocaleProvider>
   )
 }
+
+describe('moderation mutations', () => {
+  it('uses the documented review reason independently of enforcement reasons', () => {
+    const item: ModerationQueueItem = {
+      recipeId: 'recipe',
+      title: 'Soup',
+      authorHandle: 'author',
+      reviewState: 'unreviewed',
+      moderationState: 'clear',
+      recipeVersion: 4,
+      moderationVersion: 7,
+      caseId: 'case',
+      caseVersion: 3,
+      reportCount: 1,
+      activeAppeal: false,
+      updatedAt: '2026-01-01T00:00:00Z',
+    }
+
+    expect(moderationMutationInput(item, 'review', 'policy_violation')).toEqual({
+      expectedRecipeVersion: 4,
+      expectedModerationVersion: 7,
+      expectedCaseVersion: 3,
+      reasonCode: 'no_action_needed',
+    })
+  })
+
+  it('uses the case-bound evidence image endpoint', () => {
+    expect(moderationEvidenceImageUrl('case/id')).toBe(
+      '/api/admin/moderation/cases/case%2Fid/evidence-image',
+    )
+  })
+})
 
 const {
   deleteRecipeCover,
@@ -406,6 +440,10 @@ describe('shopping list', () => {
       description: '',
       instructions: 'Stir.',
       visibility: 'private',
+      publicationIntent: 'private',
+      moderationState: 'clear',
+      moderationReviewState: 'unreviewed',
+      moderationVersion: 1,
       difficulty: null,
       estimatedCalories: null,
       ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
@@ -1197,6 +1235,10 @@ describe('recommendation shopping membership', () => {
         description: '',
         instructions: '',
         visibility: 'private' as const,
+        publicationIntent: 'private' as const,
+        moderationState: 'clear' as const,
+        moderationReviewState: 'unreviewed' as const,
+        moderationVersion: 1,
         difficulty: null,
         estimatedCalories: null,
         ingredients: [{
@@ -1748,6 +1790,10 @@ describe('recipe card navigation and provenance', () => {
       description: 'Recipe description',
       instructions: 'Stir the soup.',
       visibility: 'private',
+      publicationIntent: 'private',
+      moderationState: 'clear',
+      moderationReviewState: 'unreviewed',
+      moderationVersion: 1,
       difficulty: null,
       estimatedCalories: null,
       ingredients: [{ name: 'water', quantityNote: '1 cup', canonicalIngredientId: null }],
@@ -1886,6 +1932,7 @@ describe('profile setup', () => {
     nickname: null,
     onboardingCompleted: false,
     locale: 'en' as const,
+    capabilities: [],
   }
 
   it('defaults to locale-rendered anonymous state without publishing the Google name', async () => {
@@ -1910,6 +1957,7 @@ describe('profile setup', () => {
         nickname: null,
         onboardingCompleted: true,
         locale: 'en' as const,
+        capabilities: [],
       }
       render(
         <Providers>

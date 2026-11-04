@@ -22,10 +22,20 @@ pub enum AppError {
     NotFound,
     #[error("permission denied")]
     Forbidden,
+    #[error("fresh Passkey verification is required")]
+    AdminReauthRequired,
     #[error("{0}")]
     PayloadTooLarge(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{message}")]
+    ModerationConflict {
+        message: String,
+        recipe_version: Option<i64>,
+        moderation_version: Option<i64>,
+        case_version: Option<i64>,
+        appeal_version: Option<i64>,
+    },
     #[error("{0}")]
     Validation(String),
     #[error("{0}")]
@@ -45,36 +55,81 @@ impl AppError {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ErrorBody {
     error: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recipe_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moderation_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    case_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    appeal_version: Option<i64>,
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, error) = match self {
+        let self_ = match self {
+            Self::ModerationConflict {
+                message,
+                recipe_version,
+                moderation_version,
+                case_version,
+                appeal_version,
+            } => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ErrorBody {
+                        error: "conflict",
+                        message,
+                        recipe_version,
+                        moderation_version,
+                        case_version,
+                        appeal_version,
+                    }),
+                )
+                    .into_response();
+            }
+            other => other,
+        };
+        let (status, error) = match self_ {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             Self::AuthUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "auth_unavailable"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::AdminReauthRequired => (StatusCode::FORBIDDEN, "admin_passkey_reauth_required"),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            Self::ModerationConflict { .. } => unreachable!(),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
             Self::Configuration(_)
             | Self::Data(_)
             | Self::Database(_)
             | Self::Migration(_)
             | Self::Io(_) => {
-                tracing::error!(error = %self, "request failed");
+                tracing::error!(error = %self_, "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
             }
         };
         let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
             "The server could not complete the request.".to_string()
         } else {
-            self.to_string()
+            self_.to_string()
         };
-        (status, Json(ErrorBody { error, message })).into_response()
+        (
+            status,
+            Json(ErrorBody {
+                error,
+                message,
+                recipe_version: None,
+                moderation_version: None,
+                case_version: None,
+                appeal_version: None,
+            }),
+        )
+            .into_response()
     }
 }

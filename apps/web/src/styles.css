@@ -163,6 +163,10 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .source-details-list a { word-break: break-word; }
 .shopping-membership-status { min-height: 44px; display: inline-flex; align-items: center; padding: .55rem .8rem; border: 1px solid currentColor; border-radius: .75rem; font-weight: 700; }
 .status-banner { margin: 1rem 0; padding: 1rem; border: 2px solid var(--forest); border-radius: 1rem; background: #eef4e9; display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; justify-content: space-between; }
+.moderation-banner { margin-top: 1.5rem; padding: 1.25rem; border: 2px solid #8a2d24; border-radius: 1rem; background: #fff0ed; display: grid; gap: .8rem; }
+.moderation-banner h2 { margin: 0; }
+.moderation-queue { display: grid; gap: 1rem; margin-top: 1.5rem; }
+.moderation-card { display: grid; gap: 1rem; }
 .recipe-metadata { display: flex; flex-wrap: wrap; gap: .75rem; margin: .75rem 0; }
 .recipe-metadata div { padding: .6rem .8rem; border: 1px solid var(--line); border-radius: .75rem; background: #f7f3e8; }
 .recipe-metadata dt { font-weight: 700; }

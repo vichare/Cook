@@ -19,6 +19,8 @@ import type {
   ImportDraft,
   IngredientScope,
   IngredientReference,
+  ModerationCase,
+  ModerationQueueItem,
   PantryItem,
   PantryStatus,
   Recipe,
@@ -107,6 +109,26 @@ const settingsRoute = createRoute({
   path: '/settings',
   component: SettingsPage,
 })
+const notificationsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/notifications',
+  component: NotificationsPage,
+})
+const moderatorClaimRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/admin/claim',
+  component: ModeratorClaimPage,
+})
+const moderationQueueRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/admin/moderation',
+  component: ModerationQueuePage,
+})
+const moderationCaseRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/admin/moderation/cases/$caseId',
+  component: ModerationCasePage,
+})
 const importsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/imports',
@@ -129,6 +151,10 @@ const routeTree = rootRoute.addChildren([
   pantryRoute,
   shoppingRoute,
   settingsRoute,
+  notificationsRoute,
+  moderatorClaimRoute,
+  moderationQueueRoute,
+  moderationCaseRoute,
   importsRoute,
   importDraftRoute,
 ])
@@ -209,12 +235,14 @@ const primaryDestinations = [
   ['/pantry', 'app.pantry'],
   ['/shopping-list', 'app.shopping'],
   ['/imports', 'app.imports'],
+  ['/notifications', 'app.notifications'],
   ['/settings', 'app.settings'],
 ] as const
 
 export function PrimaryNavigation() {
   const { t } = useI18n()
   const queryClient = useQueryClient()
+  const me = useQuery({ queryKey: ['me'], queryFn: api.me })
   const [open, setOpen] = useState(false)
   useEffect(() => {
     if (!window.matchMedia) return
@@ -234,6 +262,9 @@ export function PrimaryNavigation() {
         {primaryDestinations.map(([to, key]) => (
           <Link key={to} to={to}>{t(key)}</Link>
         ))}
+        {me.data?.capabilities.includes('content_moderation') && (
+          <Link to="/admin/moderation">{t('app.moderation')}</Link>
+        )}
       </nav>
       <Dialog.Root open={open} onOpenChange={setOpen}>
         <Dialog.Trigger asChild>
@@ -259,6 +290,11 @@ export function PrimaryNavigation() {
               {primaryDestinations.map(([to, key]) => (
                 <Link key={to} to={to} onClick={() => setOpen(false)}>{t(key)}</Link>
               ))}
+              {me.data?.capabilities.includes('content_moderation') && (
+                <Link to="/admin/moderation" onClick={() => setOpen(false)}>
+                  {t('app.moderation')}
+                </Link>
+              )}
             </nav>
             <button type="button" className="button ghost mobile-sign-out" onClick={signOut}>
               {t('app.signOut')}
@@ -1086,8 +1122,105 @@ export function RecipeDetailContent({ recipe }: { recipe: Recipe }) {
               <p>{t('recipe.noInstructions')}</p>
             )}
             <RecipeSourceSection source={recipe.source} />
+            {recipe.isOwner && recipe.moderationState === 'restricted' && (
+              <RestrictedOwnerPanel recipe={recipe} />
+            )}
+            {!recipe.isOwner && recipe.visibility === 'public' && recipe.moderationState === 'clear' && (
+              <ReportRecipeForm recipeId={recipe.id} />
+            )}
             {recipe.isOwner && <RevisionReview recipeId={recipe.id} />}
           </article>
+  )
+}
+
+function ReportRecipeForm({ recipeId }: { recipeId: string }) {
+  const { t } = useI18n()
+  const [reason, setReason] = useState('spam')
+  const [details, setDetails] = useState('')
+  const report = useMutation({
+    mutationFn: () => api.reportRecipe(recipeId, { reason, details }),
+  })
+  return (
+    <section className="settings-section" aria-labelledby={`report-${recipeId}`}>
+      <h2 id={`report-${recipeId}`}>{t('moderation.reportTitle')}</h2>
+      <p>{t('moderation.reportHelp')}</p>
+      <label>
+        {t('moderation.reason')}
+        <select value={reason} onChange={(event) => setReason(event.target.value)}>
+          {['spam', 'unsafe_or_harmful', 'harassment_or_hate', 'privacy',
+            'copyright_or_attribution', 'misleading', 'other'].map((value) => (
+            <option key={value} value={value}>{t(`moderation.reason.${value}` as never)}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        {t('moderation.details')}
+        <textarea
+          value={details}
+          maxLength={500}
+          rows={4}
+          onChange={(event) => setDetails(event.target.value)}
+        />
+      </label>
+      <button
+        type="button"
+        className="button secondary"
+        disabled={report.isPending || report.isSuccess}
+        onClick={() => report.mutate()}
+      >
+        {report.isPending ? t('moderation.submitting') : t('moderation.submitReport')}
+      </button>
+      {report.isSuccess && <p role="status">{t('moderation.reportSubmitted')}</p>}
+      {report.error && <ErrorText error={report.error} />}
+    </section>
+  )
+}
+
+function RestrictedOwnerPanel({ recipe }: { recipe: Recipe }) {
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const [reason, setReason] = useState('')
+  const appeals = useQuery({
+    queryKey: ['appeals', recipe.id],
+    queryFn: () => api.appeals(recipe.id),
+  })
+  const create = useMutation({
+    mutationFn: () => api.createAppeal(recipe.id, reason),
+    onSuccess: async () => {
+      setReason('')
+      await queryClient.invalidateQueries({ queryKey: ['appeals', recipe.id] })
+    },
+  })
+  const active = appeals.data?.some((appeal) => appeal.status === 'active')
+  return (
+    <section className="moderation-banner" aria-labelledby={`restricted-${recipe.id}`}>
+      <h2 id={`restricted-${recipe.id}`}>{t('moderation.restrictedTitle')}</h2>
+      <p>{t('moderation.restrictedHelp')}</p>
+      <p><strong>{t('moderation.publicationIntent')}:</strong> {t('common.public')}</p>
+      {!active && (
+        <>
+          <label>
+            {t('moderation.appealReason')}
+            <textarea
+              value={reason}
+              maxLength={1000}
+              rows={5}
+              onChange={(event) => setReason(event.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="button secondary"
+            disabled={!reason.trim() || create.isPending}
+            onClick={() => create.mutate()}
+          >
+            {t('moderation.submitAppeal')}
+          </button>
+        </>
+      )}
+      {active && <p role="status">{t('moderation.appealActive')}</p>}
+      {create.error && <ErrorText error={create.error} />}
+    </section>
   )
 }
 
@@ -3077,7 +3210,322 @@ function SettingsPage() {
         {settings.data && <SettingsForm initial={settings.data} />}
       </QueryState>
       <ImportTokenSettings />
+      <section className="settings-section">
+        <h2>{t('moderation.claimTitle')}</h2>
+        <p>{t('moderation.claimSettingsHelp')}</p>
+        <Link className="button secondary" to="/admin/claim">
+          {t('moderation.openClaim')}
+        </Link>
+      </section>
     </Page>
+  )
+}
+
+function NotificationsPage() {
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const notifications = useQuery({ queryKey: ['notifications'], queryFn: api.notifications })
+  const read = useMutation({
+    mutationFn: api.readNotification,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['notifications'] }),
+  })
+  return (
+    <Page title={t('moderation.notificationsTitle')} intro={t('moderation.notificationsIntro')}>
+      <QueryState query={notifications} empty={t('moderation.noNotifications')}>
+        <div className="card-list">
+          {notifications.data?.map((notification) => (
+            <article className="detail-card" key={notification.id}>
+              <h2>{t(`moderation.notification.${notification.kind}` as never)}</h2>
+              <p>{t('moderation.reasonCode', { reason: notification.reasonCode })}</p>
+              <Link to="/recipes/$recipeId" params={{ recipeId: notification.recipeId }}>
+                {t('moderation.openRecipe')}
+              </Link>
+              {!notification.readAt && (
+                <button
+                  type="button"
+                  className="button ghost"
+                  disabled={read.isPending}
+                  onClick={() => read.mutate(notification.id)}
+                >
+                  {t('moderation.markRead')}
+                </button>
+              )}
+            </article>
+          ))}
+        </div>
+      </QueryState>
+    </Page>
+  )
+}
+
+function ModeratorClaimPage() {
+  const { t } = useI18n()
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [code, setCode] = useState('')
+  const claim = useMutation({
+    mutationFn: async () => {
+      const challenge = await api.startModeratorClaim(code.trim())
+      const credential = await getPasskey(challenge)
+      return api.finishModeratorClaim(code.trim(), credential)
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['me'] })
+      await navigate({ to: '/admin/moderation' })
+    },
+  })
+  return (
+    <Page title={t('moderation.claimTitle')} intro={t('moderation.claimIntro')}>
+      <form
+        className="settings-form"
+        onSubmit={(event) => {
+          event.preventDefault()
+          claim.mutate()
+        }}
+      >
+        <label>
+          {t('moderation.claimCode')}
+          <input
+            value={code}
+            autoComplete="one-time-code"
+            onChange={(event) => setCode(event.target.value)}
+          />
+        </label>
+        <button className="button primary" disabled={!code.trim() || claim.isPending}>
+          {claim.isPending ? t('moderation.verifyingPasskey') : t('moderation.claimSubmit')}
+        </button>
+        {claim.error && <ErrorText error={claim.error} />}
+      </form>
+    </Page>
+  )
+}
+
+function AdminReauthButton({ onSuccess }: { onSuccess?: () => void }) {
+  const { t } = useI18n()
+  const reauth = useMutation({
+    mutationFn: async () => {
+      const challenge = await api.startAdminReauth()
+      const credential = await getPasskey(challenge)
+      await api.finishAdminReauth(credential)
+    },
+    onSuccess,
+  })
+  return (
+    <div>
+      <button
+        type="button"
+        className="button secondary"
+        disabled={reauth.isPending}
+        onClick={() => reauth.mutate()}
+      >
+        {reauth.isPending ? t('moderation.verifyingPasskey') : t('moderation.reauth')}
+      </button>
+      {reauth.isSuccess && <p role="status">{t('moderation.reauthComplete')}</p>}
+      {reauth.error && <ErrorText error={reauth.error} />}
+    </div>
+  )
+}
+
+function ModerationQueuePage() {
+  const { t } = useI18n()
+  const queue = useQuery({ queryKey: ['moderation-queue'], queryFn: () => api.moderationQueue() })
+  return (
+    <Page title={t('moderation.queueTitle')} intro={t('moderation.queueIntro')}>
+      <AdminReauthButton onSuccess={() => void queue.refetch()} />
+      <QueryState query={queue} empty={t('moderation.queueEmpty')}>
+        <div className="moderation-queue">
+          {queue.data?.items.map((item) => <ModerationQueueCard key={item.recipeId} item={item} />)}
+        </div>
+      </QueryState>
+    </Page>
+  )
+}
+
+function ModerationQueueCard({ item }: { item: ModerationQueueItem }) {
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const [reasonCode, setReasonCode] = useState('policy_violation')
+  const action = useMutation({
+    mutationFn: (kind: 'review' | 'restrict' | 'reinstate') => {
+      const value = moderationMutationInput(item, kind, reasonCode)
+      const key = `${Math.floor(Date.now() / 1000)}.${crypto.randomUUID()}`
+      if (kind === 'review') return api.reviewRecipe(item.recipeId, value, key)
+      if (kind === 'restrict') return api.restrictRecipe(item.recipeId, value, key)
+      return api.reinstateRecipe(item.recipeId, value, key)
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['moderation-queue'] }),
+  })
+  return (
+    <article className="detail-card moderation-card">
+      <div className="card-heading">
+        <div>
+          <h2>{item.title}</h2>
+          <p>{t('moderation.byHandle', { handle: item.authorHandle })}</p>
+        </div>
+        <span className="status verify">
+          {t(`moderation.state.${item.moderationState}` as never)}
+        </span>
+      </div>
+      <p>{t('moderation.queueSummary', {
+        review: t(`moderation.reviewState.${item.reviewState}` as never),
+        reports: item.reportCount,
+        appeal: item.activeAppeal ? t('moderation.yes') : t('moderation.no'),
+      })}</p>
+      <label>
+        {t('moderation.actionReason')}
+        <select value={reasonCode} onChange={(event) => setReasonCode(event.target.value)}>
+          {['policy_violation', 'safety', 'privacy', 'copyright', 'spam', 'appeal_reviewed', 'other']
+            .map((value) => (
+              <option key={value} value={value}>
+                {t(`moderation.actionReason.${value}` as never)}
+              </option>
+            ))}
+        </select>
+      </label>
+      <div className="form-actions">
+        {item.reviewState === 'unreviewed' && (
+          <button type="button" className="button secondary" onClick={() => action.mutate('review')}>
+            {t('moderation.markReviewed')}
+          </button>
+        )}
+        {item.moderationState === 'clear' ? (
+          <button type="button" className="button destructive" onClick={() => action.mutate('restrict')}>
+            {t('moderation.restrict')}
+          </button>
+        ) : (
+          <button type="button" className="button secondary" onClick={() => action.mutate('reinstate')}>
+            {t('moderation.reinstate')}
+          </button>
+        )}
+        {item.caseId && (
+          <Link className="button ghost" to="/admin/moderation/cases/$caseId" params={{ caseId: item.caseId }}>
+            {t('moderation.openCase')}
+          </Link>
+        )}
+      </div>
+      {action.error && <ErrorText error={action.error} />}
+    </article>
+  )
+}
+
+export function moderationMutationInput(
+  item: ModerationQueueItem,
+  kind: 'review' | 'restrict' | 'reinstate',
+  actionReasonCode: string,
+) {
+  return {
+    expectedRecipeVersion: item.recipeVersion,
+    expectedModerationVersion: item.moderationVersion,
+    expectedCaseVersion: item.caseVersion,
+    reasonCode: kind === 'review' ? 'no_action_needed' : actionReasonCode,
+  }
+}
+
+export function moderationEvidenceImageUrl(caseId: string) {
+  return `/api/admin/moderation/cases/${encodeURIComponent(caseId)}/evidence-image`
+}
+
+function ModerationCasePage() {
+  const { caseId } = moderationCaseRoute.useParams()
+  const { t } = useI18n()
+  const moderationCase = useQuery({
+    queryKey: ['moderation-case', caseId],
+    queryFn: () => api.moderationCase(caseId),
+    retry: false,
+  })
+  if (moderationCase.error instanceof ApiError
+    && moderationCase.error.code === 'admin_passkey_reauth_required') {
+    return (
+      <Page title={t('moderation.caseTitle')} intro={t('moderation.caseReauth')}>
+        <AdminReauthButton onSuccess={() => void moderationCase.refetch()} />
+      </Page>
+    )
+  }
+  return (
+    <Page title={t('moderation.caseTitle')} intro={t('moderation.caseIntro')}>
+      <QueryState query={moderationCase} empty={t('moderation.caseMissing')}>
+        {moderationCase.data && <ModerationCaseContent value={moderationCase.data} />}
+      </QueryState>
+    </Page>
+  )
+}
+
+function ModerationCaseContent({ value }: { value: ModerationCase }) {
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const [reasonCode, setReasonCode] = useState('appeal_reviewed')
+  const resolve = useMutation({
+    mutationFn: (resolution: 'reinstate' | 'uphold') => {
+      if (!value.appeal || value.recipeVersion === null || value.moderationVersion === null) {
+        throw new Error('Case state is incomplete')
+      }
+      return api.resolveAppeal(value.appeal.id, {
+        resolution,
+        expectedRecipeVersion: value.recipeVersion,
+        expectedModerationVersion: value.moderationVersion,
+        expectedCaseVersion: value.version,
+        expectedAppealVersion: value.appeal.version,
+        reasonCode,
+      }, `${Math.floor(Date.now() / 1000)}.${crypto.randomUUID()}`)
+    },
+    onSuccess: () => {
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['moderation-case', value.id] }),
+        queryClient.invalidateQueries({ queryKey: ['moderation-queue'] }),
+      ])
+    },
+  })
+  return (
+    <article className="detail-card">
+      <p>{t('moderation.caseStatus', { status: value.status })}</p>
+      <p>{t('moderation.byHandle', { handle: value.evidence.authorHandle })}</p>
+      <h2>{value.evidence.title}</h2>
+      {value.evidence.imageId && (
+        <figure className="recipe-cover-detail">
+          <img
+            src={moderationEvidenceImageUrl(value.id)}
+            alt={value.evidence.title}
+          />
+        </figure>
+      )}
+      <SafeMarkdown value={value.evidence.description} />
+      <SafeMarkdown value={value.evidence.instructions} />
+      <h2>{t('moderation.reports')}</h2>
+      <div className="card-list">
+        {value.reports.map((report, index) => (
+          <section className="source-note" key={`${report.createdAt}-${index}`}>
+            <strong>{report.reason}</strong>
+            <p className="pre-line">{report.details || t('common.notProvided')}</p>
+          </section>
+        ))}
+      </div>
+      {value.appeal && (
+        <section className="moderation-banner">
+          <h2>{t('moderation.activeAppeal')}</h2>
+          <p className="pre-line">{value.appeal.reason}</p>
+          <label>
+            {t('moderation.actionReason')}
+            <select value={reasonCode} onChange={(event) => setReasonCode(event.target.value)}>
+              {['appeal_reviewed', 'policy_violation', 'safety', 'privacy', 'copyright', 'spam', 'other']
+                .map((reason) => (
+                  <option key={reason} value={reason}>
+                    {t(`moderation.actionReason.${reason}` as never)}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <div className="form-actions">
+            <button type="button" className="button secondary" onClick={() => resolve.mutate('reinstate')}>
+              {t('moderation.reinstate')}
+            </button>
+            <button type="button" className="button destructive" onClick={() => resolve.mutate('uphold')}>
+              {t('moderation.uphold')}
+            </button>
+          </div>
+          {resolve.error && <ErrorText error={resolve.error} />}
+        </section>
+      )}
+    </article>
   )
 }
 

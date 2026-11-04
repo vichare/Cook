@@ -682,7 +682,11 @@ async fn claim_owned_recipe_version(
     expected_version: i64,
 ) -> AppResult<i64> {
     let version: Option<i64> = sqlx::query_scalar(
-        "UPDATE recipes SET version = version + 1, updated_at = CURRENT_TIMESTAMP
+        "UPDATE recipes
+         SET version = version + 1,
+             moderation_review_state = 'unreviewed',
+             moderation_version = moderation_version + 1,
+             updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ? AND version = ?
          RETURNING version",
     )
@@ -717,16 +721,16 @@ pub async fn get_recipe_image(
     Path(image_id): Path<String>,
 ) -> AppResult<Response<Body>> {
     let row = sqlx::query(
-        "SELECT i.image_bytes, i.media_type, i.sha256, i.version, r.visibility, r.owner_id
+        "SELECT i.image_bytes, i.media_type, i.sha256, i.version, r.visibility, r.owner_id,
+                EXISTS(SELECT 1 FROM public_eligible_recipes p WHERE p.id = r.id) AS public_eligible
          FROM recipe_images i JOIN recipes r ON r.id = i.recipe_id WHERE i.id = ?",
     )
     .bind(&image_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)?;
-    let visibility: String = row.get("visibility");
     let owner_id: String = row.get("owner_id");
-    let public = visibility == "public";
+    let public = row.get::<i64, _>("public_eligible") != 0;
     if !public {
         let session_owner = if let Some(cookie) = jar.get(state.auth.session_cookie_name()) {
             state

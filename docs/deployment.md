@@ -20,9 +20,22 @@ Host capacity, Google callback registration, SMTP deliverability, and production
 5. Run `docker compose build` and `docker compose up -d`.
 6. Install `deploy/nginx/cook.vichare.net.conf` in host nginx and validate with `nginx -t`.
 7. Confirm that only `127.0.0.1:18080` is published by Compose, then reload nginx.
-8. Smoke-test Google, Email OTP, passkey registration/login/revocation, Google-first exact-email OTP linking, Gmail email-first Google convergence, non-Gmail rejection, split-account recovery, current/all-device logout, cross-account recipe/image isolation, scoped AI token denial, recommendation explanations, and restore procedure. Never create production test identities that intentionally collide with a real user.
+8. Smoke-test Google, Email OTP, passkey registration/login/revocation, Google-first exact-email OTP linking, Gmail email-first Google convergence, non-Gmail rejection, split-account recovery, current/all-device logout, cross-account recipe/image isolation, scoped AI token denial, recommendation explanations, moderator claim/step-up/revocation, restriction image invalidation, owner appeal/notification, and restore procedure. Never create production test identities that intentionally collide with a real user.
 
 Production releases are normally installed by the tag-driven GitHub Actions workflow rather than by building on the VM. See `release-and-deployment.md`.
+
+### Content moderator bootstrap and revocation
+
+Run trusted moderation commands on the host against the production `DATABASE_URL`; do not place claim codes in shell history, logs, tickets, or chat:
+
+```sh
+docker compose -f compose.yaml run --rm cook moderation claim-code create
+docker compose -f compose.yaml run --rm cook moderation assignment revoke <assignment-uuid>
+```
+
+The create command prints one random claim code once. It expires after 15 minutes and is stored only as a digest. The user must already have a Cook account and Passkey, then enter the code at `/admin/claim`. Revocation is host-only, uses the assignment UUID from the PII-free audit/administrative record, increments authorization version, and revokes all sessions for that user.
+
+After the first successful restriction, `deploy/upgrade.sh` reads the database compatibility marker and refuses any image older than `v0.6.0`. Do not bypass this guard or restore an older application binary against a moderation-aware database. Restore the matching database backup and application release together.
 
 Never put real credentials in Compose, documentation, Git, screenshots, or support logs.
 

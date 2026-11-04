@@ -84,13 +84,13 @@ Recommendations use deterministic `intent-v1` ranking. With preferred ingredient
 
 Shopping supports concrete ingredients and exact-set choice items for OR groups. Choice purchase records which alternative was actually bought before updating pantry. Persisted shopping requirements can be removed transactionally without mutating pantry; automatic-restock-derived requirements remain until automatic restocking is disabled. Homepage statistics are whole-card links to owner recipes and filtered pantry views.
 
-### Future v0.6.0 content moderation
+### v0.6.0 content moderation
 
-Content moderation is a separate security-sensitive workstream and is not part of `v0.5.0`. The approved direction is a post-publication moderation overlay rather than preapproval or direct moderator editing. A least-privilege `content_moderator` capability may access only public-content queues, cases, reports, appeals, restrict/reinstate actions, and a PII-free audit view. It must not expose private recipes, pantry, shopping, authentication identities, sessions, tokens, impersonation, user suspension, deployment/database access, role management, or self-moderation.
+**Implemented for v0.6.0.** Content moderation is a post-publication moderation overlay rather than preapproval or direct moderator editing. A least-privilege `content_moderator` capability accesses only public-content queues, cases, reports, appeals, restrict/reinstate actions, and a PII-free audit view. It does not expose private recipes, pantry, shopping, authentication identities, sessions, tokens, impersonation, user suspension, deployment/database access, role management, or self-moderation.
 
 Author publication intent remains separate from platform moderation state, and every public surface must use one shared eligibility predicate. Restricted content is excluded or returns 404 to other viewers while its owner may view, edit, and appeal; AI and legacy clients cannot clear a restriction. The first dedicated moderator is bootstrapped with a host-generated one-time 15-minute claim code, an existing Cook user, Passkey enrollment, and a fresh Passkey assertion. There is no hard-coded moderator email or first-user auto-promotion, and emergency revocation remains host-only.
 
-The future implementation must include logged-in reporting, aggregated cases and evidence snapshots, owner notifications, one active appeal, reason codes, no reporter identity in moderator DTOs, Passkey step-up for sensitive actions, atomic idempotent optimistic mutations, public image invalidation, an immutable PII-free audit ledger, rate limits, and full IDOR/public-query/inventory security gates. It requires its own implementation, focused security review, CI, and release.
+The implementation includes logged-in reporting, aggregated cases and bounded evidence snapshots, owner notifications, one active appeal per restriction epoch, stable reason codes, no reporter identity in moderator DTOs, Passkey step-up for sensitive actions, atomic idempotent optimistic mutations, public image invalidation, an immutable PII-free audit ledger, rate limits, and explicit IDOR/public-query/inventory release gates.
 
 ### Future v0.6.0 recommendation URL state
 

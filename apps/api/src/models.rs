@@ -9,6 +9,8 @@ pub struct User {
     pub nickname: Option<String>,
     pub onboarding_completed: bool,
     pub locale: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -108,6 +110,10 @@ pub struct Recipe {
     pub description: String,
     pub instructions: String,
     pub visibility: String,
+    pub publication_intent: String,
+    pub moderation_state: String,
+    pub moderation_review_state: String,
+    pub moderation_version: i64,
     pub difficulty: Option<i64>,
     pub estimated_calories: Option<i64>,
     pub version: i64,

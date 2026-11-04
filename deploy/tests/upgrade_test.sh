@@ -124,7 +124,37 @@ EOF
     grep -Fq "compose -f compose.yaml stop cook" "$fixture/commands"
 }
 
+test_restriction_marker_blocks_older_release() {
+    new_fixture
+    mkdir "$fixture/data"
+    : >"$fixture/data/cook.db"
+    cat >"$fixture/bin/stat" <<'EOF'
+#!/bin/sh
+printf '%s\n' '10001'
+EOF
+    cat >"$fixture/bin/sqlite3" <<'EOF'
+#!/bin/sh
+case "$*" in
+    *sqlite_master*) printf '%s\n' '1' ;;
+    *minimum_release*) printf '%s\n' 'v0.6.0' ;;
+    *) exit 99 ;;
+esac
+EOF
+    cat >"$fixture/bin/docker" <<'EOF'
+#!/bin/sh
+echo "docker must not run" >&2
+exit 99
+EOF
+    chmod +x "$fixture/bin/stat" "$fixture/bin/sqlite3" "$fixture/bin/docker"
+
+    run_expect_failure "$fixture"
+
+    grep -Fq "requires v0.6.0 or newer" "$fixture/output"
+    grep -Fq "refusing v0.1.1" "$fixture/output"
+}
+
 test_missing_data_directory
 test_wrong_data_owner
 test_first_deploy_rollback_stays_stopped
+test_restriction_marker_blocks_older_release
 echo "upgrade shell tests passed"

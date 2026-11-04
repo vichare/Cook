@@ -20,6 +20,10 @@ import type {
   ShoppingPurchaseResponse,
   PublicAuthorProfile,
   AiCapabilities,
+  ModerationAppeal,
+  ModerationCase,
+  ModerationQueuePage,
+  OwnerNotification,
   User,
 } from './types'
 
@@ -225,6 +229,101 @@ export const api = {
     request<Recipe>(`/api/recipe-revisions/${id}/accept`, { method: 'POST' }),
   rejectRecipeRevision: (id: string) =>
     request<void>(`/api/recipe-revisions/${id}`, { method: 'DELETE' }),
+  reportRecipe: (id: string, value: { reason: string; details: string }) =>
+    request<{ id: string; duplicate: boolean }>(`/api/recipes/${id}/reports`, {
+      method: 'POST',
+      body: JSON.stringify(value),
+    }),
+  notifications: () => request<OwnerNotification[]>('/api/notifications'),
+  readNotification: (id: string) =>
+    request<void>(`/api/notifications/${id}/read`, { method: 'PUT' }),
+  appeals: (recipeId: string) =>
+    request<ModerationAppeal[]>(`/api/recipes/${recipeId}/appeals`),
+  createAppeal: (recipeId: string, reason: string) =>
+    request<{ id: string; version: number }>(`/api/recipes/${recipeId}/appeals`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  startModeratorClaim: (code: string) =>
+    request<unknown>('/api/capability-claims/content-moderator/passkey/start', {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    }),
+  finishModeratorClaim: (code: string, credential: unknown) =>
+    request<{ capability: string }>('/api/capability-claims/content-moderator/passkey/finish', {
+      method: 'POST',
+      body: JSON.stringify({ code, credential }),
+    }),
+  startAdminReauth: () =>
+    request<unknown>('/api/admin/reauth/passkey/start', { method: 'POST' }),
+  finishAdminReauth: (credential: unknown) =>
+    request<void>('/api/admin/reauth/passkey/finish', {
+      method: 'POST',
+      body: JSON.stringify(credential),
+    }),
+  moderationQueue: (cursor?: string) =>
+    request<ModerationQueuePage>(
+      `/api/admin/moderation/queue${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`,
+    ),
+  moderationCase: (id: string) =>
+    request<ModerationCase>(`/api/admin/moderation/cases/${id}`),
+  reviewRecipe: (
+    id: string,
+    value: { expectedRecipeVersion: number; expectedModerationVersion: number; reasonCode: string },
+    idempotencyKey: string,
+  ) =>
+    request<unknown>(`/api/admin/moderation/recipes/${id}/review`, {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(value),
+    }),
+  restrictRecipe: (
+    id: string,
+    value: {
+      expectedRecipeVersion: number
+      expectedModerationVersion: number
+      expectedCaseVersion: number | null
+      reasonCode: string
+    },
+    idempotencyKey: string,
+  ) =>
+    request<unknown>(`/api/admin/moderation/recipes/${id}/restrict`, {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(value),
+    }),
+  reinstateRecipe: (
+    id: string,
+    value: {
+      expectedRecipeVersion: number
+      expectedModerationVersion: number
+      expectedCaseVersion: number | null
+      reasonCode: string
+    },
+    idempotencyKey: string,
+  ) =>
+    request<unknown>(`/api/admin/moderation/recipes/${id}/reinstate`, {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(value),
+    }),
+  resolveAppeal: (
+    id: string,
+    value: {
+      resolution: 'reinstate' | 'uphold'
+      expectedRecipeVersion: number
+      expectedModerationVersion: number
+      expectedCaseVersion: number
+      expectedAppealVersion: number
+      reasonCode: string
+    },
+    idempotencyKey: string,
+  ) =>
+    request<unknown>(`/api/admin/moderation/appeals/${id}/resolve`, {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(value),
+    }),
   favorite: (id: string, favorite: boolean) =>
     request<void>(`/api/recipes/${id}/favorite`, { method: favorite ? 'PUT' : 'DELETE' }),
   pantry: () => request<PantryItem[]>('/api/pantry'),

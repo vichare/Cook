@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cook API
-  version: 0.3.0
+  version: 0.6.0
 servers:
   - url: https://cook.vichare.net
 paths:
@@ -1007,6 +1007,257 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Missing or not owned }
         "409": { description: Draft has already been consumed or discarded }
+  /api/capability-claims/content-moderator/passkey/start:
+    post:
+      description: Starts a Passkey assertion bound to the current session and a valid one-time 15-minute moderator claim code. Invalid codes and accounts without a Passkey return 404.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code]
+              properties:
+                code: { type: string, minLength: 32, maxLength: 256 }
+      responses:
+        "200": { description: WebAuthn credential request options }
+        "404": { description: Claim is unavailable }
+  /api/capability-claims/content-moderator/passkey/finish:
+    post:
+      description: Atomically verifies the Passkey, consumes the claim code, creates the capability assignment, advances authorization version, and refreshes only the current session.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, credential]
+              properties:
+                code: { type: string, minLength: 32, maxLength: 256 }
+                credential: { type: object, additionalProperties: true }
+      responses:
+        "200": { description: Content moderator capability assigned }
+        "404": { description: Claim is unavailable, expired, or already consumed }
+        "409": { description: Capability is already assigned }
+  /api/recipes/{id}/reports:
+    parameters: [{ $ref: "#/components/parameters/RecipeId" }]
+    post:
+      description: Reports a current public-clear recipe owned by another user. Reporter identity is never returned in moderator DTOs. Duplicates are keyed by reporter, recipe, recipe version, and reason.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ModerationReportInput" }
+      responses:
+        "200": { description: Existing duplicate report returned }
+        "201": { description: Report and bounded public evidence snapshot created }
+        "404": { description: Recipe is not reportable }
+        "429": { description: Reporter rate limit exceeded }
+  /api/notifications:
+    get:
+      description: Lists up to 100 current-user moderation notifications.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200":
+          description: Owner notifications
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/OwnerNotification" }
+  /api/notifications/{id}/read:
+    parameters:
+      - { $ref: "#/components/parameters/NotificationId" }
+    put:
+      description: Marks one current-user notification read.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "204": { description: Notification marked read }
+        "404": { description: Notification is not owned }
+  /api/recipes/{id}/appeals:
+    parameters: [{ $ref: "#/components/parameters/RecipeId" }]
+    get:
+      description: Lists the restriction appeals for an owned recipe.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200":
+          description: Appeals
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ModerationAppeal" }
+        "404": { description: Recipe is not owned }
+    post:
+      description: Creates the one active appeal allowed for the current restriction epoch.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        "201": { description: Appeal created }
+        "404": { description: Recipe is not owned and restricted }
+        "409": { description: An appeal already exists for this restriction }
+  /api/admin/reauth/passkey/start:
+    post:
+      description: Starts a Passkey assertion for the current moderator session. Non-moderators receive 404.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: WebAuthn credential request options }
+        "404": { description: Moderator capability not present }
+  /api/admin/reauth/passkey/finish:
+    post:
+      description: Verifies the assertion and raises only the current session's Passkey assurance for ten minutes.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "204": { description: Current session assurance refreshed }
+        "404": { description: Moderator capability not present }
+  /api/admin/moderation/queue:
+    get:
+      description: Keyset-paginated public-content moderation queue. Private unreviewed recipes are excluded. Non-moderators receive 404.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 30 } }
+      responses:
+        "200":
+          description: Moderation queue
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModerationQueuePage" }
+        "404": { description: Moderator capability not present }
+  /api/admin/moderation/cases/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/ModerationCaseId" }
+    get:
+      description: Returns a bounded public evidence snapshot, anonymous reports, and active appeal after fresh Passkey verification.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200":
+          description: Moderation case without reporter identity or authentication data
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModerationCaseDetail" }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
+        "404": { description: Moderator capability absent, case missing, or self-moderation denied }
+  /api/admin/moderation/cases/{id}/evidence-image:
+    parameters:
+      - { $ref: "#/components/parameters/ModerationCaseId" }
+    get:
+      description: Returns the case-owned immutable normalized evidence image to a freshly reauthenticated non-owner moderator. Later image rotation, replacement, or deletion does not change this response, and the endpoint does not grant access through the ordinary recipe image URL.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200":
+          description: "Private evidence image with Cache-Control: private, no-store"
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
+        "404": { description: Moderator capability absent, image/case missing, or self-moderation denied }
+  /api/admin/moderation/recipes/{id}/review:
+    parameters:
+      - { $ref: "#/components/parameters/RecipeId" }
+      - { $ref: "#/components/parameters/IdempotencyKey" }
+    post:
+      description: Marks a non-owned recipe reviewed with optimistic recipe and moderation versions. An active open case requires its exact version and is atomically resolved without action.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdminReviewMutation" }
+      responses:
+        "200": { description: Recipe marked reviewed }
+        "409": { description: A supplied version is stale or the idempotency fingerprint differs }
+  /api/admin/moderation/recipes/{id}/restrict:
+    parameters:
+      - { $ref: "#/components/parameters/RecipeId" }
+      - { $ref: "#/components/parameters/IdempotencyKey" }
+    post:
+      description: Restricts a non-owned recipe atomically, rotates its public image ID, updates its case, notifies the owner, and appends an audit event. Requires same-origin and fresh Passkey verification.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdminModerationMutation" }
+      responses:
+        "200": { description: Recipe restricted }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
+        "404": { description: Moderator capability absent or self-moderation denied }
+        "409": { description: A supplied version is stale or the idempotency fingerprint differs }
+  /api/admin/moderation/recipes/{id}/reinstate:
+    parameters:
+      - { $ref: "#/components/parameters/RecipeId" }
+      - { $ref: "#/components/parameters/IdempotencyKey" }
+    post:
+      description: Reinstates a non-owned restricted recipe and exposes a newly rotated image URL. Requires same-origin and fresh Passkey verification.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdminModerationMutation" }
+      responses:
+        "200": { description: Recipe reinstated }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
+        "409": { description: A supplied version is stale }
+  /api/admin/moderation/appeals/{id}/resolve:
+    parameters:
+      - { $ref: "#/components/parameters/ModerationAppealId" }
+      - { $ref: "#/components/parameters/IdempotencyKey" }
+    post:
+      description: Atomically reinstates or upholds one exact active appeal with optimistic recipe, moderation, case, and appeal versions.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AppealResolutionInput" }
+      responses:
+        "200": { description: Appeal resolved }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
+        "409": { description: A supplied version is stale }
+  /api/admin/audit-events:
+    get:
+      description: Lists PII-free append-only moderation audit metadata. Non-moderators receive 404.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: Audit event page }
+        "404": { description: Moderator capability not present }
+  /api/admin/audit-events/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/ModerationAuditEventId" }
+    get:
+      description: Returns one PII-free audit event after fresh Passkey verification.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: Audit event }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
+  /api/admin/audit-events/export:
+    get:
+      description: Exports up to 10,000 PII-free audit events as JSON after fresh Passkey verification.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: Audit JSON export }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
 components:
   securitySchemes:
     sessionCookie:
@@ -1020,6 +1271,26 @@ components:
       description: Scoped Cook AI token. The endpoint enforces recipes:import, recipes:read, recipes:write, recipes:images:write, or recipes:publish as documented.
   parameters:
     RecipeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ModerationCaseId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ModerationAppealId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ModerationAuditEventId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    NotificationId:
       name: id
       in: path
       required: true
@@ -1081,6 +1352,11 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    AdminReauthRequired:
+      description: Moderator capability is confirmed but the current session lacks a Passkey assertion from the last ten minutes.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
   requestBodies:
     RecipeInput:
       required: true
@@ -1114,7 +1390,7 @@ components:
     User:
       type: object
       description: Private current-user DTO. It is never embedded as another recipe author's public profile.
-      required: [id, email, displayName, nickname, onboardingCompleted, locale]
+      required: [id, email, displayName, nickname, onboardingCompleted, locale, capabilities]
       properties:
         id: { type: string }
         email: { type: string, format: email }
@@ -1125,6 +1401,10 @@ components:
           type: [string, "null"]
           enum: [en, zh-CN, null]
           description: Account-level interface locale. Null is an initialization state only, not a translated anonymous value.
+        capabilities:
+          type: array
+          description: Product-level capabilities for the current user only. This field is never exposed in public author or recipe DTOs.
+          items: { type: string, enum: [content_moderation] }
     ProfileInput:
       type: object
       additionalProperties: false
@@ -1277,7 +1557,7 @@ components:
       allOf:
         - $ref: "#/components/schemas/RecipeInput"
         - type: object
-          required: [id, version, isOwner, authorHandle, authorNickname, difficulty, estimatedCalories, ingredientModel, ingredientGroups, ingredients, isFavorite, isFavoriteAuthor, source, coverImage]
+          required: [id, version, isOwner, authorHandle, authorNickname, publicationIntent, moderationState, moderationReviewState, moderationVersion, difficulty, estimatedCalories, ingredientModel, ingredientGroups, ingredients, isFavorite, isFavoriteAuthor, source, coverImage]
           properties:
             id: { type: string, format: uuid }
             version: { type: integer, minimum: 1 }
@@ -1289,6 +1569,17 @@ components:
             authorNickname:
               type: [string, "null"]
               description: Opt-in public nickname. Null must be rendered as the locale's anonymous label.
+            publicationIntent:
+              type: string
+              enum: [private, public]
+              description: Author-controlled publication intent. A restricted owner may still have public intent while effective visibility remains private.
+            moderationState:
+              type: string
+              enum: [clear, restricted]
+            moderationReviewState:
+              type: string
+              enum: [unreviewed, reviewed]
+            moderationVersion: { type: integer, minimum: 1 }
             isFavorite: { type: boolean }
             isFavoriteAuthor: { type: boolean }
             source:
@@ -1304,6 +1595,146 @@ components:
       required: [version]
       properties:
         version: { type: integer, minimum: 2 }
+    ModerationReportInput:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          enum: [spam, unsafe_or_harmful, harassment_or_hate, privacy, copyright_or_attribution, misleading, other]
+        details:
+          type: string
+          maxLength: 500
+          description: Plain text only. It is never interpreted as Markdown or HTML.
+    OwnerNotification:
+      type: object
+      required: [id, recipeId, kind, reasonCode, createdAt, readAt]
+      properties:
+        id: { type: string, format: uuid }
+        recipeId: { type: string, format: uuid }
+        kind: { type: string, enum: [recipe_restricted, recipe_reinstated, appeal_upheld, content_removed] }
+        reasonCode: { type: string }
+        createdAt: { type: integer }
+        readAt: { type: [integer, "null"] }
+    ModerationAppeal:
+      type: object
+      required: [id, restrictionEpoch, status, reason, resolutionReason, version, createdAt, resolvedAt]
+      properties:
+        id: { type: string, format: uuid }
+        restrictionEpoch: { type: integer, minimum: 1 }
+        status: { type: string, enum: [active, reinstated, upheld, content_removed] }
+        reason: { type: string, maxLength: 1000 }
+        resolutionReason: { type: [string, "null"] }
+        version: { type: integer, minimum: 1 }
+        createdAt: { type: integer }
+        resolvedAt: { type: [integer, "null"] }
+    ModerationQueuePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [recipeId, title, authorHandle, reviewState, moderationState, recipeVersion, moderationVersion, caseId, caseVersion, reportCount, activeAppeal, updatedAt]
+            properties:
+              recipeId: { type: string, format: uuid }
+              title: { type: string }
+              authorHandle: { type: string }
+              reviewState: { type: string, enum: [unreviewed, reviewed] }
+              moderationState: { type: string, enum: [clear, restricted] }
+              recipeVersion: { type: integer, minimum: 1 }
+              moderationVersion: { type: integer, minimum: 1 }
+              caseId: { type: [string, "null"] }
+              caseVersion: { type: [integer, "null"] }
+              reportCount: { type: integer, minimum: 0 }
+              activeAppeal: { type: boolean }
+              updatedAt: { type: string }
+        nextCursor: { type: [string, "null"] }
+    ModerationCaseDetail:
+      type: object
+      required: [id, recipeId, status, version, createdAt, updatedAt, recipeVersion, moderationVersion, evidence, reports, appeal]
+      properties:
+        id: { type: string, format: uuid }
+        recipeId: { type: string, format: uuid }
+        status: { type: string, enum: [open, restricted, resolved, reinstated, upheld, content_removed] }
+        version: { type: integer, minimum: 1 }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+        recipeVersion: { type: [integer, "null"], minimum: 1 }
+        moderationVersion: { type: [integer, "null"], minimum: 1 }
+        evidence:
+          type: object
+          description: Bounded evidence for the version currently eligible for a moderation decision. Restricted edits refresh this evidence and increment the case version.
+          required: [recipeVersion, title, description, instructions, authorHandle, imageId]
+          properties:
+            recipeVersion: { type: integer, minimum: 1 }
+            title: { type: string, maxLength: 120 }
+            description: { type: string, maxLength: 2000 }
+            instructions: { type: string, maxLength: 20000 }
+            authorHandle: { type: string }
+            imageId:
+              type: [string, "null"]
+              description: Opaque image identifier captured with the evidence; clients read immutable bytes through the case evidence-image endpoint rather than the ordinary recipe-image URL.
+        reports:
+          type: array
+          items:
+            type: object
+            required: [reason, details, recipeVersion, createdAt]
+            properties:
+              reason: { type: string }
+              details: { type: string, maxLength: 500 }
+              recipeVersion: { type: integer, minimum: 1 }
+              createdAt: { type: integer }
+        appeal:
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [id, reason, version, createdAt]
+              properties:
+                id: { type: string, format: uuid }
+                reason: { type: string, maxLength: 1000 }
+                version: { type: integer, minimum: 1 }
+                createdAt: { type: integer }
+    AdminModerationMutation:
+      type: object
+      additionalProperties: false
+      required: [expectedRecipeVersion, expectedModerationVersion, reasonCode]
+      properties:
+        expectedRecipeVersion: { type: integer, minimum: 1 }
+        expectedModerationVersion: { type: integer, minimum: 1 }
+        expectedCaseVersion: { type: [integer, "null"], minimum: 1 }
+        reasonCode:
+          type: string
+          enum: [policy_violation, safety, privacy, copyright, spam, appeal_reviewed, other]
+    AdminReviewMutation:
+      type: object
+      additionalProperties: false
+      required: [expectedRecipeVersion, expectedModerationVersion, reasonCode]
+      properties:
+        expectedRecipeVersion: { type: integer, minimum: 1 }
+        expectedModerationVersion: { type: integer, minimum: 1 }
+        expectedCaseVersion:
+          type: [integer, "null"]
+          minimum: 1
+          description: Required and exact when an active open case exists; otherwise null.
+        reasonCode:
+          type: string
+          enum: [no_action_needed, report_resolved, appeal_reviewed, other]
+    AppealResolutionInput:
+      type: object
+      additionalProperties: false
+      required: [resolution, expectedRecipeVersion, expectedModerationVersion, expectedCaseVersion, expectedAppealVersion, reasonCode]
+      properties:
+        resolution: { type: string, enum: [reinstate, uphold] }
+        expectedRecipeVersion: { type: integer, minimum: 1 }
+        expectedModerationVersion: { type: integer, minimum: 1 }
+        expectedCaseVersion: { type: integer, minimum: 1 }
+        expectedAppealVersion: { type: integer, minimum: 1 }
+        reasonCode:
+          type: string
+          enum: [policy_violation, safety, privacy, copyright, spam, appeal_reviewed, other]
     RecipeImage:
       type: object
       required: [id, url, width, height, altText, sourceUrl, sourceLicense, sourceAttribution, version]
@@ -2050,3 +2481,7 @@ components:
       properties:
         error: { type: string }
         message: { type: string }
+        recipeVersion: { type: integer, minimum: 1 }
+        moderationVersion: { type: integer, minimum: 1 }
+        caseVersion: { type: integer, minimum: 1 }
+        appealVersion: { type: integer, minimum: 1 }

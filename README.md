@@ -2,6 +2,8 @@
 
 Cook is a deployable recipe and private-pantry recommendation MVP. It combines user-published recipes, per-account pantry state, configurable recommendation sources, and deterministic explanations for what can be cooked now.
 
+Cook v0.6.0 adds post-publication content moderation without giving moderators edit access to author content. Public eligibility is author intent `public` plus platform state `clear`; restricted recipes remain editable by their owner but disappear from every other public detail, list, search, recommendation, favorite-account, ingredient, shopping, and image surface. Logged-in users can report eligible recipes, owners receive in-app restriction/appeal notifications, and a least-privilege content moderator uses Passkey step-up for sensitive case and enforcement actions.
+
 Pantry items can carry one optional date-only expiration and a default-off automatic-restock setting. Only an explicit `out` status derives a private shopping-list item; unknown or expired items are not silently changed to out. Manual, recipe, and automatic sources deduplicate by confirmed canonical identity or owner-normalized input and remain isolated per account. Every active source combination uses the same Bought workflow to update pantry state and either remove all shopping sources or keep them for a partial purchase, with optimistic concurrency, idempotent retries, and safe atomic undo.
 
 Ingredient entry uses shared Unicode normalization, multilingual pasted-list splitting, explicit canonical selections, and accessible suggestions; fuzzy matches are advisory and never silently alter recommendation hard filters. Expired items are explained as verification concerns rather than being changed to “used up.”

@@ -45,6 +45,43 @@ database_existed=0
 new_release_started=0
 cp -p .env .env.before-upgrade
 
+requested_release="${image_reference##*:}"
+minimum_release=""
+if [ -f data/cook.db ] && command -v sqlite3 >/dev/null 2>&1; then
+    has_compatibility_table="$(
+        sqlite3 data/cook.db \
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='release_compatibility';"
+    )"
+    if [ "$has_compatibility_table" = "1" ]; then
+        minimum_release="$(
+            sqlite3 data/cook.db \
+                "SELECT COALESCE(minimum_release, '') FROM release_compatibility WHERE id = 1;"
+        )"
+    fi
+fi
+
+version_is_less_than() {
+    left="${1#v}"
+    right="${2#v}"
+    left_major="${left%%.*}"
+    left_rest="${left#*.}"
+    left_minor="${left_rest%%.*}"
+    left_patch="${left_rest#*.}"
+    right_major="${right%%.*}"
+    right_rest="${right#*.}"
+    right_minor="${right_rest%%.*}"
+    right_patch="${right_rest#*.}"
+    [ "$left_major" -lt "$right_major" ] ||
+        { [ "$left_major" -eq "$right_major" ] && [ "$left_minor" -lt "$right_minor" ]; } ||
+        { [ "$left_major" -eq "$right_major" ] && [ "$left_minor" -eq "$right_minor" ] &&
+            [ "$left_patch" -lt "$right_patch" ]; }
+}
+
+if [ -n "$minimum_release" ] && version_is_less_than "$requested_release" "$minimum_release"; then
+    echo "Cook data requires $minimum_release or newer after content restriction; refusing $requested_release." >&2
+    exit 1
+fi
+
 rollback() {
     status=$?
     if [ "$status" -eq 0 ]; then

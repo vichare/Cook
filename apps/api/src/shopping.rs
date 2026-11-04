@@ -347,7 +347,9 @@ pub async fn add_recipe_ingredient(
     }
     let recipe_title: String = sqlx::query_scalar(
         "SELECT title FROM recipes
-         WHERE id = ? AND (owner_id = ? OR visibility = 'public')",
+         WHERE id = ? AND (
+           owner_id = ? OR id IN (SELECT id FROM public_eligible_recipes)
+         )",
     )
     .bind(&recipe_id)
     .bind(&user.id)

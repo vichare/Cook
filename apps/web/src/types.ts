@@ -7,6 +7,7 @@ export interface User {
   nickname: string | null
   onboardingCompleted: boolean
   locale: 'en' | 'zh-CN' | null
+  capabilities: string[]
 }
 
 export interface AiCapabilities {
@@ -84,6 +85,10 @@ export interface Recipe {
   description: string
   instructions: string
   visibility: 'private' | 'public'
+  publicationIntent: 'private' | 'public'
+  moderationState: 'clear' | 'restricted'
+  moderationReviewState: 'unreviewed' | 'reviewed'
+  moderationVersion: number
   difficulty: number | null
   estimatedCalories: number | null
   ingredients: Ingredient[]
@@ -93,6 +98,77 @@ export interface Recipe {
   isFavoriteAuthor: boolean
   coverImage: RecipeImage | null
   source: RecipeSource | null
+}
+
+export interface OwnerNotification {
+  id: string
+  recipeId: string
+  kind: 'recipe_restricted' | 'recipe_reinstated' | 'appeal_upheld'
+  reasonCode: string
+  createdAt: number
+  readAt: number | null
+}
+
+export interface ModerationAppeal {
+  id: string
+  restrictionEpoch: number
+  status: 'active' | 'reinstated' | 'upheld'
+  reason: string
+  resolutionReason: string | null
+  version: number
+  createdAt: number
+  resolvedAt: number | null
+}
+
+export interface ModerationQueueItem {
+  recipeId: string
+  title: string
+  authorHandle: string
+  reviewState: 'unreviewed' | 'reviewed'
+  moderationState: 'clear' | 'restricted'
+  recipeVersion: number
+  moderationVersion: number
+  caseId: string | null
+  caseVersion: number | null
+  reportCount: number
+  activeAppeal: boolean
+  updatedAt: string
+}
+
+export interface ModerationQueuePage {
+  items: ModerationQueueItem[]
+  nextCursor: string | null
+}
+
+export interface ModerationCase {
+  id: string
+  recipeId: string
+  status: string
+  version: number
+  createdAt: number
+  updatedAt: number
+  recipeVersion: number | null
+  moderationVersion: number | null
+  evidence: {
+    recipeVersion: number
+    title: string
+    description: string
+    instructions: string
+    authorHandle: string
+    imageId: string | null
+  }
+  reports: Array<{
+    reason: string
+    details: string
+    recipeVersion: number
+    createdAt: number
+  }>
+  appeal: {
+    id: string
+    reason: string
+    version: number
+    createdAt: number
+  } | null
 }
 
 export interface RecipeImage {
