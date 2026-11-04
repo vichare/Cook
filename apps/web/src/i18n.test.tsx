@@ -26,4 +26,27 @@ describe('i18n', () => {
     expect(formatDateValue('zh-CN', '2026-11-04')).toContain('2026')
     expect(formatDateValue('zh-CN', '2026-11-04')).toContain('11')
   })
+
+  it('distinguishes Cook users from external source authors in Chinese', () => {
+    const ownershipKeys = [
+      'common.byAuthor',
+      'recommend.source.favoriteAccount',
+      'author.intro',
+      'author.empty',
+      'author.favorite',
+      'author.unfavorite',
+      'author.favoriteAccounts',
+      'author.noFavorites',
+      'sources.favoriteAccounts',
+    ] as const
+    for (const key of ownershipKeys) {
+      expect(translateMessage('zh-CN', key)).not.toContain('作者')
+    }
+    expect(translateMessage('en', 'sources.favoriteAccounts')).toBe(
+      'Recipes from favorite Cook users',
+    )
+    expect(translateMessage('zh-CN', 'recipe.sourceAuthor')).toBe('来源作者')
+    expect(translateMessage('zh-CN', 'import.sourceAuthor', { author: '来源用户' }))
+      .toContain('来源作者')
+  })
 })

@@ -1,6 +1,6 @@
 # Cook
 
-Cook is a deployable recipe and private-pantry recommendation MVP. It combines user-authored recipes, per-account pantry state, configurable recommendation sources, and deterministic explanations for what can be cooked now.
+Cook is a deployable recipe and private-pantry recommendation MVP. It combines user-published recipes, per-account pantry state, configurable recommendation sources, and deterministic explanations for what can be cooked now.
 
 Pantry items can carry one optional date-only expiration and a default-off automatic-restock setting. Only an explicit `out` status derives a private shopping-list item; unknown or expired items are not silently changed to out. Manual, recipe, and automatic sources deduplicate by confirmed canonical identity or owner-normalized input and remain isolated per account. Every active source combination uses the same Bought workflow to update pantry state and either remove all shopping sources or keep them for a partial purchase, with optimistic concurrency, idempotent retries, and safe atomic undo.
 
@@ -10,7 +10,7 @@ Recipes may optionally include a 1–5 difficulty and an estimated total kcal va
 
 Recipe descriptions and instructions remain Markdown source. The web editor provides text-labeled formatting controls and a live preview; rendering disables raw HTML and embedded images, allows only a small standard/GFM element set, and accepts only HTTP/HTTPS links.
 
-Public recipes use immutable random author handles and optional public nicknames without exposing authentication identities or internal account IDs. Users can privately favorite authors, and recommendations deterministically combine owned recipes, saved recipes, favorite authors' current public recipes, and other public recipes with structured explanations and a bounded 0–999 score.
+Public recipes use immutable random public-user handles and optional public nicknames without exposing authentication identities or internal account IDs. Users can privately favorite Cook users, and recommendations deterministically combine owned recipes, saved recipes, favorite users' current public recipes, and other public recipes with structured explanations and a bounded 0–999 score. Internal API and route identifiers retain their existing `author` naming for compatibility.
 
 Recommendation responses are bounded to 50 by default (hard maximum 100) while still scanning every eligible candidate with constant query count and a top-N heap. Browser and AI recipe/image edits share optimistic versions, so a stale tab receives a conflict instead of overwriting newer work.
 
@@ -56,13 +56,13 @@ Store the one-time token as the `COOK_IMPORT_TOKEN` environment variable, never 
 GitHub CLI 2.90+ can preview and install the full Skill, including schema assets:
 
 ```powershell
-gh skill preview vichare/Cook cook-recipe-import@v0.4.1
-gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.1
+gh skill preview vichare/Cook cook-recipe-import@v0.4.2
+gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.2
 ```
 
 Manual fallback: copy the entire `skills/cook-recipe-import` directory to `~/.copilot/skills/cook-recipe-import` or `~/.agents/skills/cook-recipe-import`; copying only `SKILL.md` omits required schemas. Customize > Skills manages skills after they exist in a supported location; the GitHub source link is for review, not a paste-to-install URL.
 
-Settings presents plain-language task presets, a numbered setup flow, a one-time-token connection test against `GET /api/ai/capabilities`, copyable self-contained draft/create/update examples, multipart cover guidance, authoritative schema links, first-use tasks, and progressive security/bulk rules. The non-secret AI client setup remains available after the one-time reveal closes and copies the exact `COOK_BASE_URL=<origin>` assignment; `COOK_IMPORT_TOKEN` must be copied separately while it is visible and cannot be recovered later. Reusable output includes the resolved base URL but never the secret. Recipe-level source URL/title/author/license/attribution are optional and remain distinct from cover provenance; Cook displays supplied license metadata without claiming independent verification.
+Settings presents plain-language task presets, a numbered setup flow, a one-time-token connection test against `GET /api/ai/capabilities`, copyable self-contained draft/create/update examples, multipart cover guidance, authoritative schema links, first-use tasks, and progressive security/bulk rules. The non-secret AI client setup remains available after the one-time reveal closes and copies the exact `COOK_BASE_URL=<origin>` assignment; `COOK_IMPORT_TOKEN` must be copied separately while it is visible and cannot be recovered later. Progressive setup guidance recommends a documented client Secret Store when available, otherwise secure-prompted current-process environment variables, and keeps persistent user-level options separate with their security tradeoff. Reusable commands and output include the resolved base URL but never the secret. `difficulty` and whole-recipe `estimatedCalories` are optional and may be omitted or null. Recipe-level source URL/title/author/license/attribution are optional, render after the recipe content, and remain distinct from cover provenance; Cook displays supplied license metadata without claiming independent verification.
 
 ## Interface languages
 

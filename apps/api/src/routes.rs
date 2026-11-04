@@ -4304,6 +4304,8 @@ mod tests {
         let first = response_json(first).await;
         assert_eq!(first["visibility"], "private");
         assert_eq!(first["version"], 1);
+        assert!(first["difficulty"].is_null());
+        assert!(first["estimatedCalories"].is_null());
         assert_eq!(first["source"]["license"], "CC-BY-4.0");
         assert_eq!(
             first["source"]["attribution"],
@@ -4369,6 +4371,8 @@ mod tests {
         let update = response_json(update).await;
         assert_eq!(update["status"], "updated");
         assert_eq!(update["recipe"]["version"], 2);
+        assert!(update["recipe"]["difficulty"].is_null());
+        assert!(update["recipe"]["estimatedCalories"].is_null());
         assert_eq!(
             update["recipe"]["source"]["url"],
             "https://example.test/recipes/soup-v2"
@@ -5217,6 +5221,21 @@ mod tests {
         assert_eq!(draft["estimatedCalories"], 450);
         assert_eq!(draft["sourceLicense"], "CC-BY-4.0");
 
+        let mut optional_metadata = import_payload("https://example.test/optional-metadata-soup");
+        optional_metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("difficulty");
+        optional_metadata
+            .as_object_mut()
+            .unwrap()
+            .insert("estimatedCalories".into(), Value::Null);
+        let optional = submit_import(&app, secret, optional_metadata).await;
+        assert_eq!(optional.status(), StatusCode::CREATED);
+        let optional = response_json(optional).await;
+        assert!(optional["difficulty"].is_null());
+        assert!(optional["estimatedCalories"].is_null());
+
         let other = app
             .clone()
             .oneshot(
@@ -5497,6 +5516,29 @@ mod tests {
         let cleared = response_json(clear).await;
         assert!(cleared["difficulty"].is_null());
         assert!(cleared["estimatedCalories"].is_null());
+
+        let omitted = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Metadata omitted",
+                            "visibility": "private",
+                            "ingredients": [{"name": "water"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(omitted.status(), StatusCode::CREATED);
+        let omitted = response_json(omitted).await;
+        assert!(omitted["difficulty"].is_null());
+        assert!(omitted["estimatedCalories"].is_null());
 
         let invalid = app
             .oneshot(

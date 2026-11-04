@@ -50,15 +50,15 @@ Automated tests cover representative normalization, delimiter, high-risk non-sub
 
 ### Public recipe nickname
 
-Google email, display name, issuer, and subject remain private authentication data and are never reused automatically as a public author identity. A user may opt into a non-unique Unicode nickname, clear it later, or remain in the language-independent anonymous state represented by a null nickname. The UI renders the anonymous label for the current locale.
+Google email, display name, issuer, and subject remain private authentication data and are never reused automatically as a public Cook-user identity. A user may opt into a non-unique Unicode nickname, clear it later, or remain in the language-independent anonymous state represented by a null nickname. The UI renders the anonymous label for the current locale.
 
 First-login profile setup defaults to anonymous, offers the Google display name only as a private suggestion that must be selected explicitly, and supports a custom nickname. Skipping completes onboarding anonymously. Public recipe responses expose only the nullable nickname and whether the current viewer owns the recipe; they do not expose another account's internal owner ID or authentication profile. Nickname changes apply immediately to historical public recipes.
 
-### Public authors, favorite accounts, and deterministic recommendation ranking
+### Public Cook users, favorite accounts, and deterministic recommendation ranking
 
 **Shipped on `main`.** Every account has an immutable random 128-bit URL-safe public handle. `/authors/{handle}` exposes only the nullable opt-in nickname and stable keyset-paginated public recipes; it never returns email, Google identity fields, internal user IDs, pantry data, private recipes, account age, or private counts.
 
-Favorite-account relationships are private, reject self-favorites, and dynamically include that author's current and future public recipes. Unpublished recipes disappear immediately. Saved-recipe and favorite-author overlap appears once while preserving both matched source labels and awarding the shared 75-point favorite source contribution only once.
+Favorite-account relationships are private, reject self-favorites, and dynamically include that Cook user's current and future public recipes. Unpublished recipes disappear immediately. Saved-recipe and favorite-user overlap appears once while preserving both matched source labels and awarding the shared 75-point favorite source contribution only once. Internal `/authors/{handle}` routes and API identifiers remain unchanged for compatibility.
 
 Recommendation source controls separately cover owned recipes, saved recipes, favorite accounts, and other public recipes. Hard source/visibility, excluded-ingredient, and required-ingredient filters run before status and score. Status bases absolutely dominate bounded extras on the documented 0–999 scale, and responses include primary/matched sources, structured ingredient reasons, applied controls, and a collapsible score breakdown. Production-sized 10,000-public-recipe / 500-favorite-author warm p95 under 250 ms remains an explicit release gate because this development environment does not provide representative production data.
 
@@ -76,7 +76,9 @@ Private-management tokens can list/read owned recipes, idempotently create priva
 
 The image pipeline accepts only JPEG, PNG, and WebP bytes, rejects SVG/GIF/unsupported formats, enforces request/decoder/pixel/stored-byte limits, applies orientation, resizes to a 1,600px longest edge, flattens transparency, and re-encodes to JPEG to remove metadata. Cook never fetches remote images. The skill must ask the user to confirm image rights and must not automatically copy source-site or video images.
 
-Before and after the one-time reveal, Settings provides persistent non-secret AI client setup with a human-review link to the official public Skill source, verified GitHub CLI repository+skill installation commands pinned to `v0.4.1`, manual full-folder fallback instructions, the exact trusted frontend origin as a copyable `COOK_BASE_URL=<origin>` assignment, and token-free bilingual Prompt output. The real `COOK_IMPORT_TOKEN` secret is copied separately during its one-time reveal and is never interpolated into reusable output or stored in browser persistence. Guided setup includes task cards, a numbered flow, connection testing, copyable request examples that match the bundled JSON schemas, multipart cover guidance, first-use requests, and progressive disclosure for deterministic bulk/error rules.
+Before and after the one-time reveal, Settings provides persistent non-secret AI client setup with a human-review link to the official public Skill source, verified GitHub CLI repository+skill installation commands pinned to `v0.4.2`, manual full-folder fallback instructions, the exact trusted frontend origin as a copyable `COOK_BASE_URL=<origin>` assignment, and token-free bilingual Prompt output. The real `COOK_IMPORT_TOKEN` secret is copied separately during its one-time reveal and is never interpolated into reusable output or stored in browser persistence. Progressive guidance distinguishes client Secret Stores, secure-prompted current-process environment variables, and persistent user-level configuration with its larger exposure surface. Guided setup includes task cards, a numbered flow, connection testing, copyable request examples that match the bundled JSON schemas, optional/null difficulty and whole-recipe calorie guidance, multipart cover guidance, first-use requests, and progressive disclosure for deterministic bulk/error rules.
+
+Recipe and recommendation cards use the visible recipe title as the detail link rather than repeating a separate open/details action. Recipe-level source provenance appears in a compact Source section after description, ingredients, and method; cover-image provenance remains attached to the cover.
 
 Recipe provenance is optional for original/home recipes and structured independently from cover-image provenance. Browser and AI create/update flows, pending revisions, import-draft acceptance, public/private DTOs, OpenAPI, and JSON schemas preserve source URL, title, author, license, and attribution. Cook treats submitted license text as metadata rather than verified proof; the Skill keeps externally sourced content private when reliable provenance is missing.
 
@@ -88,7 +90,7 @@ Agent Finder did not yield an adopted third-party dedicated recipe skill. Cook t
 
 Before sign-in, locale selection uses a saved local preference first, then `navigator.languages`; Chinese browser languages map to `zh-CN` and all other languages fall back to English. The sign-in screen has a visible English/简体中文 selector; switching saves the preference and retains entered Email OTP values. After sign-in, the account locale is authoritative and persists in SQLite. An existing account with no locale is initialized once from the current local/browser preference and is not repeatedly overwritten. Settings changes update the account and local preference together so the selected language remains active after sign-out.
 
-Anonymous authors remain a semantic null nickname rather than a translated database string. Dates and numbers use locale-aware `Intl` formatting, while API enums, recommendation reason codes, error codes, and persisted domain values remain language-independent.
+Anonymous Cook users remain a semantic null nickname rather than a translated database string. Dates and numbers use locale-aware `Intl` formatting, while API enums, recommendation reason codes, error codes, and persisted domain values remain language-independent.
 
 ### Authentication availability beyond Google
 

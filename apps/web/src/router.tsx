@@ -595,11 +595,16 @@ export function RecommendationsPage() {
               <div className="card-heading">
                 <div>
                   <span className={`status ${result.status.toLowerCase()}`}>{t(`status.${result.status}`)}</span>
-                  <h2>{result.recipe.title}</h2>
+                  <h2>
+                    <Link
+                      className="recipe-title-link"
+                      to="/recipes/$recipeId"
+                      params={{ recipeId: result.recipe.id }}
+                    >
+                      {result.recipe.title}
+                    </Link>
+                  </h2>
                 </div>
-                <Link to="/recipes/$recipeId" params={{ recipeId: result.recipe.id }}>
-                  {t('recommend.details')}
-                </Link>
               </div>
               {(result.recipe.coverImage || result.recipe.description) && (
                 <div className="recommendation-preview">
@@ -782,7 +787,7 @@ function IngredientFilterInput({
   )
 }
 
-function RecipesPage() {
+export function RecipesPage() {
   const { formatNumber, t } = useI18n()
   const recipes = useQuery({ queryKey: ['recipes'], queryFn: api.recipes })
   const queryClient = useQueryClient()
@@ -818,7 +823,15 @@ function RecipesPage() {
                   <span className="eyebrow">
                     {recipe.visibility === 'public' ? t('common.public') : t('common.private')}
                   </span>
-                  <h2>{recipe.title}</h2>
+                  <h2>
+                    <Link
+                      className="recipe-title-link"
+                      to="/recipes/$recipeId"
+                      params={{ recipeId: recipe.id }}
+                    >
+                      {recipe.title}
+                    </Link>
+                  </h2>
                 </div>
                 <button
                   className="button ghost"
@@ -836,9 +849,6 @@ function RecipesPage() {
                 t={t}
               />
               <AuthorByline recipe={recipe} />
-              <Link to="/recipes/$recipeId" params={{ recipeId: recipe.id }}>
-                {t('recipes.open')}
-              </Link>
             </article>
           ))}
         </div>
@@ -931,7 +941,17 @@ function AuthorProfilePage() {
         <div className="card-list">
           {recipes.map((recipe) => (
             <article className="recipe-card" key={recipe.id}>
-              <h2>{recipe.title}</h2>
+              <h2>
+                {me.data ? (
+                  <Link
+                    className="recipe-title-link"
+                    to="/recipes/$recipeId"
+                    params={{ recipeId: recipe.id }}
+                  >
+                    {recipe.title}
+                  </Link>
+                ) : recipe.title}
+              </h2>
               <p>{recipe.description || t('recipes.noDescription')}</p>
               <RecipeMetadata
                 difficulty={recipe.difficulty}
@@ -939,11 +959,6 @@ function AuthorProfilePage() {
                 formatNumber={formatNumber}
                 t={t}
               />
-              {me.data && (
-                <Link to="/recipes/$recipeId" params={{ recipeId: recipe.id }}>
-                  {t('recipes.open')}
-                </Link>
-              )}
             </article>
           ))}
         </div>
@@ -972,86 +987,137 @@ function RecipeDetailPage() {
     <Page title={recipe.data?.title ?? t('recipe.fallbackTitle')} intro={recipe.data?.description ?? ''}>
       <QueryState query={recipe} empty={t('recipe.notFound')}>
         {recipe.data && (
+          <RecipeDetailContent recipe={recipe.data} />
+        )}
+      </QueryState>
+    </Page>
+  )
+}
+
+export function RecipeDetailContent({ recipe }: { recipe: Recipe }) {
+  const { formatNumber, t } = useI18n()
+  return (
           <article className="detail-card">
             <div className="card-heading">
               <span className="status verify">
-                {recipe.data.visibility === 'public' ? t('common.public') : t('common.private')}
+                {recipe.visibility === 'public' ? t('common.public') : t('common.private')}
               </span>
-              {recipe.data.isOwner && (
-                <Link className="button secondary" to="/recipes/$recipeId/edit" params={{ recipeId }}>
+              {recipe.isOwner && (
+                <Link className="button secondary" to="/recipes/$recipeId/edit" params={{ recipeId: recipe.id }}>
                   {t('common.edit')}
                 </Link>
               )}
             </div>
-            <AuthorByline recipe={recipe.data} />
+            <AuthorByline recipe={recipe} />
             <RecipeMetadata
-              difficulty={recipe.data.difficulty}
-              estimatedCalories={recipe.data.estimatedCalories}
+              difficulty={recipe.difficulty}
+              estimatedCalories={recipe.estimatedCalories}
               formatNumber={formatNumber}
               t={t}
             />
-            {recipe.data.coverImage && (
+            {recipe.coverImage && (
               <figure className="recipe-cover-detail">
                 <img
-                  src={recipe.data.coverImage.url}
-                  alt={recipe.data.coverImage.altText}
-                  width={recipe.data.coverImage.width}
-                  height={recipe.data.coverImage.height}
+                  src={recipe.coverImage.url}
+                  alt={recipe.coverImage.altText}
+                  width={recipe.coverImage.width}
+                  height={recipe.coverImage.height}
                 />
-                {(recipe.data.coverImage.sourceAttribution || recipe.data.coverImage.sourceLicense) && (
+                {(recipe.coverImage.sourceAttribution || recipe.coverImage.sourceLicense) && (
                   <figcaption>
-                    {recipe.data.coverImage.sourceAttribution}
-                    {recipe.data.coverImage.sourceAttribution && recipe.data.coverImage.sourceLicense && ' · '}
-                    {recipe.data.coverImage.sourceLicense}
+                    {recipe.coverImage.sourceAttribution}
+                    {recipe.coverImage.sourceAttribution && recipe.coverImage.sourceLicense && ' · '}
+                    {recipe.coverImage.sourceLicense}
                   </figcaption>
                 )}
-                {recipe.data.coverImage.sourceUrl && (
-                  <a href={recipe.data.coverImage.sourceUrl} rel="noreferrer" target="_blank">
+                {recipe.coverImage.sourceUrl && (
+                  <a href={recipe.coverImage.sourceUrl} rel="noreferrer" target="_blank">
                     {t('recipe.coverSourceLink')}
                   </a>
                 )}
               </figure>
             )}
-            {recipe.data.source && (
-              <aside className="source-note">
-                <strong>{t('recipe.importedSource')}</strong>
-                {recipe.data.source.url ? (
-                  <a href={recipe.data.source.url} rel="noreferrer">
-                    {recipe.data.source.title ?? recipe.data.source.url}
-                  </a>
-                ) : (
-                  recipe.data.source.title && <span>{recipe.data.source.title}</span>
-                )}
-                {recipe.data.source.author && (
-                  <span>{t('recipe.sourceBy', { author: recipe.data.source.author })}</span>
-                )}
-                {recipe.data.source.attribution && <p>{recipe.data.source.attribution}</p>}
-                {recipe.data.source.license && (
-                  <p>{t('recipe.sourceLicenseValue', { license: recipe.data.source.license })}</p>
-                )}
-                {(recipe.data.source.license || recipe.data.source.attribution) && (
-                  <small>{t('recipe.sourceLicenseUnverified')}</small>
-                )}
-                {recipe.data.source.warnings.map((warning) => (
-                  <p key={warning}>{warning}</p>
-                ))}
-              </aside>
-            )}
-            {recipe.data.description && <SafeMarkdown value={recipe.data.description} />}
+            {recipe.description && <SafeMarkdown value={recipe.description} />}
             <h2>{t('recipe.ingredients')}</h2>
-            <RecipeIngredientList ingredients={recipe.data.ingredients} />
+            <RecipeIngredientList ingredients={recipe.ingredients} />
             <h2>{t('recipe.method')}</h2>
-            {recipe.data.instructions ? (
-              <SafeMarkdown value={recipe.data.instructions} />
+            {recipe.instructions ? (
+              <SafeMarkdown value={recipe.instructions} />
             ) : (
               <p>{t('recipe.noInstructions')}</p>
             )}
-            {recipe.data.isOwner && <RevisionReview recipeId={recipeId} />}
+            <RecipeSourceSection source={recipe.source} />
+            {recipe.isOwner && <RevisionReview recipeId={recipe.id} />}
           </article>
-        )}
-      </QueryState>
-    </Page>
   )
+}
+
+function RecipeSourceSection({ source }: { source: Recipe['source'] }) {
+  const { t } = useI18n()
+  if (!source || (!source.url
+    && !source.title
+    && !source.author
+    && !source.license
+    && !source.attribution
+    && source.warnings.length === 0)) return null
+  const sourceUrl = safeHttpUrl(source.url)
+  return (
+    <section className="source-note recipe-source-section" aria-labelledby="recipe-source-heading">
+      <h2 id="recipe-source-heading">{t('recipe.importedSource')}</h2>
+      <dl className="source-details-list">
+        {(source.url || source.title) && (
+          <div>
+            <dt>{t('recipe.sourceDetails')}</dt>
+            <dd>
+              {sourceUrl ? (
+                <a href={sourceUrl} rel="noreferrer" target="_blank">
+                  {source.title ?? sourceUrl}
+                </a>
+              ) : (source.title ?? source.url)}
+            </dd>
+          </div>
+        )}
+        {source.author && (
+          <div>
+            <dt>{t('recipe.sourceAuthor')}</dt>
+            <dd>{source.author}</dd>
+          </div>
+        )}
+        {source.license && (
+          <div>
+            <dt>{t('recipe.sourceLicense')}</dt>
+            <dd>{source.license}</dd>
+          </div>
+        )}
+        {source.attribution && (
+          <div>
+            <dt>{t('recipe.sourceAttribution')}</dt>
+            <dd>{source.attribution}</dd>
+          </div>
+        )}
+      </dl>
+      {(source.license || source.attribution) && (
+        <small>{t('recipe.sourceLicenseUnverified')}</small>
+      )}
+      {source.warnings.length > 0 && (
+        <ul className="plain-list">
+          {source.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+        </ul>
+      )}
+    </section>
+  )
+}
+
+function safeHttpUrl(value: string | null): string | null {
+  if (!value) return null
+  try {
+    const url = new URL(value)
+    return (url.protocol === 'http:' || url.protocol === 'https:') && Boolean(url.hostname)
+      ? url.toString()
+      : null
+  } catch {
+    return null
+  }
 }
 
 function FavoriteAccountsSettings() {
@@ -2957,11 +3023,11 @@ function ProfileSettings({ user }: { user: User }) {
 }
 
 export const COOK_SKILL_URL =
-  'https://github.com/vichare/Cook/tree/v0.4.1/skills/cook-recipe-import'
+  'https://github.com/vichare/Cook/tree/v0.4.2/skills/cook-recipe-import'
 export const COOK_IMPORT_SCHEMA_URL =
-  'https://raw.githubusercontent.com/vichare/Cook/v0.4.1/skills/cook-recipe-import/schema/import-draft-v1.schema.json'
+  'https://raw.githubusercontent.com/vichare/Cook/v0.4.2/skills/cook-recipe-import/schema/import-draft-v1.schema.json'
 export const COOK_AI_RECIPE_SCHEMA_URL =
-  'https://raw.githubusercontent.com/vichare/Cook/v0.4.1/skills/cook-recipe-import/schema/ai-recipe-v1.schema.json'
+  'https://raw.githubusercontent.com/vichare/Cook/v0.4.2/skills/cook-recipe-import/schema/ai-recipe-v1.schema.json'
 export type TokenPreset = 'import' | 'manage' | 'publish'
 
 function tokenPresetForScopes(scopes: string[]): TokenPreset | null {
@@ -3062,6 +3128,8 @@ Final report: created, updated, skipped, failed, and needs_review counts, plus e
 
 For externally sourced content, preserve sourceUrl, sourceTitle, sourceAuthor, sourceLicense, and sourceAttribution when available. A stated license is metadata, not verified proof. If reliable source/license/attribution is missing, do not directly publish: create a private review draft or private recipe and warn the user.
 
+Difficulty and estimatedCalories are optional and may be omitted or null. If present, difficulty must be an integer from 1 to 5 and estimatedCalories must be an integer from 1 to 100000 representing total kcal for the whole recipe, never per serving.
+
 Upload only local images the user owns or has explicit permission to use. A repository-level license may not cover every image. When uncertain, skip the image and record why. Cook never remotely fetches image URLs.`
 }
 
@@ -3084,6 +3152,44 @@ export function resolveCookBaseUrl(
     throw new Error('Cook must run from an HTTP or HTTPS origin')
   }
   return parsed.origin
+}
+
+export function windowsTemporarySetup(origin = resolveCookBaseUrl()) {
+  const baseUrl = resolveCookBaseUrl(origin)
+  return `$env:COOK_BASE_URL = '${baseUrl}'
+$secureToken = Read-Host 'COOK_IMPORT_TOKEN' -AsSecureString
+$env:COOK_IMPORT_TOKEN = [System.Net.NetworkCredential]::new('', $secureToken).Password`
+}
+
+export function unixTemporarySetup(origin = resolveCookBaseUrl()) {
+  const baseUrl = resolveCookBaseUrl(origin)
+  return `export COOK_BASE_URL='${baseUrl}'
+printf 'COOK_IMPORT_TOKEN: ' >&2
+trap 'stty echo' EXIT HUP INT TERM
+stty -echo
+IFS= read -r COOK_IMPORT_TOKEN
+stty echo
+trap - EXIT HUP INT TERM
+printf '\\n' >&2
+export COOK_IMPORT_TOKEN`
+}
+
+export function windowsPersistentBaseUrlSetup(origin = resolveCookBaseUrl()) {
+  const baseUrl = resolveCookBaseUrl(origin)
+  return `[Environment]::SetEnvironmentVariable('COOK_BASE_URL', '${baseUrl}', 'User')`
+}
+
+export function unixPersistentBaseUrlSetup(origin = resolveCookBaseUrl()) {
+  const baseUrl = resolveCookBaseUrl(origin)
+  return `case "\${SHELL##*/}" in
+  zsh) profile="\${ZDOTDIR:-$HOME}/.zshrc" ;;
+  bash) profile="$HOME/.bashrc" ;;
+  *) profile=''; printf 'Add COOK_BASE_URL to your shell profile manually.\\n' >&2 ;;
+esac
+if [ -n "$profile" ]; then
+  printf "\\nexport COOK_BASE_URL='${baseUrl}'\\n" >> "$profile"
+  printf 'Open a new interactive shell, then launch the client from that shell.\\n'
+fi`
 }
 
 function presetScopeGuidance(preset: TokenPreset) {
@@ -3125,9 +3231,9 @@ export function skillInstructionsForPreset(
   const baseUrl = resolveCookBaseUrl(origin)
   return `English:
 GitHub Copilot skill installation:
-1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.4.1
+1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.4.2
 2. Install for cross-session use, pinned to this release:
-   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.1
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.2
 3. Restart GitHub Copilot if needed, then verify the skill in Customize → Skills.
 
 Manual fallback: download or copy the entire skills/cook-recipe-import directory, including its schema directory, to ~/.copilot/skills/cook-recipe-import or ~/.agents/skills/cook-recipe-import. Do not copy only SKILL.md.
@@ -3146,9 +3252,9 @@ Minimal first use: “${firstTaskForPreset(preset, 'en')}” The import endpoint
 
 简体中文：
 GitHub Copilot Skill 安装：
-1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.4.1
+1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.4.2
 2. 安装到用户范围并固定到此 release：
-   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.1
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.2
 3. 必要时重启 GitHub Copilot，然后在 Customize → Skills 中确认。
 
 手动备用：下载或复制整个 skills/cook-recipe-import 目录（必须包括 schema 目录）到 ~/.copilot/skills/cook-recipe-import 或 ~/.agents/skills/cook-recipe-import。不要只复制 SKILL.md。
@@ -3456,6 +3562,62 @@ export function ImportTokenSettings() {
         >
           {t('token.copyBaseUrl')}
         </button>
+        <details className="client-setup-details">
+          <summary>{t('token.configureEnvironment')}</summary>
+          <p>{t('token.configureEnvironmentDetail')}</p>
+          <h4>{t('token.githubCopilotSetup')}</h4>
+          <p>{t('token.githubCopilotSetupDetail')}</p>
+          <h4>{t('token.genericClientSetup')}</h4>
+          <p>{t('token.genericClientSetupDetail')}</p>
+          <h4>{t('token.temporarySetup')}</h4>
+          <p>{t('token.temporarySetupDetail')}</p>
+          <h5>{t('token.windowsPowerShell')}</h5>
+          <pre><code>{windowsTemporarySetup(baseUrl)}</code></pre>
+          <button
+            type="button"
+            className="button ghost"
+            onClick={() => copyOutput(windowsTemporarySetup(baseUrl), t('token.temporaryCommandsCopied'))}
+          >
+            {t('token.copyWindowsTemporary')}
+          </button>
+          <h5>{t('token.macosLinux')}</h5>
+          <pre><code>{unixTemporarySetup(baseUrl)}</code></pre>
+          <button
+            type="button"
+            className="button ghost"
+            onClick={() => copyOutput(unixTemporarySetup(baseUrl), t('token.temporaryCommandsCopied'))}
+          >
+            {t('token.copyUnixTemporary')}
+          </button>
+          <details>
+            <summary>{t('token.persistentSetup')}</summary>
+            <p>{t('token.persistentSetupDetail')}</p>
+            <h5>{t('token.windowsPowerShell')}</h5>
+            <pre><code>{windowsPersistentBaseUrlSetup(baseUrl)}</code></pre>
+            <button
+              type="button"
+              className="button ghost"
+              onClick={() => copyOutput(
+                windowsPersistentBaseUrlSetup(baseUrl),
+                t('token.persistentBaseUrlCopied'),
+              )}
+            >
+              {t('token.copyWindowsPersistent')}
+            </button>
+            <h5>{t('token.macosLinux')}</h5>
+            <pre><code>{unixPersistentBaseUrlSetup(baseUrl)}</code></pre>
+            <button
+              type="button"
+              className="button ghost"
+              onClick={() => copyOutput(
+                unixPersistentBaseUrlSetup(baseUrl),
+                t('token.persistentBaseUrlCopied'),
+              )}
+            >
+              {t('token.copyUnixPersistent')}
+            </button>
+          </details>
+        </details>
         <h4>{t('token.installSkill')}</h4>
         <p>{t('token.installSkillDetail')}</p>
         <p>{t('token.skillMainNote')}</p>

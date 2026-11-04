@@ -62,7 +62,7 @@ Content-Type: application/json
 }
 ```
 
-`schemaVersion`, `sourceUrl`, `title`, at least one ingredient, and at least one step are required. The source metadata, description, difficulty, whole-recipe estimated calories, warnings, and confidence are optional. Never include owner ID or visibility; Cook derives the owner and creates a private draft. Return the `reviewUrl` resolved against `COOK_BASE_URL` and tell the user that acceptance still requires browser review.
+`schemaVersion`, `sourceUrl`, `title`, at least one ingredient, and at least one step are required. The source metadata, description, difficulty, whole-recipe estimated calories, warnings, and confidence are optional and may be omitted or set to `null` where the schema permits. If present, `difficulty` is an integer from 1 to 5 and `estimatedCalories` is an integer from 1 to 100000 representing total kcal for the whole recipe, never per serving. Never include owner ID or visibility; Cook derives the owner and creates a private draft. Return the `reviewUrl` resolved against `COOK_BASE_URL` and tell the user that acceptance still requires browser review.
 
 ## Create or update an owned recipe
 

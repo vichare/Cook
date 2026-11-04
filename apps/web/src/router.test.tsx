@@ -21,10 +21,12 @@ import {
   ProfileSetup,
   RecipeCoverFields,
   RecipeConflictNotice,
+  RecipeDetailContent,
   RecipeEditorForm,
   RecipeIngredientList,
   RecipeMetadataFields,
   RecipeProvenanceFields,
+  RecipesPage,
   RecommendationsPage,
   ShoppingListPage,
   persistRecipeEdit,
@@ -56,6 +58,7 @@ const {
   addRecipeIngredientToShopping,
   purchaseShoppingItem,
   recommendationsApi,
+  recipesApi,
   recipeApi,
   requestEmailLink,
   requestEmailOtp,
@@ -157,6 +160,7 @@ const {
     undoAvailable: true,
   }),
   recommendationsApi: vi.fn(),
+  recipesApi: vi.fn(),
   addRecipeIngredientToShopping: vi.fn(),
   saveRecipe: vi.fn(),
   recipeApi: vi.fn(),
@@ -191,6 +195,8 @@ vi.mock('./api', async () => {
       updateShoppingItem: vi.fn().mockResolvedValue([]),
       deleteShoppingItem: vi.fn().mockResolvedValue([]),
       recommendations: recommendationsApi,
+      recipes: recipesApi,
+      favorite: vi.fn().mockResolvedValue(undefined),
       addRecipeIngredientToShopping,
       undoShoppingPurchase: vi.fn().mockResolvedValue([]),
       saveProfile,
@@ -1003,7 +1009,7 @@ describe('recommendation shopping membership', () => {
         id: 'recipe-shop',
         version: 1,
         isOwner: true,
-        authorHandle: 'owner',
+        authorHandle: '',
         authorNickname: null,
         title: 'Saffron rice',
         description: '',
@@ -1094,6 +1100,11 @@ describe('recommendation shopping membership', () => {
     ]
     recommendationsApi.mockReset().mockResolvedValue([result])
     renderRecommendations()
+    expect(await screen.findByRole('link', { name: 'Saffron rice' })).toHaveAttribute(
+      'href',
+      '/recipes/recipe-shop',
+    )
+    expect(screen.queryByRole('link', { name: 'Details' })).not.toBeInTheDocument()
     expect(await screen.findByRole('img', { name: 'Saffron rice in a bowl' })).toHaveAttribute(
       'src',
       '/api/recipes/recipe-shop/cover',
@@ -1120,6 +1131,16 @@ describe('recommendation shopping membership', () => {
     expect(screen.queryByText('Available')).not.toBeInTheDocument()
     expect(screen.queryByText('Verify')).not.toBeInTheDocument()
     expect(screen.queryByRole('img')).not.toBeInTheDocument()
+  })
+
+  it('uses Cook user terminology for account ownership while preserving source-author terminology', async () => {
+    const result = recommendation()
+    result.primarySource = 'FAVORITE_ACCOUNT'
+    result.matchedSources = ['FAVORITE_ACCOUNT']
+    recommendationsApi.mockReset().mockResolvedValue([result])
+    renderRecommendations('zh-CN')
+    expect(await screen.findByText('主要来源：已收藏用户')).toBeVisible()
+    expect(screen.queryByText('主要来源：已收藏作者')).not.toBeInTheDocument()
   })
 
   it('prevents duplicate submits and transitions immediately after a successful add', async () => {
@@ -1150,6 +1171,148 @@ describe('recommendation shopping membership', () => {
     expect(screen.getByRole('button', { name: 'Add Saffron' })).toBeEnabled()
     expect(screen.queryByText('Saffron: In shopping list')).not.toBeInTheDocument()
     expect(screen.queryByText('Saffron added to the shopping list.')).not.toBeInTheDocument()
+  })
+})
+
+describe('recipe card navigation and provenance', () => {
+  function recipe(overrides: Partial<Recipe> = {}): Recipe {
+    return {
+      id: 'recipe-1',
+      version: 1,
+      isOwner: true,
+      authorHandle: 'owner',
+      authorNickname: 'Owner',
+      title: 'Linked soup',
+      description: 'Recipe description',
+      instructions: 'Stir the soup.',
+      visibility: 'private',
+      difficulty: null,
+      estimatedCalories: null,
+      ingredients: [{ name: 'water', quantityNote: '1 cup', canonicalIngredientId: null }],
+      isFavorite: false,
+      isFavoriteAuthor: false,
+      coverImage: null,
+      source: null,
+      ...overrides,
+    }
+  }
+
+  function renderDetail(value: Recipe, locale: Locale = 'en') {
+    const root = createRootRoute({
+      component: () => (
+        <LocaleProvider initialLocale={locale} storage={null}>
+          <QueryClientProvider client={new QueryClient()}>
+            <RecipeDetailContent recipe={value} />
+          </QueryClientProvider>
+        </LocaleProvider>
+      ),
+    })
+    const testRouter = createRouter({
+      routeTree: root,
+      history: createMemoryHistory({ initialEntries: ['/'] }),
+    })
+    return render(<RouterProvider router={testRouter} />)
+  }
+
+  it('uses recipe titles as the only detail links for private and public recipe cards', async () => {
+    recipesApi.mockReset().mockResolvedValue([
+      recipe(),
+      recipe({
+        id: 'recipe-2',
+        title: 'Public stew',
+        visibility: 'public',
+        isOwner: false,
+      }),
+    ])
+    const root = createRootRoute({
+      component: () => (
+        <LocaleProvider initialLocale="en" storage={null}>
+          <QueryClientProvider client={new QueryClient()}>
+            <RecipesPage />
+          </QueryClientProvider>
+        </LocaleProvider>
+      ),
+    })
+    const testRouter = createRouter({
+      routeTree: root,
+      history: createMemoryHistory({ initialEntries: ['/recipes'] }),
+    })
+    render(<RouterProvider router={testRouter} />)
+
+    expect(await screen.findByRole('link', { name: 'Linked soup' }))
+      .toHaveAttribute('href', '/recipes/recipe-1')
+    expect(screen.getByRole('link', { name: 'Public stew' }))
+      .toHaveAttribute('href', '/recipes/recipe-2')
+    expect(screen.queryByRole('link', { name: 'Open recipe' })).not.toBeInTheDocument()
+    expect(document.querySelectorAll('h2 > a.recipe-title-link')).toHaveLength(2)
+  })
+
+  it('places recipe provenance after content and keeps cover provenance with the image', async () => {
+    const detailed = recipe({
+      isOwner: false,
+      coverImage: {
+        id: 'cover-1',
+        url: '/api/recipes/recipe-1/cover',
+        altText: 'Soup cover',
+        sourceUrl: 'https://images.example.test/soup',
+        sourceLicense: 'CC-BY-4.0',
+        sourceAttribution: 'Cover photographer',
+        version: 1,
+        width: 640,
+        height: 480,
+      },
+      source: {
+        url: 'https://recipes.example.test/soup',
+        title: 'Original soup',
+        author: 'Recipe author',
+        license: 'CC-BY-4.0',
+        attribution: 'Recipe author — Original soup',
+        warnings: ['Preparation time was inferred.'],
+        confidence: 0.9,
+      },
+    })
+    renderDetail(detailed)
+
+    const article = await screen.findByRole('article')
+    const method = screen.getByRole('heading', { name: 'Method' })
+    const source = screen.getByRole('heading', { name: 'Source' })
+    expect(method.compareDocumentPosition(source) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    const cover = screen.getByRole('img', { name: 'Soup cover' }).closest('figure')
+    expect(cover).toHaveTextContent('Cover photographer')
+    expect(within(cover as HTMLElement).getByRole('link', { name: 'Open image source' }))
+      .toHaveAttribute('href', 'https://images.example.test/soup')
+    const sourceSection = source.closest('section')
+    expect(sourceSection).toHaveTextContent('Recipe author — Original soup')
+    expect(within(sourceSection as HTMLElement).getByRole('link', { name: 'Original soup' }))
+      .toHaveAttribute('target', '_blank')
+    expect(sourceSection).not.toHaveTextContent('Cover photographer')
+    cleanup()
+    renderDetail(detailed, 'zh-CN')
+    expect(await screen.findByRole('heading', { name: '来源' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: '做法' })).toBeVisible()
+    expect(screen.getByText('分享用户：Owner')).toBeVisible()
+    expect(screen.getByText('来源作者')).toBeVisible()
+    expect(screen.queryByText('作者：Owner')).not.toBeInTheDocument()
+  })
+
+  it('omits empty recipe provenance and does not link non-HTTP source URLs', async () => {
+    renderDetail(recipe())
+    await screen.findByRole('article')
+    expect(screen.queryByRole('heading', { name: 'Source' })).not.toBeInTheDocument()
+    cleanup()
+    renderDetail(recipe({
+      source: {
+        url: 'javascript:alert(1)',
+        title: null,
+        author: null,
+        license: null,
+        attribution: null,
+        warnings: [],
+        confidence: null,
+      },
+    }))
+    expect(await screen.findByRole('heading', { name: 'Source' })).toBeVisible()
+    expect(screen.queryByRole('link', { name: /javascript/ })).not.toBeInTheDocument()
   })
 })
 

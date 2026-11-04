@@ -60,6 +60,10 @@ h2 { margin: .3rem 0 .6rem; }
 .action-card strong { font-size: 1.2rem; }
 .card-list { display: grid; gap: 1rem; }
 .recipe-card, .recommendation-card, .detail-card { padding: 1.5rem; }
+.recipe-title-link { display: inline-block; min-height: 44px; padding-block: .2rem; color: var(--forest); cursor: pointer; text-decoration-thickness: .1em; text-underline-offset: .16em; }
+.recipe-title-link:hover { text-decoration-thickness: .16em; }
+.recipe-title-link:visited { color: #4c315f; }
+.recipe-title-link:active { color: var(--leaf); }
 .recipe-cover { width: 100%; max-height: 260px; object-fit: cover; border-radius: .9rem; margin-bottom: 1rem; }
 .recipe-cover-detail { margin: 1.25rem 0; }
 .recipe-cover-detail img, .recipe-cover-preview { width: min(100%, 720px); max-height: 520px; object-fit: contain; border-radius: .9rem; background: #eee8dc; }
@@ -126,6 +130,14 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .source-note, .settings-section, .secret-once { margin: 1.5rem 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: #f7f3e8; display: grid; gap: .65rem; }
 .source-note summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 700; }
 .source-note pre { max-width: 100%; overflow: auto; padding: .75rem; border-radius: .75rem; background: #fff; white-space: pre-wrap; overflow-wrap: anywhere; }
+.client-setup-details { display: grid; gap: .65rem; }
+.client-setup-details details { padding-left: .75rem; border-left: 3px solid var(--line); }
+.recipe-source-section { margin-top: 2rem; }
+.source-details-list { display: grid; gap: .65rem; margin: 0; }
+.source-details-list div { min-width: 0; }
+.source-details-list dt { font-weight: 750; }
+.source-details-list dd { margin: .15rem 0 0; overflow-wrap: anywhere; }
+.source-details-list a { word-break: break-word; }
 .shopping-membership-status { min-height: 44px; display: inline-flex; align-items: center; padding: .55rem .8rem; border: 1px solid currentColor; border-radius: .75rem; font-weight: 700; }
 .status-banner { margin: 1rem 0; padding: 1rem; border: 2px solid var(--forest); border-radius: 1rem; background: #eef4e9; display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; justify-content: space-between; }
 .recipe-metadata { display: flex; flex-wrap: wrap; gap: .75rem; margin: .75rem 0; }
@@ -192,6 +204,7 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 
 @media (forced-colors: active) {
   .status, .button, input, textarea, select, .ingredient-option, .purchase-sheet, .desktop-nav a, .mobile-nav-dialog, .mobile-nav-dialog nav a, .pantry-status-badge { border: 1px solid ButtonText; }
+  .recipe-title-link { color: LinkText; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -10,6 +10,10 @@ import {
   promptForPreset,
   resolveCookBaseUrl,
   skillInstructionsForPreset,
+  unixPersistentBaseUrlSetup,
+  unixTemporarySetup,
+  windowsPersistentBaseUrlSetup,
+  windowsTemporarySetup,
 } from './router'
 
 const { aiCapabilities, createImportToken, importTokens } = vi.hoisted(() => ({
@@ -82,6 +86,20 @@ describe('import token reveal', () => {
 
     expect(screen.getByRole('heading', { name: 'AI client setup' })).toBeVisible()
     expect(screen.getByDisplayValue(`COOK_BASE_URL=${baseUrl}`)).toBeVisible()
+    fireEvent.click(screen.getByText('Configure environment variables or a client secret store'))
+    expect(screen.getByText(/does not establish an arbitrary Secret Store/)).toBeVisible()
+    expect(screen.getByText(/Never put the token in chat/)).toBeVisible()
+    fireEvent.click(screen.getByText('Request format'))
+    expect(screen.getByText(/total kcal for the whole recipe, not per serving/)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Copy temporary PowerShell setup' }))
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(windowsTemporarySetup(baseUrl)))
+    expect(windowsTemporarySetup(baseUrl)).toContain("Read-Host 'COOK_IMPORT_TOKEN' -AsSecureString")
+    expect(windowsTemporarySetup(baseUrl)).not.toContain(secret)
+    fireEvent.click(screen.getByRole('button', { name: 'Copy temporary macOS/Linux setup' }))
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(unixTemporarySetup(baseUrl)))
+    expect(unixTemporarySetup(baseUrl)).toContain('stty -echo')
+    expect(unixTemporarySetup(baseUrl)).toContain('IFS= read -r COOK_IMPORT_TOKEN')
+    expect(unixTemporarySetup(baseUrl)).not.toContain(secret)
     fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
     expect(await screen.findByText(secret)).toBeVisible()
     expect(createImportToken).toHaveBeenCalledWith('My AI client', 90, 'import')
@@ -98,12 +116,12 @@ describe('import token reveal', () => {
     expect(prompt).toContain('COOK_IMPORT_TOKEN')
     expect(prompt).toContain(`${baseUrl}/api/import/drafts`)
     expect(prompt).not.toContain(secret)
-    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.4.1/skills/')
+    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.4.2/skills/')
     expect(installInstructions).toContain(
-      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.1',
+      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.2',
     )
     expect(installInstructions).toContain(
-      'gh skill preview vichare/Cook cook-recipe-import@v0.4.1',
+      'gh skill preview vichare/Cook cook-recipe-import@v0.4.2',
     )
     expect(installInstructions).toContain('Do not copy only SKILL.md')
     expect(installInstructions).not.toContain('install skill from GitHub URL')
@@ -346,8 +364,24 @@ describe('import token reveal', () => {
         expect(output).toContain(JSON.stringify(createRecipeExample, null, 2))
         expect(output).toContain('Cover upload is multipart, not JSON')
         expect(output).toContain('Stop the batch on 401/403')
+        expect(output).toContain('Difficulty and estimatedCalories are optional and may be omitted or null')
+        expect(output).toContain('total kcal for the whole recipe, never per serving')
       }
     }
+    for (const output of [
+      windowsTemporarySetup(baseUrl),
+      unixTemporarySetup(baseUrl),
+      windowsPersistentBaseUrlSetup(baseUrl),
+      unixPersistentBaseUrlSetup(baseUrl),
+    ]) {
+      expect(output).toContain(baseUrl)
+      expect(output).not.toContain(secret)
+    }
+    expect(windowsPersistentBaseUrlSetup(baseUrl)).not.toContain('COOK_IMPORT_TOKEN')
+    expect(unixPersistentBaseUrlSetup(baseUrl)).not.toContain('COOK_IMPORT_TOKEN')
+    expect(unixPersistentBaseUrlSetup(baseUrl)).toContain('.zshrc')
+    expect(unixPersistentBaseUrlSetup(baseUrl)).toContain('.bashrc')
+    expect(unixPersistentBaseUrlSetup(baseUrl)).toContain('launch the client from that shell')
   })
 
   it('shows self-contained request examples and tests capabilities without leaking the token', async () => {
@@ -402,6 +436,8 @@ describe('import token reveal', () => {
 
     expect(screen.getByRole('heading', { name: 'AI 客户端设置' })).toBeVisible()
     expect(screen.getByDisplayValue(`COOK_BASE_URL=${resolveCookBaseUrl()}`)).toBeVisible()
+    fireEvent.click(screen.getByText('配置环境变量或客户端 Secret Store'))
+    expect(screen.getByText(/完全退出并重启/)).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: '创建 token' }))
     expect(await screen.findByText(secret)).toBeVisible()
     const copyButton = screen.getByRole('button', { name: '复制 token' })
