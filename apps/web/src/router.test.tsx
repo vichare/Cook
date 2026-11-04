@@ -452,7 +452,14 @@ describe('shopping list', () => {
         id: 'group-1',
         optional: false,
         note: '',
-        alternatives: [{ id: 'alternative-1', name: 'water', quantityNote: '', canonicalIngredientId: null }],
+        sortOrder: 0,
+        alternatives: [{
+          id: 'alternative-1',
+          name: 'water',
+          quantityNote: '',
+          canonicalIngredientId: null,
+          sortOrder: 0,
+        }],
       }],
       isFavorite: false,
       isFavoriteAuthor: false,
@@ -501,6 +508,97 @@ describe('shopping list', () => {
       uploadRecipeCover.mockReset()
       updateRecipeCoverMetadata.mockReset()
       deleteRecipeCover.mockReset()
+    })
+
+    it('does not PUT an unchanged grouped recipe after form parsing rebuilds field order', async () => {
+      const unchangedForm: RecipeForm = {
+        ...editedForm,
+        title: originalRecipe.title,
+      }
+      recipeApi.mockResolvedValueOnce(originalRecipe)
+      await expect(persistRecipeEdit({
+        value: unchangedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion: originalRecipe.version,
+        coverFile: null,
+        removeCover: false,
+        coverMetadata: {
+          altText: originalRecipe.coverImage!.altText,
+          sourceUrl: '',
+          sourceLicense: '',
+          sourceAttribution: '',
+        },
+        coverMutationKey: 'unchanged-grouped-key',
+        acknowledgeVersion: vi.fn(),
+      })).resolves.toMatchObject({ version: originalRecipe.version })
+      expect(saveRecipe).not.toHaveBeenCalled()
+      expect(updateRecipeCoverMetadata).not.toHaveBeenCalled()
+    })
+
+    it('performs a cover-only mutation without an unchanged grouped body PUT', async () => {
+      const unchangedForm: RecipeForm = {
+        ...editedForm,
+        title: originalRecipe.title,
+      }
+      recipeApi.mockResolvedValueOnce(originalRecipe)
+      updateRecipeCoverMetadata.mockResolvedValueOnce({ version: 4 })
+      await expect(persistRecipeEdit({
+        value: unchangedForm,
+        recipe: originalRecipe,
+        acknowledgedVersion: originalRecipe.version,
+        coverFile: null,
+        removeCover: false,
+        coverMetadata,
+        coverMutationKey: 'cover-only-key',
+        acknowledgeVersion: vi.fn(),
+      })).resolves.toMatchObject({ version: 4 })
+      expect(saveRecipe).not.toHaveBeenCalled()
+      expect(updateRecipeCoverMetadata).toHaveBeenCalledWith(
+        originalRecipe.id,
+        coverMetadata,
+        originalRecipe.version,
+        'cover-only-key',
+      )
+    })
+
+    it('normalizes historical non-continuous orders without treating them as content changes', async () => {
+      const historicalRecipe: Recipe = {
+        ...originalRecipe,
+        ingredientGroups: [{
+          id: 'group-1',
+          optional: false,
+          note: '',
+          sortOrder: 14,
+          alternatives: [{
+            id: 'alternative-1',
+            name: 'water',
+            quantityNote: '',
+            canonicalIngredientId: null,
+            sortOrder: 9,
+          }],
+        }],
+      }
+      const unchangedForm: RecipeForm = {
+        ...editedForm,
+        title: historicalRecipe.title,
+      }
+      recipeApi.mockResolvedValueOnce(historicalRecipe)
+      await expect(persistRecipeEdit({
+        value: unchangedForm,
+        recipe: historicalRecipe,
+        acknowledgedVersion: historicalRecipe.version,
+        coverFile: null,
+        removeCover: false,
+        coverMetadata: {
+          altText: historicalRecipe.coverImage!.altText,
+          sourceUrl: '',
+          sourceLicense: '',
+          sourceAttribution: '',
+        },
+        coverMutationKey: 'historical-order-key',
+        acknowledgeVersion: vi.fn(),
+      })).resolves.toMatchObject({ version: historicalRecipe.version })
+      expect(saveRecipe).not.toHaveBeenCalled()
     })
 
     it('keeps unsaved input and offers comparison guidance after a stale conflict', async () => {
@@ -595,6 +693,92 @@ describe('shopping list', () => {
         coverMutationKey: 'provenance-conflict-key',
         acknowledgeVersion: vi.fn(),
       })).rejects.toEqual(expect.objectContaining({ status: 409, code: 'conflict' }))
+    })
+
+    it('serializes edited groups and alternatives with continuous visible-order sort values', async () => {
+      const groupedRecipe: Recipe = {
+        ...originalRecipe,
+        ingredientGroups: [
+          {
+            id: 'egg',
+            optional: false,
+            note: '',
+            sortOrder: 8,
+            alternatives: [
+              {
+                id: 'egg-primary',
+                name: 'Egg',
+                quantityNote: '2',
+                canonicalIngredientId: null,
+                sortOrder: 5,
+              },
+              {
+                id: 'egg-substitute',
+                name: 'Duck egg',
+                quantityNote: '2',
+                canonicalIngredientId: null,
+                sortOrder: 9,
+              },
+            ],
+          },
+          {
+            id: 'water',
+            optional: false,
+            note: '',
+            sortOrder: 20,
+            alternatives: [{
+              id: 'water-primary',
+              name: 'Water',
+              quantityNote: '200 ml',
+              canonicalIngredientId: null,
+              sortOrder: 7,
+            }],
+          },
+        ],
+      }
+      const saved = { ...groupedRecipe, version: 4 }
+      recipeApi.mockResolvedValueOnce(groupedRecipe)
+      saveRecipe.mockResolvedValueOnce(saved)
+      render(
+        <Providers>
+          <RecipeEditorForm recipe={groupedRecipe} onSaved={vi.fn()} />
+        </Providers>,
+      )
+
+      fireEvent.change(screen.getByLabelText('Group 1, alternative 2'), {
+        target: { value: 'Quail egg' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Save recipe' }))
+
+      await waitFor(() => expect(saveRecipe).toHaveBeenCalledTimes(1))
+      expect(saveRecipe).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ingredientModel: 'groups-v1',
+          ingredientGroups: [
+            expect.objectContaining({
+              id: 'egg',
+              sortOrder: 0,
+              alternatives: [
+                expect.objectContaining({ id: 'egg-primary', sortOrder: 0 }),
+                expect.objectContaining({
+                  id: 'egg-substitute',
+                  name: 'Quail egg',
+                  sortOrder: 1,
+                }),
+              ],
+            }),
+            expect.objectContaining({
+              id: 'water',
+              sortOrder: 1,
+              alternatives: [
+                expect.objectContaining({ id: 'water-primary', sortOrder: 0 }),
+              ],
+            }),
+          ],
+        }),
+        groupedRecipe.id,
+        groupedRecipe.version,
+      )
     })
 
     it('retries a failed cover upload using the acknowledged body version', async () => {
@@ -1316,28 +1500,31 @@ describe('recommendation shopping membership', () => {
     })
   })
 
-  it('partitions desired results above readiness and shows intent-v1 coverage without scores', async () => {
+  it('preserves backend intent-v2 order while partitioning desired results above readiness', async () => {
     const ready = recommendation()
     ready.recipe = { ...ready.recipe, id: 'ready', title: 'Ready plain meal' }
     ready.status = 'READY'
     ready.desiredMatches = []
     ready.score = 999
+    ready.appliedControls.preferred = ['Rice', 'Egg']
 
     const full = recommendation()
     full.recipe = { ...full.recipe, id: 'desired-full', title: 'Desired shopping meal' }
     full.desiredMatches = ['Rice', 'Egg']
-    full.rankingIntent = { version: 'intent-v1', desiredMatched: 2, desiredTotal: 2 }
+    full.rankingIntent = { version: 'intent-v2', desiredMatched: 2, desiredTotal: 2 }
     full.score = 999
+    full.appliedControls.preferred = ['Rice', 'Egg']
 
     const partial = recommendation()
     partial.recipe = { ...partial.recipe, id: 'desired-partial', title: 'Partial preferred meal' }
     partial.desiredMatches = ['Rice']
-    partial.rankingIntent = { version: 'intent-v1', desiredMatched: 1, desiredTotal: 2 }
+    partial.rankingIntent = { version: 'intent-v2', desiredMatched: 1, desiredTotal: 2 }
     partial.score = 999
+    partial.appliedControls.preferred = ['Rice', 'Egg']
 
     recommendationsApi.mockReset().mockResolvedValue([ready, full, partial])
     renderRecommendations()
-    const preferredHeading = await screen.findByRole('heading', { name: 'Uses your preferred ingredients' })
+    const preferredHeading = await screen.findByRole('heading', { name: 'Prioritizes ingredients you hope to use' })
     const otherHeading = screen.getByRole('heading', { name: 'Other recommendations' })
     expect(preferredHeading.compareDocumentPosition(otherHeading) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy()
@@ -1355,29 +1542,19 @@ describe('recommendation shopping membership', () => {
     expect(screen.queryByText(/Total 999/)).not.toBeInTheDocument()
   })
 
-  it('keeps no-desired results in one backend-ordered section and collapses blocked results last', async () => {
+  it('keeps no-desired results in one backend-ordered section without status or score sorting', async () => {
     const shop = recommendation()
     shop.recipe = { ...shop.recipe, id: 'shop-first', title: 'Shop first from backend' }
     const ready = recommendation()
     ready.recipe = { ...ready.recipe, id: 'ready-second', title: 'Ready second from backend' }
     ready.status = 'READY'
-    const blocked = recommendation()
-    blocked.recipe = { ...blocked.recipe, id: 'blocked', title: 'Scope blocked meal' }
-    blocked.status = 'BLOCKED'
-    recommendationsApi.mockReset().mockResolvedValue([shop, ready, blocked])
+    recommendationsApi.mockReset().mockResolvedValue([shop, ready])
     renderRecommendations()
     expect(await screen.findByRole('heading', { name: 'Recommendations' })).toBeVisible()
-    expect(screen.queryByRole('heading', { name: 'Uses your preferred ingredients' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Prioritizes ingredients you hope to use' })).not.toBeInTheDocument()
     const shopLink = screen.getByRole('link', { name: 'Shop first from backend' })
     const readyLink = screen.getByRole('link', { name: 'Ready second from backend' })
     expect(shopLink.compareDocumentPosition(readyLink) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    const blockedSummary = screen.getByText('Unavailable for this ingredient scope (1)')
-    expect(screen.getByRole('link', { name: 'Scope blocked meal' })).not.toBeVisible()
-    fireEvent.click(blockedSummary)
-    expect(screen.getByRole('link', { name: 'Scope blocked meal' })).toBeVisible()
-    const details = blockedSummary.closest('details')
-    expect(readyLink.compareDocumentPosition(details as Node) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy()
   })
 
   it('localizes ingredient scope choices at narrow viewport width', async () => {
@@ -1491,9 +1668,22 @@ describe('recommendation shopping membership', () => {
       id: 'group-fat',
       optional: false,
       note: 'Use either',
+      sortOrder: 0,
       alternatives: [
-        { id: 'butter', name: 'Butter', quantityNote: '1 tbsp', canonicalIngredientId: 'butter-id' },
-        { id: 'oil', name: 'Oil', quantityNote: '1 tbsp', canonicalIngredientId: 'oil-id' },
+        {
+          id: 'butter',
+          name: 'Butter',
+          quantityNote: '1 tbsp',
+          canonicalIngredientId: 'butter-id',
+          sortOrder: 0,
+        },
+        {
+          id: 'oil',
+          name: 'Oil',
+          quantityNote: '1 tbsp',
+          canonicalIngredientId: 'oil-id',
+          sortOrder: 1,
+        },
       ],
     }]
     result.missing = ['Butter', 'Oil']
@@ -1555,9 +1745,22 @@ describe('ingredient groups and homepage navigation', () => {
             id: 'group-dairy',
             optional: true,
             note: 'Use what is open',
+            sortOrder: 0,
             alternatives: [
-              { id: 'alt-milk', name: 'Milk', quantityNote: '1 cup', canonicalIngredientId: null },
-              { id: 'alt-oat', name: 'Oat milk', quantityNote: '1 cup', canonicalIngredientId: null },
+              {
+                id: 'alt-milk',
+                name: 'Milk',
+                quantityNote: '1 cup',
+                canonicalIngredientId: null,
+                sortOrder: 0,
+              },
+              {
+                id: 'alt-oat',
+                name: 'Oat milk',
+                quantityNote: '1 cup',
+                canonicalIngredientId: null,
+                sortOrder: 1,
+              },
             ],
           }]}
         />

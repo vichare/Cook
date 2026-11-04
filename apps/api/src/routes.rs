@@ -1757,7 +1757,7 @@ async fn get_recommendations(
             ));
         }
     }
-    resolve_recommendation_request(&state.pool, &user.id, &mut request).await?;
+    validate_recommendation_request(&state.pool, &user.id, &request).await?;
     let settings = load_settings(&state.pool, &user.id).await?;
     let mut transaction = state.pool.begin().await?;
     let pantry = load_pantry_tx(&mut transaction, &user.id).await?;
@@ -2344,79 +2344,30 @@ pub(crate) async fn validate_group_selections(
     Ok(())
 }
 
-async fn resolve_recommendation_request(
+async fn validate_recommendation_request(
     pool: &SqlitePool,
     owner_id: &str,
-    request: &mut RecommendationRequest,
+    request: &RecommendationRequest,
 ) -> AppResult<()> {
-    for references in [
-        &mut request.preferred,
-        &mut request.required,
-        &mut request.excluded,
-    ] {
-        for reference in references.iter_mut() {
-            if let crate::models::IngredientReference::Selection {
-                name,
-                canonical_ingredient_id,
-            } = reference
-            {
-                if canonical_ingredient_id.is_none() {
-                    *canonical_ingredient_id = resolve_reference_id(pool, owner_id, name).await?;
-                } else if !canonical_ingredient_is_visible_pool(
-                    pool,
-                    owner_id,
-                    canonical_ingredient_id.as_deref().unwrap_or_default(),
-                )
-                .await?
+    for references in [&request.preferred, &request.required, &request.excluded] {
+        for reference in references.iter() {
+            if let Some(canonical_ingredient_id) = reference.canonical_ingredient_id() {
+                if canonical_ingredient_id.is_empty()
+                    || !canonical_ingredient_is_visible_pool(
+                        pool,
+                        owner_id,
+                        canonical_ingredient_id,
+                    )
+                    .await?
                 {
                     return Err(AppError::Validation(
                         "selected canonical ingredient is not available to this account".into(),
                     ));
                 }
-            } else {
-                let name = reference.name().to_string();
-                if let Some(canonical_ingredient_id) =
-                    resolve_reference_id(pool, owner_id, &name).await?
-                {
-                    *reference = crate::models::IngredientReference::Selection {
-                        name,
-                        canonical_ingredient_id: Some(canonical_ingredient_id),
-                    };
-                }
             }
         }
     }
     Ok(())
-}
-
-async fn resolve_reference_id(
-    pool: &SqlitePool,
-    owner_id: &str,
-    name: &str,
-) -> AppResult<Option<String>> {
-    let normalized = normalize_ingredient(name);
-    if normalized.is_empty() {
-        return Ok(None);
-    }
-    let alias: Option<String> = sqlx::query_scalar(
-        "SELECT canonical_ingredient_id FROM ingredient_aliases
-         WHERE owner_id = ? AND alias_normalized = ?",
-    )
-    .bind(owner_id)
-    .bind(&normalized)
-    .fetch_optional(pool)
-    .await?;
-    let exact: Option<String> =
-        sqlx::query_scalar("SELECT id FROM ingredient_catalog WHERE normalized_name = ?")
-            .bind(normalized)
-            .fetch_optional(pool)
-            .await?;
-    if exact.is_some() && alias.is_some() && exact != alias {
-        return Err(AppError::Validation(
-            "ingredient identity is ambiguous; select canonicalIngredientId".into(),
-        ));
-    }
-    Ok(exact.or(alias))
 }
 
 async fn canonical_ingredient_is_visible_pool(
@@ -5651,18 +5602,11 @@ mod tests {
             .await
             .unwrap();
         let other = response_json(other).await;
-        let other_result = other
+        assert!(other
             .as_array()
             .unwrap()
             .iter()
-            .find(|item| item["recipe"]["id"] == recipe_id)
-            .unwrap();
-        assert_eq!(other_result["status"], "BLOCKED");
-        assert_eq!(other_result["rankingIntent"]["scopeEligible"], false);
-        assert_eq!(
-            other_result["ingredientGroupReasons"][0]["action"],
-            "MISSING"
-        );
+            .all(|item| item["recipe"]["id"] != recipe_id));
 
         let conflict = app
             .oneshot(
@@ -9134,14 +9078,11 @@ mod tests {
             .await
             .unwrap();
         let body = response_json(recommendations).await;
-        let powder = body
+        assert!(body
             .as_array()
             .unwrap()
             .iter()
-            .find(|item| item["recipe"]["title"] == "Powder test")
-            .unwrap();
-        assert_eq!(powder["status"], "BLOCKED");
-        assert_eq!(powder["missing"], json!(["Baking powder"]));
+            .all(|item| item["recipe"]["title"] != "Powder test"));
         let tomato = body
             .as_array()
             .unwrap()
@@ -9361,6 +9302,11 @@ mod tests {
             ingredients[0]["canonicalIngredientId"],
             ingredients[1]["canonicalIngredientId"]
         );
+        let oil_canonical_id = ingredients
+            .iter()
+            .find(|ingredient| ingredient["name"] == "油")
+            .unwrap()["canonicalIngredientId"]
+            .clone();
 
         let soy_only = app
             .clone()
@@ -9393,7 +9339,15 @@ mod tests {
                 Request::post("/api/recommendations")
                     .header("content-type", "application/json")
                     .header("cookie", &cookie)
-                    .body(Body::from(json!({"required": ["油"]}).to_string()))
+                    .body(Body::from(
+                        json!({
+                            "required": [{
+                                "name": "油",
+                                "canonicalIngredientId": oil_canonical_id
+                            }]
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -9526,6 +9480,214 @@ mod tests {
             .unwrap();
         assert_eq!(lifecycle["status"], "READY");
         assert_eq!(lifecycle["available"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recommendation_filters_preserve_unresolved_identity_through_api_route() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Recommendation identity").await;
+        let soy = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Canonical soy",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "visibility": "private",
+                            "ingredients": [{"name": "酱油", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(soy.status(), StatusCode::CREATED);
+        let soy = response_json(soy).await;
+        let soy_id = soy["id"].as_str().unwrap();
+        let soy_canonical_id = soy["ingredients"][0]["canonicalIngredientId"]
+            .as_str()
+            .unwrap();
+
+        let oil = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Canonical oil",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "visibility": "private",
+                            "ingredients": [{"name": "油", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oil.status(), StatusCode::CREATED);
+        let oil = response_json(oil).await;
+        let oil_id = oil["id"].as_str().unwrap();
+        let oil_canonical_id = oil["ingredients"][0]["canonicalIngredientId"]
+            .as_str()
+            .unwrap();
+
+        for preferred in [
+            json!(["酱油"]),
+            json!([{"name": "酱油", "canonicalIngredientId": null}]),
+            json!(["油"]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/recommendations")
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .body(Body::from(json!({"preferred": preferred}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = response_json(response).await;
+            for recipe_id in [soy_id, oil_id] {
+                let result = body
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["recipe"]["id"] == recipe_id)
+                    .unwrap();
+                assert_eq!(result["desiredMatches"], json!([]));
+            }
+        }
+
+        for required in [
+            json!(["酱油"]),
+            json!([{"name": "酱油", "canonicalIngredientId": null}]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/recommendations")
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .body(Body::from(json!({"required": required}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = response_json(response).await;
+            assert!(body
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["recipe"]["id"] != soy_id));
+        }
+
+        for excluded in [
+            json!(["酱油"]),
+            json!([{"name": "酱油", "canonicalIngredientId": null}]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/recommendations")
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .body(Body::from(json!({"excluded": excluded}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = response_json(response).await;
+            assert!(body
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["recipe"]["id"] == soy_id));
+        }
+
+        let explicit_preferred = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "preferred": [{
+                                "name": "油",
+                                "canonicalIngredientId": oil_canonical_id
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let explicit_preferred = response_json(explicit_preferred).await;
+        let explicit_oil = explicit_preferred
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == oil_id)
+            .unwrap();
+        assert_eq!(explicit_oil["desiredMatches"], json!(["油"]));
+        let explicit_soy = explicit_preferred
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == soy_id)
+            .unwrap();
+        assert_eq!(explicit_soy["desiredMatches"], json!([]));
+
+        let explicit_hard_filters = app
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(
+                        json!({
+                            "preferred": [{
+                                "name": "油",
+                                "canonicalIngredientId": oil_canonical_id
+                            }],
+                            "required": [{
+                                "name": "酱油",
+                                "canonicalIngredientId": soy_canonical_id
+                            }],
+                            "excluded": [{
+                                "name": "油",
+                                "canonicalIngredientId": oil_canonical_id
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let explicit_hard_filters = response_json(explicit_hard_filters).await;
+        let explicit_soy = explicit_hard_filters
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == soy_id)
+            .unwrap();
+        assert_eq!(explicit_soy["desiredMatches"], json!([]));
+        assert!(explicit_hard_filters
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["recipe"]["id"] != oil_id));
     }
 
     #[tokio::test]
@@ -9883,6 +10045,168 @@ mod tests {
             restored[0]["choiceAlternatives"].as_array().unwrap().len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn recipe_update_requires_valid_explicit_group_and_alternative_sort_orders() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Ordered recipe editor").await;
+        let groups = json!([
+            {
+                "id": "egg",
+                "optional": false,
+                "note": "",
+                "sortOrder": 0,
+                "alternatives": [
+                    {"id": "chicken", "name": "Chicken egg", "quantityNote": "2", "sortOrder": 0},
+                    {"id": "duck", "name": "Duck egg", "quantityNote": "2", "sortOrder": 1}
+                ]
+            },
+            {
+                "id": "water",
+                "optional": false,
+                "note": "",
+                "sortOrder": 1,
+                "alternatives": [
+                    {"id": "water-primary", "name": "Water", "quantityNote": "200 ml", "sortOrder": 0}
+                ]
+            }
+        ]);
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Steamed egg",
+                            "description": "",
+                            "instructions": "Steam.",
+                            "visibility": "public",
+                            "ingredientModel": "groups-v1",
+                            "ingredientGroups": groups
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = response_json(created).await;
+        let recipe_id = created["id"].as_str().unwrap();
+
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .body(Body::from(
+                        json!({
+                            "title": "Steamed egg with alternatives",
+                            "description": "",
+                            "instructions": "Steam.",
+                            "visibility": "public",
+                            "ingredientModel": "groups-v1",
+                            "ingredientGroups": groups
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated = response_json(updated).await;
+        assert_eq!(updated["version"], 2);
+        assert_eq!(updated["ingredientGroups"][0]["sortOrder"], 0);
+        assert_eq!(
+            updated["ingredientGroups"][0]["alternatives"][1]["sortOrder"],
+            1
+        );
+        assert_eq!(updated["ingredientGroups"][1]["sortOrder"], 1);
+
+        let mut invalid_groups = Vec::new();
+        let mut duplicate_group = groups.clone();
+        duplicate_group[1]["sortOrder"] = json!(0);
+        invalid_groups.push(duplicate_group);
+        let mut negative_group = groups.clone();
+        negative_group[0]["sortOrder"] = json!(-1);
+        invalid_groups.push(negative_group);
+        let mut duplicate_alternative = groups.clone();
+        duplicate_alternative[0]["alternatives"][1]["sortOrder"] = json!(0);
+        invalid_groups.push(duplicate_alternative);
+        let mut negative_alternative = groups;
+        negative_alternative[0]["alternatives"][0]["sortOrder"] = json!(-1);
+        invalid_groups.push(negative_alternative);
+
+        for invalid in invalid_groups {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put(format!("/api/recipes/{recipe_id}"))
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .header("if-match", "\"recipe-v2\"")
+                        .body(Body::from(
+                            json!({
+                                "title": "Invalid order",
+                                "description": "",
+                                "instructions": "Steam.",
+                                "visibility": "public",
+                                "ingredientModel": "groups-v1",
+                                "ingredientGroups": invalid
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response_json(response).await["error"], "validation_error");
+        }
+
+        let mut missing_group_order = json!([
+            {
+                "id": "egg",
+                "optional": false,
+                "note": "",
+                "sortOrder": 0,
+                "alternatives": [
+                    {"id": "chicken", "name": "Chicken egg", "quantityNote": "2", "sortOrder": 0}
+                ]
+            }
+        ]);
+        missing_group_order[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("sortOrder");
+        let missing = app
+            .oneshot(
+                Request::put(format!("/api/recipes/{recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .header("if-match", "\"recipe-v2\"")
+                    .body(Body::from(
+                        json!({
+                            "title": "Missing order",
+                            "description": "",
+                            "instructions": "Steam.",
+                            "visibility": "public",
+                            "ingredientModel": "groups-v1",
+                            "ingredientGroups": missing_group_order
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

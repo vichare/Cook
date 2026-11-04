@@ -44,7 +44,6 @@ pub struct IngredientAlternativeInput {
     pub quantity_note: String,
     #[serde(default)]
     pub canonical_ingredient_id: Option<String>,
-    #[serde(default)]
     pub sort_order: i64,
 }
 
@@ -56,7 +55,6 @@ pub struct IngredientGroupInput {
     pub optional: bool,
     #[serde(default)]
     pub note: String,
-    #[serde(default)]
     pub sort_order: i64,
     pub alternatives: Vec<IngredientAlternativeInput>,
 }

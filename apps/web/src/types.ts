@@ -52,15 +52,24 @@ export interface Ingredient {
 
 export interface IngredientAlternative extends Ingredient {
   id: string
-  sortOrder?: number
+  sortOrder: number
 }
 
 export interface IngredientGroup {
   id: string
   optional: boolean
   note: string
-  sortOrder?: number
+  sortOrder: number
   alternatives: IngredientAlternative[]
+}
+
+export type EditableIngredientAlternative = Omit<IngredientAlternative, 'sortOrder'> & {
+  sortOrder?: number
+}
+
+export type EditableIngredientGroup = Omit<IngredientGroup, 'sortOrder' | 'alternatives'> & {
+  sortOrder?: number
+  alternatives: EditableIngredientAlternative[]
 }
 
 export interface IngredientReference {
@@ -286,10 +295,15 @@ export interface Recommendation {
   primarySource: RecommendationSource
   matchedSources: RecommendationSource[]
   desiredMatches: string[]
-  rankingIntent?: 'intent-v1' | {
-    version: 'intent-v1'
+  rankingIntent?: 'intent-v1' | 'intent-v2' | {
+    version: 'intent-v1' | 'intent-v2'
+    scopeEligible?: boolean
+    desiredTier?: 'AVAILABLE' | 'VERIFY' | 'SHOPPING_PLANNED' | 'MISSING'
     desiredMatched?: number
     desiredTotal?: number
+    desiredCoverage?: number
+    otherMissing?: number
+    sourceTier?: 'PREFERRED' | 'OTHER_PUBLIC'
   }
   ingredientReasons: Array<{
     ingredient: string

@@ -1,6 +1,7 @@
 import type {
   Ingredient,
   IngredientAlternative,
+  EditableIngredientGroup,
   IngredientGroup,
   IngredientReference,
   Recipe,
@@ -49,9 +50,11 @@ export function legacyIngredientGroups(ingredients: Ingredient[]): IngredientGro
     id: `legacy-group-${index + 1}`,
     optional: false,
     note: '',
+    sortOrder: index,
     alternatives: [{
       ...ingredient,
       id: `legacy-alternative-${index + 1}`,
+      sortOrder: 0,
     }],
   }))
 }
@@ -78,16 +81,36 @@ export function emptyIngredientGroup(name = ''): IngredientGroup {
     id: newIngredientId('group'),
     optional: false,
     note: '',
+    sortOrder: 0,
     alternatives: [{
       id: newIngredientId('alternative'),
       name,
       quantityNote: '',
       canonicalIngredientId: null,
+      sortOrder: 0,
     }],
   }
 }
 
-export function asIngredientReference(alternative: IngredientAlternative): IngredientReference {
+export function normalizeIngredientGroupOrder(
+  groups: EditableIngredientGroup[],
+): IngredientGroup[] {
+  return groups.map((group, groupIndex) => ({
+    id: group.id,
+    optional: group.optional,
+    note: group.note,
+    sortOrder: groupIndex,
+    alternatives: group.alternatives.map((alternative, alternativeIndex) => ({
+      id: alternative.id,
+      name: alternative.name,
+      quantityNote: alternative.quantityNote,
+      canonicalIngredientId: alternative.canonicalIngredientId,
+      sortOrder: alternativeIndex,
+    })),
+  }))
+}
+
+export function asIngredientReference(alternative: IngredientReference): IngredientReference {
   return {
     name: alternative.name,
     canonicalIngredientId: alternative.canonicalIngredientId,

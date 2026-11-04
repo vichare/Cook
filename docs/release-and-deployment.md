@@ -91,6 +91,6 @@ Store off-host encrypted copies and regularly test restoration. Normalized recip
 - verify Google-first exact-email OTP linking, Gmail email-first Google convergence, non-Gmail rejection, and pre-existing split-account recovery without account merging
 - verify private recipe and pantry isolation with two accounts
 - verify private cover denial, public cover delivery, scoped AI token denial, and owner revision acceptance without sending a real token in logs
-- verify READY/VERIFY/SHOP/BLOCKED recommendations
+- verify READY/VERIFY/SHOP ordering and that ingredient-scope hard filters omit ineligible recipes
 - inspect `docker compose -f compose.yaml ps` and bounded container logs
 - verify the newest backup and perform a scheduled restore drill

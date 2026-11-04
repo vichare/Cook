@@ -47,7 +47,11 @@
         "name": { "type": "string", "minLength": 1, "maxLength": 120 },
         "quantityNote": { "type": "string", "maxLength": 240, "default": "" },
         "canonicalIngredientId": { "type": ["string", "null"] },
-        "sortOrder": { "type": "integer", "minimum": 0 }
+        "sortOrder": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Required explicit zero-based display order, unique within the containing group."
+        }
       }
     },
     "group": {
@@ -58,7 +62,11 @@
         "id": { "type": "string", "minLength": 1, "maxLength": 120 },
         "optional": { "type": "boolean", "default": false },
         "note": { "type": "string", "maxLength": 240, "default": "" },
-        "sortOrder": { "type": "integer", "minimum": 0 },
+        "sortOrder": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Required explicit zero-based display order, unique across ingredient groups."
+        },
         "alternatives": {
           "type": "array",
           "minItems": 1,

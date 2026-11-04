@@ -35,5 +35,5 @@ The combobox uses a 150 ms client debounce. The API p95 ≤300 ms target has not
 
 - [ ] Test the user's local date boundary immediately before and after midnight in at least two materially different time zones.
 - [ ] Confirm past dates are allowed with warning, never inferred, never converted to timestamps, and never change pantry status to `out`.
-- [ ] Confirm expired and expires-today `have` items are `VERIFY` normally and `BLOCKED` in pantry-only mode.
+- [ ] Confirm expired and expires-today `have` items are `VERIFY` with `ANY`, and their recipes are excluded by the `PANTRY_ONLY` hard filter.
 - [ ] Confirm ambiguous or similar suggestions never alter must-use, excluded, or pantry-only hard matching until the user explicitly selects a canonical identity.

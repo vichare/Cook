@@ -41,8 +41,9 @@ import {
   expirationShortcut,
   ingredientIdentity,
   localDateValue,
-  recipeIngredientGroups,
+  normalizeIngredientGroupOrder,
   normalizeIngredient,
+  recipeIngredientGroups,
   splitIngredientList,
 } from './ingredients'
 import { createPasskey, getPasskey } from './webauthn'
@@ -747,16 +748,18 @@ export function RecommendationsPage() {
       <QueryState query={recommendations} empty={t('recommend.noMatches')}>
         <div className="recommendation-results">
           {(() => {
-            const active = recommendations.data?.filter((result) => result.status !== 'BLOCKED') ?? []
-            const blocked = recommendations.data?.filter((result) => result.status === 'BLOCKED') ?? []
-            const usesPreferred = active.filter((result) => result.desiredMatches.length > 0)
-            const hasDesired = usesPreferred.length > 0
-            const other = hasDesired
-              ? active.filter((result) => result.desiredMatches.length === 0)
-              : active
+            const results = recommendations.data ?? []
+            const hasDesiredIntent = submitted.preferred.length > 0
+              || results.some((result) => result.appliedControls.preferred.length > 0)
+            const usesPreferred = hasDesiredIntent
+              ? results.filter((result) => result.desiredMatches.length > 0)
+              : []
+            const other = hasDesiredIntent
+              ? results.filter((result) => result.desiredMatches.length === 0)
+              : results
             return (
               <>
-                {hasDesired && (
+                {usesPreferred.length > 0 && (
                   <section aria-labelledby="recommend-preferred">
                     <h2 id="recommend-preferred">{t('recommend.usesPreferred')}</h2>
                     <div className="card-list">{usesPreferred.map(renderRecommendationCard)}</div>
@@ -765,17 +768,10 @@ export function RecommendationsPage() {
                 {other.length > 0 && (
                   <section aria-labelledby="recommend-other">
                     <h2 id="recommend-other">
-                      {t(hasDesired ? 'recommend.otherRecommendations' : 'recommend.results')}
+                      {t(hasDesiredIntent ? 'recommend.otherRecommendations' : 'recommend.results')}
                     </h2>
                     <div className="card-list">{other.map(renderRecommendationCard)}</div>
                   </section>
-                )}
-                {blocked.length > 0 && (
-                  <details className="blocked-recommendations">
-                    <summary>{t('recommend.blockedSummary', { count: formatNumber(blocked.length) })}</summary>
-                    <p>{t('recommend.blockedHelp')}</p>
-                    <div className="card-list">{blocked.map(renderRecommendationCard)}</div>
-                  </details>
                 )}
               </>
             )
@@ -1775,7 +1771,8 @@ function recipeMatchesForm(recipe: Recipe, value: RecipeForm): boolean {
     && (recipe.source?.author ?? '') === value.sourceAuthor.trim()
     && (recipe.source?.license ?? '') === value.sourceLicense.trim()
     && (recipe.source?.attribution ?? '') === value.sourceAttribution.trim()
-    && JSON.stringify(recipeIngredientGroups(recipe)) === JSON.stringify(value.ingredientGroups)
+    && JSON.stringify(normalizeIngredientGroupOrder(recipeIngredientGroups(recipe)))
+      === JSON.stringify(normalizeIngredientGroupOrder(value.ingredientGroups))
 }
 
 function coverMetadataMatches(recipe: Recipe, metadata: CoverMetadata): boolean {
@@ -1878,6 +1875,7 @@ export async function persistRecipeEdit({
   const payload = {
     ...value,
     ingredientModel: 'groups-v1' as const,
+    ingredientGroups: normalizeIngredientGroupOrder(value.ingredientGroups),
     sourceUrl: value.sourceUrl.trim() || null,
     sourceTitle: value.sourceTitle.trim() || null,
     sourceAuthor: value.sourceAuthor.trim() || null,
@@ -4759,7 +4757,7 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
         difficulty: value.difficulty,
         estimatedCalories: value.estimatedCalories,
         ingredientModel: 'groups-v1',
-        ingredientGroups: value.ingredientGroups,
+        ingredientGroups: normalizeIngredientGroupOrder(value.ingredientGroups),
       }),
     onSuccess: (value) => queryClient.setQueryData(['import-draft', draft.id], value),
   })
@@ -5252,11 +5250,13 @@ function recommendationDesiredCoverage(
   fallbackTotal: number,
 ): { matched: number; total: number } {
   const intent = recommendation.rankingIntent
-  const matched = typeof intent === 'object' && intent.version === 'intent-v1'
+  const matched = typeof intent === 'object'
+    && (intent.version === 'intent-v1' || intent.version === 'intent-v2')
     && typeof intent.desiredMatched === 'number'
     ? intent.desiredMatched
     : recommendation.desiredMatches.length
-  const total = typeof intent === 'object' && intent.version === 'intent-v1'
+  const total = typeof intent === 'object'
+    && (intent.version === 'intent-v1' || intent.version === 'intent-v2')
     && typeof intent.desiredTotal === 'number'
     ? intent.desiredTotal
     : fallbackTotal

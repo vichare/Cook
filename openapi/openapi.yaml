@@ -558,7 +558,7 @@ paths:
       parameters:
         - in: query
           name: limit
-          description: Maximum ranked recipes returned. Candidate scanning remains complete so the highest-scoring results are not missed.
+          description: Maximum ranked recipes returned. Candidate scanning remains complete so the highest-ranked results are not missed.
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
       requestBody:
         required: true
@@ -567,7 +567,7 @@ paths:
             schema: { $ref: "#/components/schemas/RecommendationRequest" }
       responses:
         "200":
-          description: Bounded deterministic top-N recommendations with ingredient explanations
+          description: Bounded deterministic top-N recommendations after source, visibility, required, excluded, and ingredient-scope hard filters. Desired matches form the first ranking partition.
           content:
             application/json:
               schema:
@@ -1478,7 +1478,10 @@ components:
         name: { type: string, minLength: 1, maxLength: 120 }
         quantityNote: { type: string, maxLength: 240, default: "" }
         canonicalIngredientId: { type: [string, "null"] }
-        sortOrder: { type: integer, minimum: 0 }
+        sortOrder:
+          type: integer
+          minimum: 0
+          description: Required explicit zero-based display order, unique within the containing group. Cook's web editor serializes current visible order as consecutive values.
     IngredientGroup:
       type: object
       additionalProperties: false
@@ -1495,7 +1498,10 @@ components:
           maxLength: 240
           default: ""
           description: Group-level guidance. For a single-alternative group, the deprecated ingredients projection uses the alternative quantityNote, not this note.
-        sortOrder: { type: integer, minimum: 0 }
+        sortOrder:
+          type: integer
+          minimum: 0
+          description: Required explicit zero-based display order, unique across recipe groups. Cook's web editor serializes current visible order as consecutive values.
         alternatives:
           type: array
           minItems: 1
@@ -1959,7 +1965,7 @@ components:
               minLength: 1
               description: May contain a supported delimiter-separated list; each resulting name is limited to 120 characters.
             canonicalIngredientId: { type: [string, "null"] }
-      description: Legacy strings remain accepted. Structured references preserve an explicit canonical selection; fuzzy suggestions are never inferred here.
+      description: Legacy strings and structured references with an omitted/null canonicalIngredientId remain unresolved normalized names. Recommendation filters never bind them to a catalog entry or owner alias. Only a client-supplied non-empty canonicalIngredientId selects canonical identity, and fuzzy suggestions are never inferred here.
     IngredientSuggestion:
       type: object
       required: [canonicalIngredientId, displayName, matchedText, reason]
@@ -1982,7 +1988,7 @@ components:
         verificationDays: { type: integer, minimum: 1, maximum: 90 }
     RecommendationRequest:
       type: object
-      description: ingredientScope is the intent-v1 control. Deprecated pantryOnly maps true to PANTRY_ONLY and false to ANY. Supplying both fields returns 400.
+      description: ingredientScope is an intent-v2 hard filter. Recipes outside the selected scope are omitted. Deprecated pantryOnly maps true to PANTRY_ONLY and false to ANY. Supplying both fields returns 400.
       properties:
         preferred: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
         required: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
@@ -2054,11 +2060,11 @@ components:
         score:
           type: integer
           deprecated: true
-          description: Compatibility-only legacy score. intent-v1 never sorts by this value.
+          description: Compatibility-only legacy score. intent-v2 never sorts by this value.
         scoreBreakdown:
           type: object
           deprecated: true
-          description: Compatibility-only legacy fields. intent-v1 never sorts by these values.
+          description: Compatibility-only legacy fields. intent-v2 never sorts by these values.
           required: [statusBase, source, availability, desired, certainty, simplicity]
           properties:
             statusBase: { type: integer, enum: [0, 250, 500, 750] }
@@ -2091,11 +2097,17 @@ components:
         desiredMatches: { type: array, items: { type: string } }
         rankingIntent:
           type: object
-          required: [version, scopeEligible, desiredTier, desiredMatched, desiredTotal, desiredCoverage, fulfillment, unplannedMissing, shoppingCovered, verify, effectiveGroups, source, available, availableCoverage, reasons]
+          required: [version, scopeEligible, desiredTier, desiredMatched, desiredTotal, desiredCoverage, otherMissing, fulfillment, unplannedMissing, shoppingCovered, verify, effectiveGroups, source, sourceTier, available, availableCoverage, reasons]
           properties:
-            version: { type: string, const: intent-v1 }
-            scopeEligible: { type: boolean }
-            desiredTier: { $ref: "#/components/schemas/IngredientGroupAction" }
+            version: { type: string, const: intent-v2 }
+            scopeEligible:
+              type: boolean
+              const: true
+              description: Returned recommendations have already passed the ingredient-scope hard filter.
+            desiredTier:
+              allOf:
+                - { $ref: "#/components/schemas/IngredientGroupAction" }
+              description: Worst action among distinctly assigned desired groups, compared only inside the desired-match partition after source tier and match count.
             desiredMatched: { type: integer, minimum: 0, maximum: 100 }
             desiredTotal: { type: integer, minimum: 0, maximum: 100 }
             desiredCoverage:
@@ -2103,12 +2115,18 @@ components:
               minimum: 0
               maximum: 10000
               description: Basis points of distinct requested desired identities assigned to distinct scope-qualified groups.
+            otherMissing:
+              type: integer
+              minimum: 0
+              maximum: 100
+              description: Effective non-desired groups whose action is SHOPPING_PLANNED or MISSING.
             fulfillment: { type: string, enum: [READY, VERIFY, SHOP, BLOCKED] }
             unplannedMissing: { type: integer, minimum: 0, maximum: 100 }
             shoppingCovered: { type: integer, minimum: 0, maximum: 100 }
             verify: { type: integer, minimum: 0, maximum: 100 }
             effectiveGroups: { type: integer, minimum: 0, maximum: 100 }
             source: { $ref: "#/components/schemas/RecommendationSource" }
+            sourceTier: { $ref: "#/components/schemas/RecommendationSourceTier" }
             available: { type: integer, minimum: 0, maximum: 100 }
             availableCoverage:
               type: integer
@@ -2194,6 +2212,10 @@ components:
     RecommendationSource:
       type: string
       enum: [OWN, FAVORITE_RECIPE, FAVORITE_ACCOUNT, OTHER_PUBLIC]
+    RecommendationSourceTier:
+      type: string
+      enum: [PREFERRED, OTHER_PUBLIC]
+      description: OWN, FAVORITE_RECIPE, and FAVORITE_ACCOUNT share the PREFERRED tier; overlapping source labels do not stack.
     IngredientGroupAction:
       type: string
       enum: [AVAILABLE, VERIFY, SHOPPING_PLANNED, MISSING]

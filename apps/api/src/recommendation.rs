@@ -1,5 +1,5 @@
 use std::{
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap, HashSet},
 };
 
@@ -52,6 +52,13 @@ pub enum RecommendationSource {
     Own,
     FavoriteRecipe,
     FavoriteAccount,
+    OtherPublic,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecommendationSourceTier {
+    Preferred,
     OtherPublic,
 }
 
@@ -131,12 +138,14 @@ pub struct RankingIntent {
     pub desired_matched: usize,
     pub desired_total: usize,
     pub desired_coverage: u16,
+    pub other_missing: usize,
     pub fulfillment: RecommendationStatus,
     pub unplanned_missing: usize,
     pub shopping_covered: usize,
     pub verify: usize,
     pub effective_groups: usize,
     pub source: RecommendationSource,
+    pub source_tier: RecommendationSourceTier,
     pub available: usize,
     pub available_coverage: u16,
     pub reasons: Vec<RankingReason>,
@@ -290,7 +299,6 @@ fn recommend_inner(
         {
             return None;
         }
-        let required_assignment = assign_distinct_groups(&required, &group_keys, None, None, true)?;
         let matched_sources = matched_sources(&recipe, settings);
         let primary_source = *matched_sources.first()?;
 
@@ -300,21 +308,26 @@ fn recommend_inner(
             .map(|group| evaluate_group(group, &pantry, shopping, stale_before, now.date_naive()))
             .collect::<Vec<_>>();
         let ingredient_scope = request.ingredient_scope.unwrap_or_default();
+        let scope_qualified = evaluated_groups
+            .iter()
+            .map(|group| action_qualifies_scope(group.action, ingredient_scope))
+            .collect::<Vec<_>>();
+        let action_priorities = evaluated_groups
+            .iter()
+            .map(|group| action_rank(group.action))
+            .collect::<Vec<_>>();
+        let required_assignment = assign_distinct_groups(
+            &required,
+            &group_keys,
+            Some(&scope_qualified),
+            Some(&action_priorities),
+            true,
+        )?;
         let desired_assignment = assign_distinct_groups(
             &preferred,
             &group_keys,
-            Some(
-                &evaluated_groups
-                    .iter()
-                    .map(|group| action_qualifies_scope(group.action, ingredient_scope))
-                    .collect::<Vec<_>>(),
-            ),
-            Some(
-                &evaluated_groups
-                    .iter()
-                    .map(|group| action_rank(group.action))
-                    .collect::<Vec<_>>(),
-            ),
+            Some(&scope_qualified),
+            Some(&action_priorities),
             false,
         )
         .unwrap_or_default();
@@ -382,9 +395,10 @@ fn recommend_inner(
             .iter()
             .filter(|reason| reason.effective)
             .all(|reason| action_qualifies_scope(reason.action, ingredient_scope));
-        let status = if !scope_eligible {
-            RecommendationStatus::Blocked
-        } else if unplanned_missing > 0 || shopping_covered > 0 {
+        if !scope_eligible {
+            return None;
+        }
+        let status = if unplanned_missing > 0 || shopping_covered > 0 {
             RecommendationStatus::Shop
         } else if verify_count > 0 {
             RecommendationStatus::Verify
@@ -490,39 +504,46 @@ fn recommend_inner(
                 }
             }
         }
-        if !scope_eligible {
-            reasons.push(
-                "Blocked by ingredient scope because effective groups are not covered".into(),
-            );
-            reason_details.push(RecommendationReason::IngredientScopeBlocked {
-                scope: ingredient_scope,
-            });
-            if ingredient_scope == IngredientScope::PantryOnly {
-                reason_details.push(RecommendationReason::PantryOnlyBlocked);
-            }
-        }
         let desired_tier = desired_assignments
             .iter()
             .map(|(_, group_index)| evaluated_groups[*group_index].action)
-            .max_by_key(|action| action_rank(*action))
+            .min_by_key(|action| action_rank(*action))
             .unwrap_or(IngredientGroupAction::Missing);
+        let desired_group_indices = desired_assignments
+            .iter()
+            .map(|(_, group_index)| *group_index)
+            .collect::<HashSet<_>>();
+        let other_missing = ingredient_group_reasons
+            .iter()
+            .enumerate()
+            .filter(|(index, reason)| {
+                reason.effective
+                    && !desired_group_indices.contains(index)
+                    && matches!(
+                        reason.action,
+                        IngredientGroupAction::ShoppingPlanned | IngredientGroupAction::Missing
+                    )
+            })
+            .count();
         let desired_total = preferred.len();
         let desired_matched = desired_matches.len();
         let desired_coverage = coverage_basis_points(desired_matched, desired_total);
         let available_coverage = coverage_basis_points(available_count, effective_count);
         let ranking_intent = RankingIntent {
-            version: "intent-v1",
+            version: "intent-v2",
             scope_eligible,
             desired_tier,
             desired_matched,
             desired_total,
             desired_coverage,
+            other_missing,
             fulfillment: status,
             unplanned_missing,
             shopping_covered,
             verify: verify_count,
             effective_groups: effective_count,
             source: primary_source,
+            source_tier: source_tier(primary_source),
             available: available_count,
             available_coverage,
             reasons: vec![
@@ -612,89 +633,134 @@ fn assign_distinct_groups(
     group_priorities: Option<&[i32]>,
     require_all: bool,
 ) -> Option<HashMap<String, usize>> {
-    fn augment(
-        identity_index: usize,
-        identities: &[String],
-        group_keys: &[HashSet<String>],
-        qualified_groups: Option<&[bool]>,
-        group_priorities: Option<&[i32]>,
-        seen: &mut [bool],
-        group_matches: &mut [Option<usize>],
-    ) -> bool {
-        let mut group_indices = (0..group_keys.len()).collect::<Vec<_>>();
-        group_indices.sort_by_key(|index| {
-            (
-                std::cmp::Reverse(group_priorities.map_or(0, |priorities| priorities[*index])),
-                *index,
-            )
+    #[derive(Clone)]
+    struct FlowEdge {
+        to: usize,
+        reverse: usize,
+        capacity: u8,
+        cost: i64,
+    }
+
+    fn add_edge(graph: &mut [Vec<FlowEdge>], from: usize, to: usize, cost: i64) -> usize {
+        let forward_index = graph[from].len();
+        let reverse_index = graph[to].len();
+        graph[from].push(FlowEdge {
+            to,
+            reverse: reverse_index,
+            capacity: 1,
+            cost,
         });
-        for group_index in group_indices {
-            let group_identities = &group_keys[group_index];
-            if seen[group_index]
-                || qualified_groups.is_some_and(|qualified| !qualified[group_index])
-                || !group_identities.contains(&identities[identity_index])
+        graph[to].push(FlowEdge {
+            to: from,
+            reverse: forward_index,
+            capacity: 0,
+            cost: -cost,
+        });
+        forward_index
+    }
+
+    let mut identities = requested.iter().cloned().collect::<Vec<_>>();
+    identities.sort();
+    let identity_count = identities.len();
+    let group_count = group_keys.len();
+    let source = 0;
+    let identity_start = 1;
+    let group_start = identity_start + identity_count;
+    let sink = group_start + group_count;
+    let mut graph = vec![Vec::new(); sink + 1];
+    for identity_index in 0..identity_count {
+        add_edge(&mut graph, source, identity_start + identity_index, 0);
+    }
+    for group_index in 0..group_count {
+        add_edge(&mut graph, group_start + group_index, sink, 0);
+    }
+
+    let max_matches = identity_count.min(group_count);
+    let action_base =
+        i64::try_from(max_matches + 1).expect("recommendation matching bounds fit i64");
+    let maximum_tie_per_edge = identity_count * group_count + identity_count;
+    let tie_scale = i64::try_from(max_matches * maximum_tie_per_edge + 1)
+        .expect("recommendation matching bounds fit i64");
+    let action_penalty = |group_index: usize| match group_priorities
+        .map_or(4, |priorities| priorities[group_index])
+    {
+        4.. => 0,
+        3 => 1,
+        2 => action_base,
+        _ => action_base * action_base,
+    };
+    let mut assignment_edges = Vec::new();
+    for (identity_index, identity) in identities.iter().enumerate() {
+        for (group_index, group) in group_keys.iter().enumerate() {
+            if qualified_groups.is_some_and(|qualified| !qualified[group_index])
+                || !group.contains(identity)
             {
                 continue;
             }
-            seen[group_index] = true;
-            if group_matches[group_index].is_none()
-                || augment(
-                    group_matches[group_index].expect("checked above"),
-                    identities,
-                    group_keys,
-                    qualified_groups,
-                    group_priorities,
-                    seen,
-                    group_matches,
-                )
-            {
-                group_matches[group_index] = Some(identity_index);
-                return true;
+            let tie = group_index * identity_count + identity_index;
+            let cost = action_penalty(group_index) * tie_scale
+                + i64::try_from(tie).expect("recommendation matching bounds fit i64");
+            let node = identity_start + identity_index;
+            let edge_index = add_edge(&mut graph, node, group_start + group_index, cost);
+            assignment_edges.push((identity_index, group_index, edge_index));
+        }
+    }
+
+    let node_count = graph.len();
+    let mut potentials = vec![0i64; node_count];
+    let mut matched = 0usize;
+    loop {
+        let mut distances = vec![i64::MAX; node_count];
+        let mut parents = vec![None; node_count];
+        let mut queue = BinaryHeap::new();
+        distances[source] = 0;
+        queue.push(Reverse((0i64, source)));
+        while let Some(Reverse((distance, node))) = queue.pop() {
+            if distance != distances[node] {
+                continue;
+            }
+            for (edge_index, edge) in graph[node].iter().enumerate() {
+                if edge.capacity == 0 {
+                    continue;
+                }
+                let next_distance = distance + edge.cost + potentials[node] - potentials[edge.to];
+                if next_distance < distances[edge.to] {
+                    distances[edge.to] = next_distance;
+                    parents[edge.to] = Some((node, edge_index));
+                    queue.push(Reverse((next_distance, edge.to)));
+                }
             }
         }
-        false
-    }
-    let mut identities = requested.iter().cloned().collect::<Vec<_>>();
-    identities.sort_by(|left, right| {
-        let candidate_count = |identity: &String| {
-            group_keys
-                .iter()
-                .enumerate()
-                .filter(|(index, group)| {
-                    qualified_groups.is_none_or(|qualified| qualified[*index])
-                        && group.contains(identity)
-                })
-                .count()
-        };
-        candidate_count(left)
-            .cmp(&candidate_count(right))
-            .then_with(|| left.cmp(right))
-    });
-    let mut group_matches = vec![None; group_keys.len()];
-    let mut matched = 0usize;
-    for identity_index in 0..identities.len() {
-        if augment(
-            identity_index,
-            &identities,
-            group_keys,
-            qualified_groups,
-            group_priorities,
-            &mut vec![false; group_keys.len()],
-            &mut group_matches,
-        ) {
-            matched += 1;
+        if distances[sink] == i64::MAX {
+            break;
         }
+        for node in 0..node_count {
+            if distances[node] != i64::MAX {
+                potentials[node] += distances[node];
+            }
+        }
+        let mut node = sink;
+        while node != source {
+            let (parent, edge_index) = parents[node].expect("reachable sink has a parent path");
+            let reverse = graph[parent][edge_index].reverse;
+            graph[parent][edge_index].capacity = 0;
+            graph[node][reverse].capacity = 1;
+            node = parent;
+        }
+        matched += 1;
     }
-    if require_all && matched != identities.len() {
+
+    if require_all && matched != identity_count {
         return None;
     }
     Some(
-        group_matches
+        assignment_edges
             .into_iter()
-            .enumerate()
-            .filter_map(|(group_index, identity_index)| {
-                identity_index
-                    .map(|identity_index| (identities[identity_index].clone(), group_index))
+            .filter(|(identity_index, _, edge_index)| {
+                graph[identity_start + identity_index][*edge_index].capacity == 0
+            })
+            .map(|(identity_index, group_index, _)| {
+                (identities[identity_index].clone(), group_index)
             })
             .collect(),
     )
@@ -874,26 +940,30 @@ impl Ord for WorstFirst {
 fn compare_recommendations(left: &Recommendation, right: &Recommendation) -> Ordering {
     let left_rank = &left.ranking_intent;
     let right_rank = &right.ranking_intent;
-    right_rank
-        .scope_eligible
-        .cmp(&left_rank.scope_eligible)
+    let left_desired_match = left_rank.desired_matched > 0;
+    let right_desired_match = right_rank.desired_matched > 0;
+    right_desired_match
+        .cmp(&left_desired_match)
         .then_with(|| {
-            if left_rank.desired_total > 0 {
-                action_rank(right_rank.desired_tier).cmp(&action_rank(left_rank.desired_tier))
-            } else {
-                Ordering::Equal
-            }
+            source_tier_rank(right_rank.source_tier).cmp(&source_tier_rank(left_rank.source_tier))
         })
         .then_with(|| {
-            if left_rank.desired_total > 0 {
+            if left_desired_match && right_desired_match {
                 right_rank.desired_matched.cmp(&left_rank.desired_matched)
             } else {
                 Ordering::Equal
             }
         })
         .then_with(|| {
-            if left_rank.desired_total > 0 {
-                right_rank.desired_coverage.cmp(&left_rank.desired_coverage)
+            if left_desired_match && right_desired_match {
+                action_rank(right_rank.desired_tier).cmp(&action_rank(left_rank.desired_tier))
+            } else {
+                Ordering::Equal
+            }
+        })
+        .then_with(|| {
+            if left_desired_match && right_desired_match {
+                left_rank.other_missing.cmp(&right_rank.other_missing)
             } else {
                 Ordering::Equal
             }
@@ -907,7 +977,6 @@ fn compare_recommendations(left: &Recommendation, right: &Recommendation) -> Ord
         .then_with(|| left_rank.shopping_covered.cmp(&right_rank.shopping_covered))
         .then_with(|| left_rank.verify.cmp(&right_rank.verify))
         .then_with(|| left_rank.effective_groups.cmp(&right_rank.effective_groups))
-        .then_with(|| source_rank(right_rank.source).cmp(&source_rank(left_rank.source)))
         .then_with(|| {
             right_rank
                 .available_coverage
@@ -1001,11 +1070,19 @@ fn action_rank(action: IngredientGroupAction) -> i32 {
     }
 }
 
-fn source_rank(source: RecommendationSource) -> i32 {
+fn source_tier(source: RecommendationSource) -> RecommendationSourceTier {
     match source {
-        RecommendationSource::Own => 3,
-        RecommendationSource::FavoriteRecipe | RecommendationSource::FavoriteAccount => 2,
-        RecommendationSource::OtherPublic => 1,
+        RecommendationSource::Own
+        | RecommendationSource::FavoriteRecipe
+        | RecommendationSource::FavoriteAccount => RecommendationSourceTier::Preferred,
+        RecommendationSource::OtherPublic => RecommendationSourceTier::OtherPublic,
+    }
+}
+
+fn source_tier_rank(tier: RecommendationSourceTier) -> i32 {
+    match tier {
+        RecommendationSourceTier::Preferred => 2,
+        RecommendationSourceTier::OtherPublic => 1,
     }
 }
 
@@ -1164,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn pantry_only_marks_missing_recipe_blocked() {
+    fn pantry_only_filters_missing_recipe_as_a_hard_constraint() {
         let results = recommend(
             vec![recipe("1", "Toast", &["bread"])],
             &[],
@@ -1175,11 +1252,11 @@ mod tests {
             &settings(),
             Utc::now(),
         );
-        assert_eq!(results[0].status, RecommendationStatus::Blocked);
+        assert!(results.is_empty());
     }
 
     #[test]
-    fn pantry_only_marks_uncertain_recipe_blocked() {
+    fn pantry_only_filters_uncertain_recipe_as_a_hard_constraint() {
         let results = recommend(
             vec![recipe("1", "Toast", &["bread"])],
             &[pantry("bread", PantryStatus::Unknown, None)],
@@ -1190,8 +1267,7 @@ mod tests {
             &settings(),
             Utc::now(),
         );
-        assert_eq!(results[0].status, RecommendationStatus::Blocked);
-        assert_eq!(results[0].verify, vec!["bread"]);
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -1223,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn expires_today_blocks_pantry_only_with_clear_reason() {
+    fn expires_today_is_filtered_by_pantry_only() {
         let now = DateTime::parse_from_rfc3339("2026-11-04T23:59:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -1239,19 +1315,7 @@ mod tests {
             &settings(),
             now,
         );
-        assert_eq!(results[0].status, RecommendationStatus::Blocked);
-        assert!(results[0]
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("expires today")));
-        assert!(results[0].reason_details.contains(
-            &RecommendationReason::IngredientExpiresToday {
-                ingredient: "milk".into(),
-            }
-        ));
-        assert!(results[0]
-            .reason_details
-            .contains(&RecommendationReason::PantryOnlyBlocked));
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -1357,6 +1421,147 @@ mod tests {
             .iter()
             .all(|result| (0..=999).contains(&result.score)));
         assert!(results[2].score > results[0].score);
+    }
+
+    #[test]
+    fn desired_partition_precedes_source_and_readiness() {
+        let now = DateTime::parse_from_rfc3339("2026-01-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut desired_public = recipe(
+            "desired-public",
+            "Chicken wings with missing seasoning",
+            &["鸡翅", "盐"],
+        );
+        desired_public.is_owner = false;
+        desired_public.visibility = "public".into();
+        let ready_own = recipe("ready-own", "Ready plain rice", &["白粥"]);
+        let results = recommend(
+            vec![ready_own, desired_public],
+            &[pantry(
+                "白粥",
+                PantryStatus::Have,
+                Some("2026-01-19T00:00:00Z"),
+            )],
+            &RecommendationRequest {
+                preferred: vec!["鸡翅".into(), "鱼".into()],
+                ..Default::default()
+            },
+            &settings(),
+            now,
+        );
+        assert_eq!(results[0].recipe.id, "desired-public");
+        assert_eq!(results[0].status, RecommendationStatus::Shop);
+        assert_eq!(results[1].recipe.id, "ready-own");
+        assert_eq!(results[1].status, RecommendationStatus::Ready);
+    }
+
+    #[test]
+    fn own_and_favorite_share_one_source_tier_above_other_public() {
+        let now = DateTime::parse_from_rfc3339("2026-01-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let own = recipe("b-own", "Same title", &["rice"]);
+        let mut favorite = recipe("a-favorite", "Same title", &["rice"]);
+        favorite.is_owner = false;
+        favorite.visibility = "public".into();
+        favorite.is_favorite = true;
+        let mut other = recipe("0-other", "Same title", &["rice"]);
+        other.is_owner = false;
+        other.visibility = "public".into();
+        let results = recommend(
+            vec![own, other, favorite],
+            &[],
+            &RecommendationRequest::default(),
+            &settings(),
+            now,
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.recipe.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-favorite", "b-own", "0-other"]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.ranking_intent.source_tier)
+                .collect::<Vec<_>>(),
+            vec![
+                RecommendationSourceTier::Preferred,
+                RecommendationSourceTier::Preferred,
+                RecommendationSourceTier::OtherPublic,
+            ]
+        );
+    }
+
+    #[test]
+    fn desired_match_count_precedes_action_and_or_group_counts_once() {
+        let mut two_groups = recipe("two", "Two desired groups", &["鸡翅", "鱼"]);
+        two_groups.is_favorite = true;
+        let mut one_or_group = recipe("one", "One OR group", &["鸡翅"]);
+        one_or_group.is_favorite = true;
+        one_or_group.ingredient_groups[0]
+            .alternatives
+            .push(IngredientAlternativeInput {
+                id: "fish".into(),
+                name: "鱼".into(),
+                quantity_note: String::new(),
+                canonical_ingredient_id: None,
+                sort_order: 1,
+            });
+        one_or_group.ingredients.push(IngredientInput {
+            name: "鱼".into(),
+            quantity_note: String::new(),
+            canonical_ingredient_id: None,
+        });
+        let results = recommend(
+            vec![one_or_group, two_groups],
+            &[],
+            &RecommendationRequest {
+                preferred: vec!["鸡翅".into(), "鱼".into()],
+                ..Default::default()
+            },
+            &settings(),
+            Utc::now(),
+        );
+        assert_eq!(results[0].recipe.id, "two");
+        assert_eq!(results[0].ranking_intent.desired_matched, 2);
+        assert_eq!(results[1].ranking_intent.desired_matched, 1);
+    }
+
+    #[test]
+    fn unresolved_desired_identity_does_not_match_canonical_recipe_identity() {
+        let mut candidate = recipe("soy", "Soy sauce", &["酱油"]);
+        candidate.ingredient_groups[0].alternatives[0].canonical_ingredient_id =
+            Some("soy-sauce".into());
+        candidate.ingredients[0].canonical_ingredient_id = Some("soy-sauce".into());
+        let unresolved = recommend(
+            vec![candidate.clone()],
+            &[],
+            &RecommendationRequest {
+                preferred: vec![IngredientReference::from("酱油")],
+                ..Default::default()
+            },
+            &settings(),
+            Utc::now(),
+        );
+        assert_eq!(unresolved[0].ranking_intent.desired_matched, 0);
+        let canonical = recommend(
+            vec![candidate],
+            &[],
+            &RecommendationRequest {
+                preferred: vec![IngredientReference::Selection {
+                    name: "酱油".into(),
+                    canonical_ingredient_id: Some("soy-sauce".into()),
+                }],
+                ..Default::default()
+            },
+            &settings(),
+            Utc::now(),
+        );
+        assert_eq!(canonical[0].ranking_intent.desired_matched, 1);
     }
 
     #[test]
@@ -1506,6 +1711,81 @@ mod tests {
     }
 
     #[test]
+    fn required_assignment_uses_best_scope_qualified_distinct_groups() {
+        let mut candidate = recipe("required-actions", "Required actions", &["a", "a", "a"]);
+        candidate.ingredient_groups[0].alternatives.extend([
+            IngredientAlternativeInput {
+                id: "group-0-b".into(),
+                name: "b".into(),
+                quantity_note: String::new(),
+                canonical_ingredient_id: None,
+                sort_order: 1,
+            },
+            IngredientAlternativeInput {
+                id: "group-0-available".into(),
+                name: "available-0".into(),
+                quantity_note: String::new(),
+                canonical_ingredient_id: None,
+                sort_order: 2,
+            },
+        ]);
+        candidate.ingredient_groups[1].optional = true;
+        candidate.ingredient_groups[2].optional = true;
+        candidate.ingredient_groups[2].alternatives.extend([
+            IngredientAlternativeInput {
+                id: "group-2-b".into(),
+                name: "b".into(),
+                quantity_note: String::new(),
+                canonical_ingredient_id: None,
+                sort_order: 1,
+            },
+            IngredientAlternativeInput {
+                id: "group-2-available".into(),
+                name: "available-2".into(),
+                quantity_note: String::new(),
+                canonical_ingredient_id: None,
+                sort_order: 2,
+            },
+        ]);
+        let now = DateTime::parse_from_rfc3339("2026-01-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let pantry = [
+            pantry(
+                "available-0",
+                PantryStatus::Have,
+                Some("2026-01-19T00:00:00Z"),
+            ),
+            pantry(
+                "available-2",
+                PantryStatus::Have,
+                Some("2026-01-19T00:00:00Z"),
+            ),
+        ];
+        for scope in [
+            IngredientScope::Any,
+            IngredientScope::PantryOnly,
+            IngredientScope::PantryOrList,
+        ] {
+            let results = recommend(
+                vec![candidate.clone()],
+                &pantry,
+                &RecommendationRequest {
+                    required: vec!["a".into(), "b".into()],
+                    ingredient_scope: Some(scope),
+                    ..Default::default()
+                },
+                &settings(),
+                now,
+            );
+            assert_eq!(results.len(), 1, "scope {scope:?}");
+            assert_eq!(results[0].status, RecommendationStatus::Ready);
+            assert!(!results[0].ingredient_group_reasons[1].effective);
+            assert!(results[0].ingredient_group_reasons[2].effective);
+        }
+    }
+
+    #[test]
     fn pantry_or_list_requires_exact_choice_or_concrete_coverage_and_verify_wins() {
         let mut candidate = recipe("or", "OR spread", &["butter"]);
         candidate.ingredient_groups[0]
@@ -1557,8 +1837,7 @@ mod tests {
             Utc::now(),
             10,
         );
-        assert!(!blocked[0].ranking_intent.scope_eligible);
-        assert_eq!(blocked[0].status, RecommendationStatus::Blocked);
+        assert!(blocked.is_empty());
 
         let concrete = ActiveShoppingCoverage {
             concrete_identity_keys: HashSet::from(["n:oil".into()]),
@@ -1584,11 +1863,7 @@ mod tests {
             Utc::now(),
             10,
         );
-        assert_eq!(
-            verify[0].ingredient_group_reasons[0].action,
-            IngredientGroupAction::Verify
-        );
-        assert!(!verify[0].ranking_intent.scope_eligible);
+        assert!(verify.is_empty());
     }
 
     #[test]
@@ -1637,8 +1912,7 @@ mod tests {
             &settings(),
             now,
         );
-        assert!(must[0].ingredient_group_reasons[1].effective);
-        assert!(!must[0].ranking_intent.scope_eligible);
+        assert!(must.is_empty());
     }
 
     #[test]
@@ -1690,6 +1964,97 @@ mod tests {
         );
         assert_eq!(hundred[0].ranking_intent.desired_matched, 100);
         assert_eq!(hundred[0].ranking_intent.desired_coverage, 10_000);
+    }
+
+    #[test]
+    fn desired_assignment_lexicographically_maximizes_action_distribution() {
+        let mut candidate = recipe("overlap-actions", "Overlap actions", &["a", "b", "a"]);
+        candidate.ingredient_groups[2]
+            .alternatives
+            .push(IngredientAlternativeInput {
+                id: "b-shared".into(),
+                name: "b".into(),
+                quantity_note: String::new(),
+                canonical_ingredient_id: None,
+                sort_order: 1,
+            });
+        candidate.ingredient_groups[2]
+            .alternatives
+            .push(IngredientAlternativeInput {
+                id: "c-available".into(),
+                name: "c".into(),
+                quantity_note: String::new(),
+                canonical_ingredient_id: None,
+                sort_order: 2,
+            });
+        let now = DateTime::parse_from_rfc3339("2026-01-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let shopping = ActiveShoppingCoverage {
+            concrete_identity_keys: HashSet::from(["n:b".into()]),
+            exact_choice_keys: HashSet::new(),
+        };
+        let request = RecommendationRequest {
+            preferred: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        let all = recommend_inner(
+            vec![
+                candidate.clone(),
+                recipe("plain", "Plain", &["missing"]),
+                recipe("ready", "Ready", &["c"]),
+            ],
+            &[pantry(
+                "c",
+                PantryStatus::Have,
+                Some("2026-01-19T00:00:00Z"),
+            )],
+            &shopping,
+            &request,
+            &settings(),
+            now,
+            None,
+        );
+        let overlap = all
+            .iter()
+            .find(|result| result.recipe.id == "overlap-actions")
+            .unwrap();
+        assert_eq!(overlap.ranking_intent.desired_matched, 2);
+        assert_eq!(
+            overlap.ranking_intent.desired_tier,
+            IngredientGroupAction::ShoppingPlanned
+        );
+        assert_eq!(overlap.ranking_intent.other_missing, 1);
+
+        for limit in 1..=all.len() {
+            let limited = recommend_inner(
+                vec![
+                    candidate.clone(),
+                    recipe("plain", "Plain", &["missing"]),
+                    recipe("ready", "Ready", &["c"]),
+                ],
+                &[pantry(
+                    "c",
+                    PantryStatus::Have,
+                    Some("2026-01-19T00:00:00Z"),
+                )],
+                &shopping,
+                &request,
+                &settings(),
+                now,
+                Some(limit),
+            );
+            assert_eq!(
+                limited
+                    .iter()
+                    .map(|result| &result.recipe.id)
+                    .collect::<Vec<_>>(),
+                all.iter()
+                    .take(limit)
+                    .map(|result| &result.recipe.id)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
