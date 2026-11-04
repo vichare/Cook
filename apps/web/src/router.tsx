@@ -10,7 +10,7 @@ import {
   useSearch,
 } from '@tanstack/react-router'
 import { QueryClient, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useFieldArray, useForm, type UseFormReturn } from 'react-hook-form'
 import { z } from 'zod'
 import { ApiError, api } from './api'
@@ -49,9 +49,31 @@ import {
 import { createPasskey, getPasskey } from './webauthn'
 import { useI18n, type Locale, type Translate } from './i18n'
 import { useRecommendationWorkbench } from './recommendation-workbench'
+import {
+  moveRecommendationIngredient,
+  prepareRecommendationIngredientBatch,
+  type RecommendationIngredientBucket,
+  type RecommendationIngredientMoveRequest,
+} from './recommendation-ingredients'
+import {
+  positionRecommendationMoveMenu,
+  type RecommendationMoveMenuPosition,
+} from './recommendation-move-menu'
+import {
+  recommendationControlsKey,
+  type RecommendationControls,
+} from './recommendation-url'
 
 interface RouterContext {
   queryClient: QueryClient
+}
+
+interface PendingRecommendationIngredientBatch {
+  baseKey: string
+  confirmationIndex: number
+  confirmations: RecommendationIngredientMoveRequest[]
+  controls: RecommendationControls
+  locationGeneration: number
 }
 
 const rootRoute = createRootRouteWithContext<RouterContext>()({
@@ -539,6 +561,7 @@ export function RecommendationsPage() {
   const {
     activeControls,
     controls: filters,
+    locationGeneration,
     results: recommendations,
     retry,
     setControls: setFilters,
@@ -555,6 +578,50 @@ export function RecommendationsPage() {
   const [pendingShoppingIdentity, setPendingShoppingIdentity] = useState<string | null>(null)
   const [shoppingNotice, setShoppingNotice] = useState<{ id: number; name: string } | null>(null)
   const shoppingNoticeSequence = useRef(0)
+  const [moveNotice, setMoveNotice] = useState<{ id: number; message: string } | null>(null)
+  const moveNoticeSequence = useRef(0)
+  const [moveBatch, setMoveBatch] = useState<PendingRecommendationIngredientBatch | null>(null)
+  const lastMoveConfirmation = useRef<RecommendationIngredientMoveRequest | null>(null)
+  const moveConfirmationRestoreFocus = useRef<HTMLElement | null>(null)
+  const confirmedMove = useRef(false)
+  const [restoreMoveConfirmationFocus, setRestoreMoveConfirmationFocus] = useState(false)
+  const currentLocationGeneration = useRef(locationGeneration)
+  currentLocationGeneration.current = locationGeneration
+  const currentControlsKey = useRef('')
+  currentControlsKey.current = filters ? recommendationControlsKey(filters) : ''
+  const moveButtonRefs = useRef(new Map<string, HTMLButtonElement>())
+  const [pendingMoveFocus, setPendingMoveFocus] = useState<{
+    bucket: RecommendationIngredientBucket
+    identity: string
+  } | null>(null)
+  useEffect(() => {
+    if (!pendingMoveFocus) return
+    const target = moveButtonRefs.current.get(
+      `${pendingMoveFocus.bucket}:${pendingMoveFocus.identity}`,
+    )
+    if (!target) return
+    target.focus()
+    setPendingMoveFocus(null)
+  }, [filters, pendingMoveFocus])
+  useEffect(() => {
+    if (!restoreMoveConfirmationFocus || moveBatch) return
+    moveConfirmationRestoreFocus.current?.focus()
+    setRestoreMoveConfirmationFocus(false)
+  }, [moveBatch, restoreMoveConfirmationFocus])
+  useEffect(() => {
+    if (!moveBatch || !filters) return
+    if (
+      moveBatch.locationGeneration === locationGeneration
+      && moveBatch.baseKey === recommendationControlsKey(filters)
+    ) return
+    confirmedMove.current = false
+    setMoveBatch(null)
+    setRestoreMoveConfirmationFocus(true)
+    setMoveNotice({
+      id: ++moveNoticeSequence.current,
+      message: t('recommend.moveCanceledNavigation'),
+    })
+  }, [filters, locationGeneration, moveBatch, t])
   const addShopping = useMutation({
     mutationFn: ({
       recipeId,
@@ -716,6 +783,135 @@ export function RecommendationsPage() {
       : recommendations.status === 'error'
         ? t('recommend.failed')
         : ''
+  const pendingMoveConfirmation = moveBatch
+    ? moveBatch.confirmations[moveBatch.confirmationIndex] ?? null
+    : null
+  if (pendingMoveConfirmation) lastMoveConfirmation.current = pendingMoveConfirmation
+  const announceMove = (message: string) => {
+    setMoveNotice({ id: ++moveNoticeSequence.current, message })
+  }
+  const commitControls = (next: RecommendationControls) => {
+    const result = setFilters(next)
+    if (result.status === 'rejected') announceMove(t('recommend.controlsTooLong'))
+    return result
+  }
+  const commitMove = (request: RecommendationIngredientMoveRequest) => {
+    const result = moveRecommendationIngredient(
+      filters,
+      request.identity,
+      request.from,
+      request.to,
+    )
+    if (!result.ingredient || result.outcome === 'source-missing') {
+      setPendingMoveFocus({ bucket: request.from, identity: request.identity })
+      announceMove(t('recommend.moveFailed', { name: request.ingredient.name }))
+      return
+    }
+    if (result.outcome === 'target-full') {
+      setPendingMoveFocus({ bucket: request.from, identity: request.identity })
+      announceMove(t('recommend.moveTargetFull', {
+        bucket: recommendationBucketLabel(request.to, t),
+        name: request.ingredient.name,
+      }))
+      return
+    }
+    const commit = commitControls(result.controls)
+    if (commit.status !== 'committed') {
+      setPendingMoveFocus({ bucket: request.from, identity: request.identity })
+      if (commit.status === 'unchanged') {
+        announceMove(t('recommend.moveFailed', { name: request.ingredient.name }))
+      }
+      return
+    }
+    setPendingMoveFocus({ bucket: request.to, identity: result.focusIdentity })
+    announceMove(t(
+      result.outcome === 'already-present'
+        ? 'recommend.moveAlreadyPresent'
+        : 'recommend.moveSuccess',
+      {
+        name: result.ingredient.name,
+        bucket: recommendationBucketLabel(request.to, t),
+      },
+    ))
+  }
+  const queueAdditions = (
+    bucket: RecommendationIngredientBucket,
+    additions: IngredientReference[],
+  ) => {
+    const prepared = prepareRecommendationIngredientBatch(filters, additions, bucket)
+    if (prepared.outcome === 'oversized') {
+      announceMove(t('recommend.controlsTooLong'))
+      return false
+    }
+    if (prepared.outcome === 'target-full') {
+      announceMove(t('recommend.moveTargetFull', {
+        bucket: recommendationBucketLabel(bucket, t),
+        name: prepared.ingredient.name,
+      }))
+      return false
+    }
+    if (prepared.confirmations.length === 0) {
+      if (prepared.controls === filters) return true
+      return commitControls(prepared.controls).status !== 'rejected'
+    }
+    moveConfirmationRestoreFocus.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setMoveBatch({
+      baseKey: recommendationControlsKey(filters),
+      confirmationIndex: 0,
+      confirmations: prepared.confirmations,
+      controls: prepared.controls,
+      locationGeneration,
+    })
+    return true
+  }
+  const finishMoveConfirmation = (move: boolean) => {
+    if (!moveBatch || !pendingMoveConfirmation) return
+    if (
+      currentLocationGeneration.current !== moveBatch.locationGeneration
+      || currentControlsKey.current !== moveBatch.baseKey
+    ) {
+      confirmedMove.current = false
+      setMoveBatch(null)
+      setRestoreMoveConfirmationFocus(true)
+      announceMove(t('recommend.moveCanceledNavigation'))
+      return
+    }
+    confirmedMove.current = move
+    if (!move) {
+      setMoveBatch(null)
+      setRestoreMoveConfirmationFocus(true)
+      announceMove(t('recommend.moveBatchCanceled', {
+        name: pendingMoveConfirmation.ingredient.name,
+      }))
+      return
+    }
+    const nextIndex = moveBatch.confirmationIndex + 1
+    if (nextIndex < moveBatch.confirmations.length) {
+      confirmedMove.current = false
+      setMoveBatch({ ...moveBatch, confirmationIndex: nextIndex })
+      return
+    }
+    const commit = commitControls(moveBatch.controls)
+    if (commit.status !== 'committed') {
+      confirmedMove.current = false
+      return
+    }
+    setPendingMoveFocus({
+      bucket: pendingMoveConfirmation.to,
+      identity: pendingMoveConfirmation.identity,
+    })
+    setMoveBatch(null)
+    announceMove(moveBatch.confirmations.length === 1
+      ? t('recommend.moveSuccess', {
+          name: pendingMoveConfirmation.ingredient.name,
+          bucket: recommendationBucketLabel(pendingMoveConfirmation.to, t),
+        })
+      : t('recommend.moveBatchSuccess', {
+          count: formatNumber(moveBatch.confirmations.length),
+          bucket: recommendationBucketLabel(pendingMoveConfirmation.to, t),
+        }))
+  }
 
   return (
     <Page title={t('recommend.title')} intro={t('recommend.intro')}>
@@ -738,19 +934,79 @@ export function RecommendationsPage() {
       >
         <p className="recommendation-share-note">{t('recommend.shareNote')}</p>
         <IngredientFilterInput
+          bucket="preferred"
           label={t('recommend.hopeToUse')}
           values={filters.preferred}
-          onChange={(preferred) => setFilters({ ...filters, preferred })}
+          onAdd={(values) => queueAdditions('preferred', values)}
+          onRemove={(identity) => {
+            commitControls({
+              ...filters,
+              preferred: filters.preferred.filter((value) => ingredientIdentity(value) !== identity),
+            })
+          }}
+          onMove={(identity, to) => commitMove({
+            from: 'preferred',
+            to,
+            identity,
+            ingredient: filters.preferred.find((value) =>
+              ingredientIdentity(value) === identity
+            )!,
+          })}
+          registerMoveButton={(identity, element) => {
+            const key = `preferred:${identity}`
+            if (element) moveButtonRefs.current.set(key, element)
+            else moveButtonRefs.current.delete(key)
+          }}
         />
         <IngredientFilterInput
+          bucket="required"
           label={t('recommend.mustUse')}
           values={filters.required}
-          onChange={(required) => setFilters({ ...filters, required })}
+          onAdd={(values) => queueAdditions('required', values)}
+          onRemove={(identity) => {
+            commitControls({
+              ...filters,
+              required: filters.required.filter((value) => ingredientIdentity(value) !== identity),
+            })
+          }}
+          onMove={(identity, to) => commitMove({
+            from: 'required',
+            to,
+            identity,
+            ingredient: filters.required.find((value) =>
+              ingredientIdentity(value) === identity
+            )!,
+          })}
+          registerMoveButton={(identity, element) => {
+            const key = `required:${identity}`
+            if (element) moveButtonRefs.current.set(key, element)
+            else moveButtonRefs.current.delete(key)
+          }}
         />
         <IngredientFilterInput
+          bucket="excluded"
           label={t('recommend.doNotUse')}
           values={filters.excluded}
-          onChange={(excluded) => setFilters({ ...filters, excluded })}
+          onAdd={(values) => queueAdditions('excluded', values)}
+          onRemove={(identity) => {
+            commitControls({
+              ...filters,
+              excluded: filters.excluded.filter((value) => ingredientIdentity(value) !== identity),
+            })
+          }}
+          onMove={(identity, to) => commitMove({
+            from: 'excluded',
+            to,
+            identity,
+            ingredient: filters.excluded.find((value) =>
+              ingredientIdentity(value) === identity
+            )!,
+          })}
+          registerMoveButton={(identity, element) => {
+            const key = `excluded:${identity}`
+            if (element) moveButtonRefs.current.set(key, element)
+            else moveButtonRefs.current.delete(key)
+          }}
         />
         <fieldset className="recommendation-scope">
           <legend>{t('recommend.scopeLegend')}</legend>
@@ -762,7 +1018,9 @@ export function RecommendationsPage() {
                 name="ingredient-scope"
                 value={scope}
                 checked={filters.ingredientScope === scope}
-                onChange={() => setFilters({ ...filters, ingredientScope: scope })}
+                onChange={() => {
+                  commitControls({ ...filters, ingredientScope: scope })
+                }}
               />
               <span>
                 <strong>{t(`recommend.scope.${scope}`)}</strong>
@@ -784,10 +1042,12 @@ export function RecommendationsPage() {
               <input
                 type="checkbox"
                 checked={filters.sources[field]}
-                onChange={(event) => setFilters({
-                  ...filters,
-                  sources: { ...filters.sources, [field]: event.target.checked },
-                })}
+                onChange={(event) => {
+                  commitControls({
+                    ...filters,
+                    sources: { ...filters.sources, [field]: event.target.checked },
+                  })
+                }}
               />
               {t(label)}
             </label>
@@ -795,6 +1055,9 @@ export function RecommendationsPage() {
         </fieldset>
       </form>
       <p className="sr-only" aria-live="polite" aria-atomic="true">{resultStatus}</p>
+      <p key={moveNotice?.id} className="sr-only" aria-live="polite" aria-atomic="true">
+        {moveNotice?.message ?? ''}
+      </p>
       {recommendations.status === 'loading' && recommendations.data.length > 0 && (
         <div className="status-banner">
           <span>{t('recommend.loading')}</span>
@@ -866,18 +1129,71 @@ export function RecommendationsPage() {
         names={verifyNames}
         onSaved={retry}
       />
+      <Dialog.Root
+        open={pendingMoveConfirmation !== null}
+        onOpenChange={(open) => {
+          if (!open && pendingMoveConfirmation) finishMoveConfirmation(false)
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          {lastMoveConfirmation.current && (
+            <Dialog.Content
+              className="confirmation-sheet recommendation-move-confirmation"
+              onCloseAutoFocus={(event) => {
+                event.preventDefault()
+                if (!confirmedMove.current) moveConfirmationRestoreFocus.current?.focus()
+                confirmedMove.current = false
+              }}
+            >
+              <Dialog.Title>{t('recommend.moveConfirmTitle')}</Dialog.Title>
+              <Dialog.Description>
+                {t('recommend.moveConfirmDescription', {
+                  name: lastMoveConfirmation.current.ingredient.name,
+                  from: recommendationBucketLabel(lastMoveConfirmation.current.from, t),
+                  to: recommendationBucketLabel(lastMoveConfirmation.current.to, t),
+                })}
+              </Dialog.Description>
+              <div className="dialog-actions">
+                <button
+                  type="button"
+                  className="button ghost"
+                  onClick={() => finishMoveConfirmation(false)}
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  type="button"
+                  className="button primary"
+                  onClick={() => finishMoveConfirmation(true)}
+                >
+                  {t('recommend.confirmMove')}
+                </button>
+              </div>
+            </Dialog.Content>
+          )}
+        </Dialog.Portal>
+      </Dialog.Root>
     </Page>
   )
 }
 
 function IngredientFilterInput({
+  bucket,
   label,
   values,
-  onChange,
+  onAdd,
+  onRemove,
+  onMove,
+  registerMoveButton,
 }: {
+  bucket: RecommendationIngredientBucket
   label: string
   values: IngredientReference[]
-  onChange: (values: IngredientReference[]) => void
+  onAdd: (values: IngredientReference[]) => boolean
+  onRemove: (identity: string) => void
+  onMove: (identity: string, to: RecommendationIngredientBucket) => void
+  registerMoveButton: (identity: string, element: HTMLButtonElement | null) => void
 }) {
   const { t } = useI18n()
   const [draft, setDraft] = useState<IngredientReference>({ name: '', canonicalIngredientId: null })
@@ -886,12 +1202,7 @@ function IngredientFilterInput({
       name,
       canonicalIngredientId: index === 0 ? next.canonicalIngredientId : null,
     }))
-    const existing = new Set(values.map(ingredientIdentity))
-    onChange([
-      ...values,
-      ...additions.filter((value) => !existing.has(ingredientIdentity(value))),
-    ])
-    setDraft({ name: '', canonicalIngredientId: null })
+    if (onAdd(additions)) setDraft({ name: '', canonicalIngredientId: null })
   }
   return (
     <fieldset className="ingredient-filter">
@@ -902,8 +1213,9 @@ function IngredientFilterInput({
         onChange={setDraft}
         onCommit={add}
         onPasteList={(names) => {
-          onChange([...values, ...names.map((name) => ({ name, canonicalIngredientId: null }))])
-          setDraft({ name: '', canonicalIngredientId: null })
+          if (onAdd(names.map((name) => ({ name, canonicalIngredientId: null })))) {
+            setDraft({ name: '', canonicalIngredientId: null })
+          }
         }}
         placeholder={t('recommend.filterPlaceholder')}
       />
@@ -912,11 +1224,17 @@ function IngredientFilterInput({
           {values.map((value, index) => (
             <li key={`${ingredientIdentity(value)}-${index}`}>
               <span>{value.name}</span>
+              <RecommendationIngredientMoveMenu
+                bucket={bucket}
+                ingredient={value}
+                onMove={onMove}
+                registerTrigger={registerMoveButton}
+              />
               <button
                 type="button"
                 className="button ghost"
                 aria-label={t('recommend.removeFromFilter', { name: value.name, label })}
-                onClick={() => onChange(values.filter((_, itemIndex) => itemIndex !== index))}
+                onClick={() => onRemove(ingredientIdentity(value))}
               >
                 {t('common.remove')}
               </button>
@@ -926,6 +1244,189 @@ function IngredientFilterInput({
       )}
     </fieldset>
   )
+}
+
+function RecommendationIngredientMoveMenu({
+  bucket,
+  ingredient,
+  onMove,
+  registerTrigger,
+}: {
+  bucket: RecommendationIngredientBucket
+  ingredient: IngredientReference
+  onMove: (identity: string, to: RecommendationIngredientBucket) => void
+  registerTrigger: (identity: string, element: HTMLButtonElement | null) => void
+}) {
+  const { t } = useI18n()
+  const menuId = useId()
+  const containerRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement | null>(null)
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const [open, setOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(0)
+  const [position, setPosition] = useState<RecommendationMoveMenuPosition | null>(null)
+  const identity = ingredientIdentity(ingredient)
+  const targets = (['preferred', 'required', 'excluded'] as RecommendationIngredientBucket[])
+    .filter((candidate) => candidate !== bucket)
+
+  useEffect(() => {
+    if (open) itemRefs.current[activeIndex]?.focus()
+  }, [activeIndex, open])
+  useEffect(() => {
+    if (!open) return
+    const updatePosition = () => {
+      if (!triggerRef.current) return
+      const placement = positionRecommendationMoveMenu(
+        triggerRef.current.getBoundingClientRect(),
+        recommendationMoveMenuViewport(),
+      )
+      if (placement.status === 'reference-hidden') {
+        setOpen(false)
+        triggerRef.current.focus({ preventScroll: true })
+        return
+      }
+      setPosition(placement.position)
+    }
+    updatePosition()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+    window.visualViewport?.addEventListener('resize', updatePosition)
+    window.visualViewport?.addEventListener('scroll', updatePosition)
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+      window.visualViewport?.removeEventListener('resize', updatePosition)
+      window.visualViewport?.removeEventListener('scroll', updatePosition)
+    }
+  }, [open])
+
+  const closeAndRestore = () => {
+    setOpen(false)
+    triggerRef.current?.focus()
+  }
+  const openAt = (index: number) => {
+    if (triggerRef.current) {
+      const placement = positionRecommendationMoveMenu(
+        triggerRef.current.getBoundingClientRect(),
+        recommendationMoveMenuViewport(),
+      )
+      if (placement.status === 'reference-hidden') {
+        triggerRef.current.focus({ preventScroll: true })
+        return
+      }
+      setPosition(placement.position)
+    }
+    setActiveIndex(index)
+    setOpen(true)
+  }
+
+  return (
+    <div
+      className="ingredient-move-menu"
+      ref={containerRef}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false)
+      }}
+    >
+      <button
+        type="button"
+        className="button ghost ingredient-move-trigger"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
+        aria-label={t('recommend.moveIngredient', { name: ingredient.name })}
+        ref={(element) => {
+          triggerRef.current = element
+          registerTrigger(identity, element)
+        }}
+        onClick={() => open ? closeAndRestore() : openAt(0)}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowDown') {
+            event.preventDefault()
+            openAt(0)
+          } else if (event.key === 'ArrowUp') {
+            event.preventDefault()
+            openAt(targets.length - 1)
+          } else if (event.key === 'Escape' && open) {
+            event.preventDefault()
+            closeAndRestore()
+          }
+        }}
+      >
+        {t('recommend.move')}
+      </button>
+      {open && (
+        <div
+          id={menuId}
+          role="menu"
+          className="ingredient-move-menu-items"
+          data-placement={position?.placement}
+          aria-label={t('recommend.moveMenu', { name: ingredient.name })}
+          style={position ? {
+            left: position.left,
+            maxHeight: position.maxHeight,
+            top: position.top,
+            width: position.width,
+          } : undefined}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault()
+              const delta = event.key === 'ArrowDown' ? 1 : -1
+              setActiveIndex((current) => (current + delta + targets.length) % targets.length)
+            } else if (event.key === 'Home') {
+              event.preventDefault()
+              setActiveIndex(0)
+            } else if (event.key === 'End') {
+              event.preventDefault()
+              setActiveIndex(targets.length - 1)
+            } else if (event.key === 'Escape') {
+              event.preventDefault()
+              closeAndRestore()
+            } else if (event.key === 'Tab') {
+              setOpen(false)
+            }
+          }}
+        >
+          {targets.map((target, index) => (
+            <button
+              type="button"
+              role="menuitem"
+              className="ingredient-move-menu-item"
+              key={target}
+              ref={(element) => {
+                itemRefs.current[index] = element
+              }}
+              onClick={() => {
+                setOpen(false)
+                onMove(identity, target)
+              }}
+            >
+              {t('recommend.moveToBucket', { bucket: recommendationBucketLabel(target, t) })}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function recommendationBucketLabel(
+  bucket: RecommendationIngredientBucket,
+  t: Translate,
+): string {
+  if (bucket === 'preferred') return t('recommend.hopeToUse')
+  if (bucket === 'required') return t('recommend.mustUse')
+  return t('recommend.doNotUse')
+}
+
+function recommendationMoveMenuViewport() {
+  const viewport = window.visualViewport
+  return {
+    height: viewport?.height ?? window.innerHeight,
+    offsetLeft: viewport?.offsetLeft ?? 0,
+    offsetTop: viewport?.offsetTop ?? 0,
+    width: viewport?.width ?? window.innerWidth,
+  }
 }
 
 export function RecipesPage() {

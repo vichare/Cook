@@ -44,6 +44,7 @@ import type { ModerationQueueItem, PantryItem, Recipe, Recommendation } from './
 import {
   encodeRecommendationControls,
   parseRecommendationControls,
+  RECOMMENDATION_URL_MAX_LENGTH,
   recommendationControlsFromSettings,
 } from './recommendation-url'
 
@@ -1543,6 +1544,527 @@ describe('recommendation shopping membership', () => {
     ])
     expect(request.ingredientScope).toBe('PANTRY_ONLY')
     expect(screen.getAllByText('Spring onion')).toHaveLength(2)
+  })
+
+  it('opens a two-target keyboard move menu, restores focus on Escape, and moves atomically', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Rice', canonicalIngredientId: 'rice-id' }],
+    })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${query}`)
+    await screen.findByText('Saffron rice')
+
+    const moveTrigger = screen.getByRole('button', { name: 'Move Rice' })
+    const originalInnerWidth = window.innerWidth
+    const originalInnerHeight = window.innerHeight
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 640 })
+    Object.defineProperty(moveTrigger, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        bottom: 124,
+        height: 44,
+        left: -20,
+        right: 24,
+        top: 80,
+        width: 44,
+        x: -20,
+        y: 80,
+        toJSON: () => ({}),
+      }),
+    })
+    fireEvent.keyDown(moveTrigger, { key: 'ArrowDown' })
+    const menu = screen.getByRole('menu', { name: 'Move Rice to another filter' })
+    expect(menu).toHaveStyle({ left: '12px', maxHeight: '498px', width: '288px' })
+    expect(menu).toHaveAttribute('data-placement', 'below')
+    expect(within(menu).getAllByRole('menuitem')).toHaveLength(2)
+    expect(within(menu).getByRole('menuitem', { name: 'Move to Must use' })).toBeVisible()
+    expect(within(menu).getByRole('menuitem', { name: 'Move to Do not use' })).toBeVisible()
+    expect(within(menu).queryByRole('menuitem', { name: 'Move to Hope to use' })).toBeNull()
+
+    fireEvent.keyDown(within(menu).getAllByRole('menuitem')[0], { key: 'Escape' })
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(document.activeElement).toBe(moveTrigger)
+
+    const replaceState = vi.spyOn(window.history, 'replaceState')
+    replaceState.mockClear()
+    fireEvent.click(moveTrigger)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to Must use' }))
+
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+    expect(recommendationsApi.mock.calls[1][0].preferred).toEqual([])
+    expect(recommendationsApi.mock.calls[1][0].required).toEqual([
+      { name: 'Rice', canonicalIngredientId: 'rice-id' },
+    ])
+    expect(replaceState).toHaveBeenCalledTimes(1)
+    expect(parseRecommendationControls(window.location.search, defaults).controls).toEqual(
+      expect.objectContaining({
+        preferred: [],
+        required: [{ name: 'Rice', canonicalIngredientId: 'rice-id' }],
+      }),
+    )
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Move Rice' }))
+    })
+    expect(screen.getByText('Rice moved to Must use.')).toBeInTheDocument()
+    replaceState.mockRestore()
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: originalInnerHeight })
+  })
+
+  it('repositions against visual viewport changes and closes when its trigger scrolls out', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Rice', canonicalIngredientId: null }],
+    })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${query}`)
+    await screen.findByText('Saffron rice')
+
+    const originalVisualViewport = window.visualViewport
+    const visualViewport = Object.assign(new EventTarget(), {
+      height: 400,
+      offsetLeft: 0,
+      offsetTop: 0,
+      width: 280,
+    })
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    })
+    const moveTrigger = screen.getByRole('button', { name: 'Move Rice' })
+    let rect = {
+      bottom: 194,
+      height: 44,
+      left: 60,
+      right: 104,
+      top: 150,
+      width: 44,
+      x: 60,
+      y: 150,
+      toJSON: () => ({}),
+    }
+    Object.defineProperty(moveTrigger, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => rect,
+    })
+
+    fireEvent.keyDown(moveTrigger, { key: 'ArrowDown' })
+    expect(screen.getByRole('menu')).toHaveStyle({ left: '12px', width: '256px' })
+
+    Object.assign(visualViewport, {
+      height: 300,
+      offsetLeft: 50,
+      offsetTop: 100,
+      width: 240,
+    })
+    visualViewport.dispatchEvent(new Event('resize'))
+    await waitFor(() => {
+      expect(screen.getByRole('menu')).toHaveStyle({
+        left: '62px',
+        top: '200px',
+        width: '216px',
+      })
+    })
+
+    rect = { ...rect, bottom: 94, top: 50, y: 50 }
+    visualViewport.dispatchEvent(new Event('scroll'))
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(document.activeElement).toBe(moveTrigger)
+
+    rect = { ...rect, bottom: 194, top: 150, y: 150 }
+    fireEvent.keyDown(moveTrigger, { key: 'ArrowDown' })
+    expect(screen.getByRole('menu')).toBeVisible()
+    rect = { ...rect, bottom: 445, top: 401, y: 401 }
+    fireEvent.scroll(window)
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(document.activeElement).toBe(moveTrigger)
+
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: originalVisualViewport,
+    })
+  })
+
+  it('requires confirmation before an input add moves an identity from another bucket', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      required: [{ name: 'Rice', canonicalIngredientId: null }],
+    })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${query}`)
+    await screen.findByText('Saffron rice')
+
+    const excludedInput = screen.getByRole('combobox', { name: 'Add ingredient to Do not use' })
+    excludedInput.focus()
+    fireEvent.change(excludedInput, { target: { value: 'ＲＩＣＥ' } })
+    fireEvent.keyDown(excludedInput, { key: 'Enter' })
+    expect(screen.getByRole('dialog')).toHaveTextContent(
+      'Rice is in Must use. Move it to Do not use?',
+    )
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(document.activeElement).toBe(excludedInput))
+    expect(screen.getByText('Move canceled. No ingredients from this entry were changed.'))
+      .toBeInTheDocument()
+
+    fireEvent.change(excludedInput, { target: { value: 'rice' } })
+    fireEvent.keyDown(excludedInput, { key: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: 'Move ingredient' }))
+
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+    expect(recommendationsApi.mock.calls[1][0].required).toEqual([])
+    expect(recommendationsApi.mock.calls[1][0].excluded).toEqual([
+      { name: 'Rice', canonicalIngredientId: null },
+    ])
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Move Rice' }))
+    })
+  })
+
+  it('keeps a mixed pasted batch unchanged when any move confirmation is canceled', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      required: [{ name: 'Rice', canonicalIngredientId: null }],
+    })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${query}`)
+    await screen.findByText('Saffron rice')
+    const originalUrl = window.location.href
+
+    const excludedInput = screen.getByRole('combobox', { name: 'Add ingredient to Do not use' })
+    excludedInput.focus()
+    fireEvent.change(excludedInput, { target: { value: 'Rice, Salt' } })
+    fireEvent.keyDown(excludedInput, { key: 'Enter' })
+
+    expect(screen.getByRole('dialog')).toHaveTextContent(
+      'Rice is in Must use. Move it to Do not use?',
+    )
+    expect(screen.queryByText('Salt')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await new Promise((resolve) => window.setTimeout(resolve, 350))
+
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    expect(window.location.href).toBe(originalUrl)
+    expect(screen.getByText('Rice')).toBeVisible()
+    expect(screen.queryByText('Salt')).toBeNull()
+    expect(screen.getByText('Move canceled. No ingredients from this entry were changed.'))
+      .toBeInTheDocument()
+  })
+
+  it('confirms every conflict in a mixed batch and commits controls only once at the end', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Rice', canonicalIngredientId: null }],
+      required: [{ name: 'Pepper', canonicalIngredientId: null }],
+    })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${query}`)
+    await screen.findByText('Saffron rice')
+
+    const excludedInput = screen.getByRole('combobox', { name: 'Add ingredient to Do not use' })
+    excludedInput.focus()
+    fireEvent.change(excludedInput, { target: { value: 'Rice, Salt, Pepper' } })
+    fireEvent.keyDown(excludedInput, { key: 'Enter' })
+    expect(screen.getByRole('dialog')).toHaveTextContent(
+      'Rice is in Hope to use. Move it to Do not use?',
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move ingredient' }))
+    expect(screen.getByRole('dialog')).toHaveTextContent(
+      'Pepper is in Must use. Move it to Do not use?',
+    )
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('Salt')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move ingredient' }))
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+    expect(recommendationsApi.mock.calls[1][0].preferred).toEqual([])
+    expect(recommendationsApi.mock.calls[1][0].required).toEqual([])
+    expect(recommendationsApi.mock.calls[1][0].excluded.map(
+      (value: { name: string }) => value.name,
+    )).toEqual(['Pepper', 'Rice', 'Salt'])
+    expect(screen.getByText('2 ingredients moved to Do not use.')).toBeInTheDocument()
+  })
+
+  it('rejects a move into a full bucket without changing controls, URL, request, or focus', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const required = Array.from({ length: 100 }, (_, index) => ({
+      name: `R${index}`,
+      canonicalIngredientId: `required-${index}`,
+    }))
+    const query = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Rice', canonicalIngredientId: 'rice-id' }],
+      required,
+    })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${query}`)
+    await screen.findByText('Saffron rice')
+    const originalUrl = window.location.href
+
+    const moveTrigger = screen.getByRole('button', { name: 'Move Rice' })
+    fireEvent.click(moveTrigger)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to Must use' }))
+    await new Promise((resolve) => window.setTimeout(resolve, 350))
+
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    expect(window.location.href).toBe(originalUrl)
+    expect(screen.getByText(
+      'Must use already has 100 ingredients. Remove one before moving or adding Rice.',
+    )).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Move Rice' })).toBe(moveTrigger)
+    expect(document.activeElement).toBe(moveTrigger)
+  })
+
+  it('rejects an input add into a full bucket while retaining the typed value and focus', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const excluded = Array.from({ length: 100 }, (_, index) => ({
+      name: `X${index}`,
+      canonicalIngredientId: `excluded-${index}`,
+    }))
+    const query = encodeRecommendationControls({ ...defaults, excluded })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${query}`)
+    await screen.findByText('Saffron rice')
+    const originalUrl = window.location.href
+
+    const input = screen.getByRole('combobox', { name: 'Add ingredient to Do not use' })
+    input.focus()
+    fireEvent.change(input, { target: { value: 'Rice' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await new Promise((resolve) => window.setTimeout(resolve, 350))
+
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    expect(window.location.href).toBe(originalUrl)
+    expect(input).toHaveValue('Rice')
+    expect(document.activeElement).toBe(input)
+    expect(screen.getByText(
+      'Do not use already has 100 ingredients. Remove one before moving or adding Rice.',
+    )).toBeInTheDocument()
+  })
+
+  it('rejects an oversized staged batch before opening confirmation or clearing input', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const required = [{ name: 'Rice', canonicalIngredientId: null }]
+    const excluded: Array<{ name: string; canonicalIngredientId: null }> = []
+    let overflowName = ''
+    for (let index = 0; index < 100; index += 1) {
+      const name = `${index}-${'x'.repeat(110)}`
+      const query = encodeRecommendationControls({
+        ...defaults,
+        required,
+        excluded: [...excluded, { name, canonicalIngredientId: null }],
+      })
+      if (query.length > RECOMMENDATION_URL_MAX_LENGTH) {
+        overflowName = name
+        break
+      }
+      excluded.push({ name, canonicalIngredientId: null })
+    }
+    expect(overflowName).not.toBe('')
+    const initial = encodeRecommendationControls({ ...defaults, required, excluded })
+    expect(initial.length).toBeLessThanOrEqual(RECOMMENDATION_URL_MAX_LENGTH)
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${initial}`)
+    await screen.findByText('Saffron rice')
+    const originalUrl = window.location.href
+
+    const input = screen.getByRole('combobox', { name: 'Add ingredient to Do not use' })
+    const batch = `Rice, ${overflowName}`
+    input.focus()
+    fireEvent.change(input, { target: { value: batch } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await new Promise((resolve) => window.setTimeout(resolve, 350))
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(input).toHaveValue(batch)
+    expect(document.activeElement).toBe(input)
+    expect(window.location.href).toBe(originalUrl)
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    expect(screen.getByText(
+      'These ingredient filters are too large to save in the page link. No filters were changed.',
+    )).toBeInTheDocument()
+  })
+
+  it('cancels a stale add confirmation after popstate and rejects its detached confirm action', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const initial = encodeRecommendationControls({
+      ...defaults,
+      required: [{ name: 'Rice', canonicalIngredientId: null }],
+    })
+    const restored = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Salt', canonicalIngredientId: null }],
+    })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', `/recommendations?${initial}`)
+    await screen.findByText('Saffron rice')
+
+    const excludedInput = screen.getByRole('combobox', { name: 'Add ingredient to Do not use' })
+    excludedInput.focus()
+    fireEvent.change(excludedInput, { target: { value: 'Rice' } })
+    fireEvent.keyDown(excludedInput, { key: 'Enter' })
+    const staleConfirm = screen.getByRole('button', { name: 'Move ingredient' })
+
+    window.history.replaceState({}, '', `/recommendations?${restored}`)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+    expect(screen.getByText(
+      'The page changed, so the pending move was canceled. No filters were changed.',
+    )).toBeInTheDocument()
+
+    fireEvent.click(staleConfirm)
+    await new Promise((resolve) => window.setTimeout(resolve, 350))
+    expect(recommendationsApi).toHaveBeenCalledTimes(2)
+    expect(recommendationsApi.mock.calls[1][0].preferred).toEqual([
+      { name: 'Salt', canonicalIngredientId: null },
+    ])
+    expect(recommendationsApi.mock.calls[1][0].required).toEqual([])
+    expect(recommendationsApi.mock.calls[1][0].excluded).toEqual([])
+  })
+
+  it('invalidates a pending request when a chip moves and ignores its late response', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Rice', canonicalIngredientId: null }],
+    })
+    let resolveOld!: (value: Recommendation[]) => void
+    let resolveMoved!: (value: Recommendation[]) => void
+    recommendationsApi.mockReset()
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve }))
+      .mockReturnValueOnce(new Promise((resolve) => { resolveMoved = resolve }))
+    renderRecommendations('en', `/recommendations?${query}`)
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move Rice' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to Do not use' }))
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+
+    const moved = recommendation()
+    moved.recipe = { ...moved.recipe, title: 'Moved filters result' }
+    resolveMoved([moved])
+    expect(await screen.findByText('Moved filters result')).toBeVisible()
+
+    const stale = recommendation()
+    stale.recipe = { ...stale.recipe, title: 'Late pre-move result' }
+    resolveOld([stale])
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    expect(screen.queryByText('Late pre-move result')).not.toBeInTheDocument()
+    expect(screen.getByText('Moved filters result')).toBeVisible()
+  })
+
+  it('restores complete pre-move buckets on popstate and rejects the pending move response', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const beforeMove = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Rice', canonicalIngredientId: null }],
+    })
+    let resolveMove!: (value: Recommendation[]) => void
+    const restored = recommendation()
+    restored.recipe = { ...restored.recipe, title: 'Restored before-move result' }
+    recommendationsApi.mockReset()
+      .mockResolvedValueOnce([recommendation()])
+      .mockReturnValueOnce(new Promise((resolve) => { resolveMove = resolve }))
+      .mockResolvedValueOnce([restored])
+    renderRecommendations('en', `/recommendations?${beforeMove}`)
+    await screen.findByText('Saffron rice')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move Rice' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to Do not use' }))
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+
+    window.history.replaceState({}, '', `/recommendations?${beforeMove}`)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    expect(await screen.findByText('Restored before-move result')).toBeVisible()
+    expect(recommendationsApi.mock.calls[2][0].preferred).toEqual([
+      { name: 'Rice', canonicalIngredientId: null },
+    ])
+    expect(recommendationsApi.mock.calls[2][0].excluded).toEqual([])
+
+    const stale = recommendation()
+    stale.recipe = { ...stale.recipe, title: 'Pending moved result' }
+    resolveMove([stale])
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    expect(screen.queryByText('Pending moved result')).not.toBeInTheDocument()
+    expect(screen.getByText('Restored before-move result')).toBeVisible()
   })
 
   it('downgrades only an unavailable URL-origin canonical identity and retries by name', async () => {

@@ -91,6 +91,7 @@ Store off-host encrypted copies and regularly test restoration. Normalized recip
 - verify Google-first exact-email OTP linking, Gmail email-first Google convergence, non-Gmail rejection, and pre-existing split-account recovery without account merging
 - verify private recipe and pantry isolation with two accounts
 - open, refresh, copy, and reopen a versioned recommendation URL; verify identical filter/source request semantics, Back/Forward restoration, automatic debounce, retained results on failure, Retry, and no pantry/shopping/account/token/private-recipe data in the URL
+- move canonical and unresolved recommendation ingredients among desired, must-use, and do-not-use with keyboard and touch; verify one URL replacement/request per committed move or confirmed batch, target-chip focus, localized live announcements, explicit cross-bucket add confirmation, full-bucket and oversized-URL rollback, Back/Forward cancellation of stale dialogs, visual-viewport collision handling and reference-hidden closure at 320px/zoom, and no duplicate identity or intermediate conflicting URL
 - share a URL whose canonical ingredient is visible only through the sender's private pantry/recipe/alias; verify the receiver gets an explained name-only downgrade, while a directly selected unauthorized canonical ID remains rejected
 - verify private cover denial, public cover delivery, scoped AI token denial, and owner revision acceptance without sending a real token in logs
 - verify READY/VERIFY/SHOP ordering and that ingredient-scope hard filters omit ineligible recipes

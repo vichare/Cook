@@ -2,13 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api } from './api'
 import { localDateValue } from './ingredients'
 import {
-  canonicalizeRecommendationControls,
   encodeRecommendationControls,
   parseRecommendationControls,
-  RECOMMENDATION_URL_MAX_LENGTH,
   recommendationControlsFromSettings,
   recommendationControlsKey,
   tryDowngradeRecommendationCanonicalIds,
+  validateRecommendationControls,
   type RecommendationControls,
   type RecommendationUrlIssue,
 } from './recommendation-url'
@@ -22,10 +21,16 @@ export interface RecommendationResultState {
   status: 'idle' | 'loading' | 'success' | 'error'
 }
 
+export type RecommendationControlsCommitResult =
+  | { controls: RecommendationControls; status: 'committed' }
+  | { controls: RecommendationControls; status: 'unchanged' }
+  | { controls: RecommendationControls; reason: 'oversized'; status: 'rejected' }
+
 export function useRecommendationWorkbench(settings: RecommendationSettings | undefined) {
   const [controls, setControlsState] = useState<RecommendationControls | null>(null)
   const [activeControls, setActiveControls] = useState<RecommendationControls | null>(null)
   const [urlIssues, setUrlIssues] = useState<RecommendationUrlIssue[]>([])
+  const [locationGeneration, setLocationGeneration] = useState(0)
   const [retrySequence, setRetrySequence] = useState(0)
   const [results, setResults] = useState<RecommendationResultState>({
     data: [],
@@ -59,6 +64,7 @@ export function useRecommendationWorkbench(settings: RecommendationSettings | un
     scheduledRequestKey.current = activeKeyRef.current
     urlCanonicalIds.current = canonicalIds(parsed.controls)
     latestControls.current = parsed.controls
+    setLocationGeneration((generation) => generation + 1)
     setUrlIssues(parsed.issues)
     setControlsState(parsed.controls)
     setActiveControls(parsed.controls)
@@ -194,15 +200,16 @@ export function useRecommendationWorkbench(settings: RecommendationSettings | un
   }, [activeControls, retrySequence])
 
   const setControls = useCallback((next: RecommendationControls) => {
-    const canonical = canonicalizeRecommendationControls(next)
-    if (encodeRecommendationControls(canonical).length > RECOMMENDATION_URL_MAX_LENGTH) {
+    const validation = validateRecommendationControls(next)
+    const canonical = validation.controls
+    if (validation.status === 'oversized') {
       setUrlIssues((issues) => [...new Set([...issues, 'oversized' as const])])
-      return
+      return { controls: canonical, reason: 'oversized', status: 'rejected' } as const
     }
     if (
       latestControls.current
       && recommendationControlsKey(latestControls.current) === recommendationControlsKey(canonical)
-    ) return
+    ) return { controls: canonical, status: 'unchanged' } as const
     const retainedCanonicalIds = canonicalIds(canonical)
     urlCanonicalIds.current = new Set(
       [...urlCanonicalIds.current].filter((id) => retainedCanonicalIds.has(id)),
@@ -211,6 +218,7 @@ export function useRecommendationWorkbench(settings: RecommendationSettings | un
     invalidateActiveRequest()
     setResults((current) => ({ ...current, error: null, status: 'loading' }))
     setControlsState(canonical)
+    return { controls: canonical, status: 'committed' } as const
   }, [invalidateActiveRequest])
 
   const retry = useCallback(() => {
@@ -239,6 +247,7 @@ export function useRecommendationWorkbench(settings: RecommendationSettings | un
   return {
     activeControls,
     controls,
+    locationGeneration,
     results,
     retry,
     setControls,

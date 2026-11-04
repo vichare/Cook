@@ -212,8 +212,15 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .ingredient-option span, .ingredient-option small { color: #435248; }
 .ingredient-filter { min-width: 0; display: grid; gap: .65rem; }
 .ingredient-chips { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: .5rem; }
-.ingredient-chips li { display: flex; align-items: center; gap: .4rem; padding: .25rem .25rem .25rem .7rem; border: 1px solid var(--line); border-radius: 999px; background: white; }
-.ingredient-chips .button { min-height: 36px; }
+.ingredient-chips li { max-width: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; padding: .25rem .25rem .25rem .7rem; border: 1px solid var(--line); border-radius: 1.4rem; background: white; }
+.ingredient-chips li > span { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+.ingredient-chips .button { min-height: 44px; }
+.ingredient-move-menu { display: inline-flex; }
+.ingredient-move-trigger[aria-expanded="true"] { box-shadow: inset 0 0 0 2px var(--forest); }
+.ingredient-move-menu-items { position: fixed; z-index: 18; max-width: calc(100vw - 24px); overflow-y: auto; display: grid; gap: .25rem; padding: .4rem; border: 2px solid var(--forest); border-radius: .8rem; background: white; box-shadow: var(--shadow); }
+.ingredient-move-menu-item { min-height: 44px; padding: .65rem .75rem; border: 0; border-radius: .55rem; background: white; color: inherit; text-align: left; cursor: pointer; font-weight: 750; }
+.ingredient-move-menu-item:hover, .ingredient-move-menu-item:focus-visible { background: #e4ecdf; }
+.recommendation-move-confirmation { display: grid; align-content: start; gap: 1rem; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 760px) {
@@ -233,7 +240,7 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 }
 
 @media (forced-colors: active) {
-  .status, .button, input, textarea, select, .ingredient-option, .purchase-sheet, .remove-shopping-dialog, .desktop-nav a, .mobile-nav-dialog, .mobile-nav-dialog nav a, .pantry-status-badge, .metric, .optional-badge, .active-filter, .blocked-recommendations { border: 1px solid ButtonText; }
+  .status, .button, input, textarea, select, .ingredient-option, .ingredient-move-menu-items, .ingredient-move-menu-item, .purchase-sheet, .remove-shopping-dialog, .desktop-nav a, .mobile-nav-dialog, .mobile-nav-dialog nav a, .pantry-status-badge, .metric, .optional-badge, .active-filter, .blocked-recommendations { border: 1px solid ButtonText; }
   .recipe-title-link { color: LinkText; }
   .metric { color: LinkText; }
   .destructive { color: ButtonText; background: Canvas; border-width: 2px; }

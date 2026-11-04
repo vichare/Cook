@@ -43,6 +43,17 @@ export interface RecommendationUrlParseResult {
   hadUrlState: boolean
 }
 
+export type RecommendationControlsValidationResult =
+  | {
+    controls: RecommendationControls
+    query: string
+    status: 'valid'
+  }
+  | {
+    controls: RecommendationControls
+    status: 'oversized'
+  }
+
 const bucketParameters = [
   ['preferred', 'p'],
   ['required', 'r'],
@@ -107,6 +118,16 @@ export function canonicalizeRecommendationControls(
 
 export function recommendationControlsKey(controls: RecommendationControls): string {
   return encodeRecommendationControls(controls)
+}
+
+export function validateRecommendationControls(
+  controls: RecommendationControls,
+): RecommendationControlsValidationResult {
+  const canonical = canonicalizeRecommendationControls(controls)
+  const query = encodeRecommendationControls(canonical)
+  return query.length > RECOMMENDATION_URL_MAX_LENGTH
+    ? { controls: canonical, status: 'oversized' }
+    : { controls: canonical, query, status: 'valid' }
 }
 
 export interface RecommendationCanonicalDowngradeResult {

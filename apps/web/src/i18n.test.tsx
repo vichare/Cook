@@ -49,4 +49,21 @@ describe('i18n', () => {
     expect(translateMessage('zh-CN', 'import.sourceAuthor', { author: '来源用户' }))
       .toContain('来源作者')
   })
+
+  it('localizes recommendation ingredient moves without implementation terminology', () => {
+    expect(translateMessage('en', 'recommend.moveConfirmDescription', {
+      name: 'Rice',
+      from: 'Must use',
+      to: 'Do not use',
+    })).toBe('Rice is in Must use. Move it to Do not use?')
+    expect(translateMessage('zh-CN', 'recommend.moveConfirmDescription', {
+      name: '米饭',
+      from: '必须使用',
+      to: '禁止使用',
+    })).toBe('米饭 目前在必须使用。移到禁止使用吗？')
+    expect(translateMessage('zh-CN', 'recommend.moveSuccess', {
+      name: '米饭',
+      bucket: '必须使用',
+    })).not.toMatch(/canonical|normalization|identity/i)
+  })
 })
