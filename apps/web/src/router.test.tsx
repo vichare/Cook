@@ -244,6 +244,52 @@ describe('shopping list', () => {
     await waitFor(() => expect(purchaseShoppingItem).toHaveBeenCalled())
   })
 
+  it('defaults an uncertain concrete pantry match to creating with the typed name', async () => {
+    shoppingItems.mockReset().mockResolvedValue([{
+      id: 'manual-scallion',
+      name: 'Scallion',
+      canonicalIngredientId: null,
+      automatic: false,
+      pantryItemId: null,
+      sources: [{ kind: 'manual', label: '', recipeId: null }],
+      version: 2,
+      purchaseOptions: {
+        resolution: 'choice',
+        candidates: [{
+          id: 'pantry-green-onion', name: 'Green onion', status: 'unknown', quantityNote: '',
+          expiresOn: null, canonicalIngredientId: 'green-onion',
+          autoAddToShoppingListWhenOut: false, version: 4,
+        }],
+      },
+    }])
+    purchaseShoppingItem.mockReset().mockResolvedValue({
+      pantry: {
+        id: 'new-scallion', name: 'Scallion', status: 'have', quantityNote: '',
+        confirmedAt: '2026-11-04T00:00:00Z', expiresOn: null,
+        canonicalIngredientId: null, autoAddToShoppingListWhenOut: false, version: 1,
+      },
+      shoppingItems: [],
+      purchaseActionId: 'purchase-scallion',
+      undoAvailable: true,
+    })
+    render(<Providers><ShoppingListPage /></Providers>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Bought Scallion' }))
+    expect(screen.getByRole('radio', { name: 'Create with this name: Scallion' })).toBeChecked()
+    expect(screen.getByRole('radio', {
+      name: /Use existing pantry item: Green onion/,
+    })).not.toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: 'Save to pantry and remove from list' }))
+    await waitFor(() => expect(purchaseShoppingItem).toHaveBeenCalledWith(
+      'manual-scallion',
+      expect.objectContaining({
+        pantryItemId: null,
+        pantryExpectedVersion: null,
+        createUsingCurrentName: true,
+      }),
+      expect.any(String),
+    ))
+  })
+
   it('explains automatic-only removal, uses the disable action, and restores focus on cancel', async () => {
     shoppingItems.mockReset().mockResolvedValue([{
       id: 'auto:pantry-1',
@@ -1671,7 +1717,8 @@ describe('ingredient groups and homepage navigation', () => {
     fireEvent.click(screen.getByRole('radio', { name: 'Milk' }))
     expect(screen.getByRole('button', { name: 'Save to pantry and remove from list' })).toBeEnabled()
     fireEvent.click(screen.getByRole('radio', { name: 'Oat milk' }))
-    expect(screen.getByRole('button', { name: 'Save to pantry and remove from list' })).toBeDisabled()
+    expect(screen.getByRole('radio', { name: /Create with this name: Oat milk/ })).toBeChecked()
+    expect(screen.getByRole('button', { name: 'Save to pantry and remove from list' })).toBeEnabled()
     fireEvent.click(screen.getByRole('radio', { name: /Use existing pantry item: Oat carton/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Save to pantry and remove from list' }))
     await waitFor(() => expect(purchaseShoppingItem).toHaveBeenCalledWith(

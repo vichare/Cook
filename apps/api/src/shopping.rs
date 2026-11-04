@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    ingredients::{bounded_levenshtein, clean_display_name, normalize_ingredient},
+    ingredients::{clean_display_name, normalize_ingredient},
     models::{
         PantryItem, PantryPurchaseCandidate, PantryStatus, ShoppingChoiceAlternative, ShoppingItem,
         ShoppingItemInput, ShoppingItemSource, ShoppingPurchaseOptions,
@@ -55,7 +55,7 @@ pub struct PurchaseInput {
     #[serde(default)]
     pantry_item_id: Option<String>,
     #[serde(default)]
-    create_using_current_name: bool,
+    create_using_current_name: Option<bool>,
     #[serde(default)]
     pantry_expected_version: Option<i64>,
     #[serde(default)]
@@ -538,17 +538,18 @@ pub async fn purchase_item(
     .await?;
     let automatic_match =
         deterministic_reuse(&candidates, canonical_id.as_deref(), &normalized_name);
-    if input.create_using_current_name && automatic_match.is_some() {
+    let force_create = input.create_using_current_name == Some(true);
+    if force_create && automatic_match.is_some() {
         return Err(AppError::Conflict(
             "an exact pantry item already exists".into(),
         ));
     }
-    let selected_id = if input.create_using_current_name {
+    let selected_id = if force_create {
         None
     } else {
         input.pantry_item_id.clone().or(automatic_match)
     };
-    if selected_id.is_none() && !input.create_using_current_name && !candidates.is_empty() {
+    if selected_id.is_none() && !force_create && !candidates.is_empty() {
         return Err(AppError::Conflict("pantry match choice is required".into()));
     }
     let pantry_before = if let Some(id) = &selected_id {
@@ -1191,21 +1192,16 @@ fn pantry_candidates_from_context(
     let alias_ids = context.aliases.get(normalized_name);
     let mut candidates = Vec::new();
     for row in &context.rows {
-        let fuzzy = row.canonical_name.as_deref().is_some_and(|candidate| {
-            let max = if normalized_name.chars().count() <= 5 {
-                1
-            } else {
-                2
-            };
-            bounded_levenshtein(normalized_name, candidate, max).is_some()
-        });
-        let matches = row.normalized_name == normalized_name
-            || canonical_id.is_some() && row.canonical_ingredient_id.as_deref() == canonical_id
-            || row
-                .canonical_ingredient_id
-                .as_ref()
-                .is_some_and(|id| alias_ids.is_some_and(|aliases| aliases.contains(id)))
-            || fuzzy;
+        let matches = if let Some(canonical_id) = canonical_id {
+            row.canonical_ingredient_id.as_deref() == Some(canonical_id)
+        } else {
+            (row.canonical_ingredient_id.is_none() && row.normalized_name == normalized_name)
+                || row.canonical_name.as_deref() == Some(normalized_name)
+                || row
+                    .canonical_ingredient_id
+                    .as_ref()
+                    .is_some_and(|id| alias_ids.is_some_and(|aliases| aliases.contains(id)))
+        };
         if matches {
             candidates.push(PantryPurchaseCandidate {
                 id: row.id.clone(),
@@ -1225,18 +1221,14 @@ fn pantry_candidates_from_context(
 fn deterministic_reuse(
     candidates: &[PantryPurchaseCandidate],
     canonical_id: Option<&str>,
-    normalized_name: &str,
+    _normalized_name: &str,
 ) -> Option<String> {
-    let exact: Vec<_> = candidates
+    let exact = candidates
         .iter()
-        .filter(|candidate| match canonical_id {
-            Some(id) => candidate.canonical_ingredient_id.as_deref() == Some(id),
-            None => {
-                candidate.canonical_ingredient_id.is_none()
-                    && normalize_ingredient(&candidate.name) == normalized_name
-            }
+        .filter(|candidate| {
+            canonical_id.is_none_or(|id| candidate.canonical_ingredient_id.as_deref() == Some(id))
         })
-        .collect();
+        .collect::<Vec<_>>();
     (exact.len() == 1).then(|| exact[0].id.clone())
 }
 
@@ -1780,7 +1772,7 @@ fn validate_purchase_input(input: &PurchaseInput) -> AppResult<()> {
         chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
             .map_err(|_| AppError::Validation("expiration must be an ISO date".into()))?;
     }
-    if input.create_using_current_name && input.pantry_item_id.is_some() {
+    if input.create_using_current_name == Some(true) && input.pantry_item_id.is_some() {
         return Err(AppError::Validation(
             "choose either an existing pantry item or create using the current name".into(),
         ));
@@ -2057,8 +2049,9 @@ mod tests {
             candidate("same", "  Milk ", None),
             candidate("canonical", "Milk", Some("canonical-milk")),
         ];
+        assert_eq!(deterministic_reuse(&unresolved, None, "milk"), None);
         assert_eq!(
-            deterministic_reuse(&unresolved, None, "milk"),
+            deterministic_reuse(&unresolved[..1], None, "milk"),
             Some("same".into())
         );
         let ambiguous = vec![
@@ -2066,5 +2059,86 @@ mod tests {
             candidate("two", "Ｍｉｌｋ", None),
         ];
         assert_eq!(deterministic_reuse(&ambiguous, None, "milk"), None);
+    }
+
+    #[test]
+    fn pantry_candidates_use_only_whole_term_strict_identity() {
+        let context = PantryCandidateContext {
+            rows: vec![
+                PantryCandidateRow {
+                    id: "oil".into(),
+                    name: "油".into(),
+                    normalized_name: "油".into(),
+                    status: PantryStatus::Have,
+                    quantity_note: String::new(),
+                    expires_on: None,
+                    canonical_ingredient_id: Some("oil-id".into()),
+                    auto_add_to_shopping_list_when_out: false,
+                    version: 1,
+                    canonical_name: Some("油".into()),
+                },
+                PantryCandidateRow {
+                    id: "wing".into(),
+                    name: "鸡翅".into(),
+                    normalized_name: "鸡翅".into(),
+                    status: PantryStatus::Have,
+                    quantity_note: String::new(),
+                    expires_on: None,
+                    canonical_ingredient_id: Some("wing-id".into()),
+                    auto_add_to_shopping_list_when_out: false,
+                    version: 1,
+                    canonical_name: Some("鸡翅".into()),
+                },
+                PantryCandidateRow {
+                    id: "breast".into(),
+                    name: "鸡胸肉".into(),
+                    normalized_name: "鸡胸肉".into(),
+                    status: PantryStatus::Have,
+                    quantity_note: String::new(),
+                    expires_on: None,
+                    canonical_ingredient_id: Some("breast-id".into()),
+                    auto_add_to_shopping_list_when_out: false,
+                    version: 1,
+                    canonical_name: Some("鸡胸肉".into()),
+                },
+                PantryCandidateRow {
+                    id: "typo".into(),
+                    name: "Tomoto".into(),
+                    normalized_name: "tomoto".into(),
+                    status: PantryStatus::Have,
+                    quantity_note: String::new(),
+                    expires_on: None,
+                    canonical_ingredient_id: Some("tomato-id".into()),
+                    auto_add_to_shopping_list_when_out: false,
+                    version: 1,
+                    canonical_name: Some("tomato".into()),
+                },
+            ],
+            aliases: HashMap::from([("鸡胸脯肉".into(), HashSet::from(["breast-id".into()]))]),
+        };
+        assert!(pantry_candidates_from_context(&context, "酱油", None).is_empty());
+        assert!(pantry_candidates_from_context(&context, "鸡腿", None).is_empty());
+        assert_eq!(
+            pantry_candidates_from_context(&context, "鸡胸脯肉", None)[0].id,
+            "breast"
+        );
+        assert!(pantry_candidates_from_context(&context, "鸡胸脯", None).is_empty());
+        assert!(pantry_candidates_from_context(&context, "tomoto", None).is_empty());
+        assert_eq!(
+            pantry_candidates_from_context(&context, "anything", Some("oil-id"))[0].id,
+            "oil"
+        );
+    }
+
+    #[test]
+    fn purchase_input_defaults_to_safe_create_when_unspecified() {
+        let input: PurchaseInput = serde_json::from_value(serde_json::json!({
+            "disposition": "remove",
+            "shoppingExpectedVersion": 1,
+            "quantityNote": "",
+            "autoAddToShoppingListWhenOut": false
+        }))
+        .unwrap();
+        assert_eq!(input.create_using_current_name, None);
     }
 }

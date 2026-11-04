@@ -1376,11 +1376,19 @@ async fn ingredient_suggestions(
              WHERE ri.canonical_ingredient_id = c.id
                AND (r.owner_id = ? OR r.visibility = 'public')
          ) OR EXISTS (
+             SELECT 1
+             FROM recipe_ingredient_alternatives ria
+             JOIN recipe_ingredient_groups rig ON rig.id = ria.group_id
+             JOIN recipes r ON r.id = rig.recipe_id
+             WHERE ria.canonical_ingredient_id = c.id
+               AND (r.owner_id = ? OR r.visibility = 'public')
+         ) OR EXISTS (
              SELECT 1 FROM ingredient_aliases a
              WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?
          )
          LIMIT ?",
     )
+    .bind(&user.id)
     .bind(&user.id)
     .bind(&user.id)
     .bind(&user.id)
@@ -1438,6 +1446,15 @@ async fn ingredient_suggestions(
         left.reason
             .cmp(&right.reason)
             .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+    let mut similar_count = 0usize;
+    suggestions.retain(|suggestion| {
+        if suggestion.reason == MatchReason::Similar {
+            similar_count += 1;
+            similar_count <= 2
+        } else {
+            true
+        }
     });
     suggestions.truncate(8);
     Ok(Json(suggestions))
@@ -2084,41 +2101,55 @@ async fn resolve_canonical_ingredient(
             ));
         }
         selected_id.to_string()
-    } else if let Some(alias_id) = sqlx::query_scalar(
-        "SELECT canonical_ingredient_id FROM ingredient_aliases
-         WHERE owner_id = ? AND alias_normalized = ?",
-    )
-    .bind(owner_id)
-    .bind(&normalized)
-    .fetch_optional(&mut **transaction)
-    .await?
-    {
-        alias_id
     } else {
-        sqlx::query(
-            "INSERT INTO ingredient_catalog
+        let exact_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM ingredient_catalog WHERE normalized_name = ?")
+                .bind(&normalized)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        let alias_id: Option<String> = sqlx::query_scalar(
+            "SELECT canonical_ingredient_id FROM ingredient_aliases
+             WHERE owner_id = ? AND alias_normalized = ?",
+        )
+        .bind(owner_id)
+        .bind(&normalized)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if exact_id.is_some() && alias_id.is_some() && exact_id != alias_id {
+            return Err(AppError::Validation(
+                "ingredient identity is ambiguous; select canonicalIngredientId".into(),
+            ));
+        }
+        if let Some(id) = exact_id.or(alias_id) {
+            id
+        } else {
+            sqlx::query(
+                "INSERT INTO ingredient_catalog
              (id, normalized_name, display_name, created_at)
              VALUES (?, ?, ?, ?)
              ON CONFLICT(normalized_name) DO NOTHING",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&normalized)
-        .bind(&display_name)
-        .bind(Utc::now().timestamp())
-        .execute(&mut **transaction)
-        .await?;
-        sqlx::query_scalar("SELECT id FROM ingredient_catalog WHERE normalized_name = ?")
+            )
+            .bind(Uuid::new_v4().to_string())
             .bind(&normalized)
-            .fetch_one(&mut **transaction)
-            .await?
+            .bind(&display_name)
+            .bind(Utc::now().timestamp())
+            .execute(&mut **transaction)
+            .await?;
+            sqlx::query_scalar("SELECT id FROM ingredient_catalog WHERE normalized_name = ?")
+                .bind(&normalized)
+                .fetch_one(&mut **transaction)
+                .await?
+        }
     };
     if selected_id.is_some() {
-        let canonical_normalized: String =
-            sqlx::query_scalar("SELECT normalized_name FROM ingredient_catalog WHERE id = ?")
-                .bind(&canonical_id)
-                .fetch_one(&mut **transaction)
-                .await?;
+        let (canonical_normalized, canonical_display): (String, String) = sqlx::query_as(
+            "SELECT normalized_name, display_name FROM ingredient_catalog WHERE id = ?",
+        )
+        .bind(&canonical_id)
+        .fetch_one(&mut **transaction)
+        .await?;
         if canonical_normalized != normalized {
+            let advisory = match_reason(&display_name, &canonical_display, &[]);
             let alias_exists: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM ingredient_aliases
                  WHERE owner_id = ? AND alias_normalized = ?",
@@ -2127,7 +2158,12 @@ async fn resolve_canonical_ingredient(
             .bind(&normalized)
             .fetch_optional(&mut **transaction)
             .await?;
-            if alias_exists.is_none() {
+            if alias_exists.is_none()
+                && !matches!(
+                    advisory,
+                    Some(MatchReason::Prefix | MatchReason::Substring | MatchReason::Similar)
+                )
+            {
                 let alias_count: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM ingredient_aliases WHERE owner_id = ?",
                 )
@@ -2140,22 +2176,27 @@ async fn resolve_canonical_ingredient(
                     ));
                 }
             }
-            sqlx::query(
-                "INSERT INTO ingredient_aliases
+            if !matches!(
+                advisory,
+                Some(MatchReason::Prefix | MatchReason::Substring | MatchReason::Similar)
+            ) {
+                sqlx::query(
+                    "INSERT INTO ingredient_aliases
                  (id, owner_id, alias_name, alias_normalized, canonical_ingredient_id, created_at)
                  VALUES (?, ?, ?, ?, ?, ?)
                  ON CONFLICT(owner_id, alias_normalized) DO UPDATE SET
                    alias_name = excluded.alias_name,
                    canonical_ingredient_id = excluded.canonical_ingredient_id",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(owner_id)
-            .bind(&display_name)
-            .bind(&normalized)
-            .bind(&canonical_id)
-            .bind(Utc::now().timestamp())
-            .execute(&mut **transaction)
-            .await?;
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(owner_id)
+                .bind(&display_name)
+                .bind(&normalized)
+                .bind(&canonical_id)
+                .bind(Utc::now().timestamp())
+                .execute(&mut **transaction)
+                .await?;
+            }
         }
     }
     Ok(canonical_id)
@@ -2297,15 +2338,17 @@ async fn resolve_reference_id(
     .bind(&normalized)
     .fetch_optional(pool)
     .await?;
-    if alias.is_some() {
-        return Ok(alias);
-    }
-    Ok(
+    let exact: Option<String> =
         sqlx::query_scalar("SELECT id FROM ingredient_catalog WHERE normalized_name = ?")
             .bind(normalized)
             .fetch_optional(pool)
-            .await?,
-    )
+            .await?;
+    if exact.is_some() && alias.is_some() && exact != alias {
+        return Err(AppError::Validation(
+            "ingredient identity is ambiguous; select canonicalIngredientId".into(),
+        ));
+    }
+    Ok(exact.or(alias))
 }
 
 async fn canonical_ingredient_is_visible_pool(
@@ -2350,17 +2393,14 @@ fn matched_suggestion_text(
     aliases: &[String],
     reason: MatchReason,
 ) -> String {
-    if match_reason(query, canonical, &[]) == Some(reason) {
+    if reason != MatchReason::Alias && match_reason(query, canonical, &[]) == Some(reason) {
         return canonical.to_string();
     }
     aliases
         .iter()
         .find(|alias| {
-            let alias_reason = match match_reason(query, alias, &[]) {
-                Some(MatchReason::Exact) => Some(MatchReason::Alias),
-                value => value,
-            };
-            alias_reason == Some(reason)
+            reason == MatchReason::Alias
+                && normalize_ingredient(query) == normalize_ingredient(alias)
         })
         .cloned()
         .unwrap_or_else(|| canonical.to_string())
@@ -7595,7 +7635,7 @@ mod tests {
         let owner_suggestions = app
             .clone()
             .oneshot(
-                Request::get("/api/ingredients/suggestions?q=tomtao")
+                Request::get("/api/ingredients/suggestions?q=tomoto")
                     .header("cookie", &owner_cookie)
                     .body(Body::empty())
                     .unwrap(),
@@ -7743,6 +7783,466 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingredient_suggestions_keep_cjk_terms_distinct_and_aliases_explicit() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "CJK owner").await;
+        let pantry = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([
+                            {"name": "酱油", "status": "have", "quantityNote": ""},
+                            {"name": "油", "status": "have", "quantityNote": ""},
+                            {"name": "鸡腿", "status": "have", "quantityNote": ""},
+                            {"name": "鸡翅", "status": "have", "quantityNote": ""},
+                            {"name": "鸡胸肉", "status": "have", "quantityNote": ""},
+                            {"name": "Soy Sauce", "status": "have", "quantityNote": ""},
+                            {"name": "Tomato", "status": "have", "quantityNote": ""},
+                            {"name": "baton", "status": "have", "quantityNote": ""},
+                            {"name": "caton", "status": "have", "quantityNote": ""},
+                            {"name": "haton", "status": "have", "quantityNote": ""}
+                        ])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pantry.status(), StatusCode::OK);
+        let pantry = response_json(pantry).await;
+        let id_for = |name: &str| {
+            pantry
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap()["canonicalIngredientId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        for (query, expected) in [
+            ("%E9%85%B1%E6%B2%B9", "酱油"),
+            ("%E6%B2%B9", "油"),
+            ("%E9%B8%A1%E8%85%BF", "鸡腿"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/ingredients/suggestions?q={query}"))
+                        .header("cookie", &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let response = response_json(response).await;
+            assert_eq!(response.as_array().unwrap().len(), 1);
+            assert_eq!(response[0]["displayName"], expected);
+            assert_eq!(response[0]["reason"], "exact");
+        }
+        let single_han = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=%E9%B8%A1")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(single_han).await, json!([]));
+
+        let normalized_exact = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=%20%EF%BC%B3%EF%BC%AF%EF%BC%B9%E3%80%80%EF%BC%B3%EF%BC%A1%EF%BC%B5%EF%BC%A3%EF%BC%A5%20")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let normalized_exact = response_json(normalized_exact).await;
+        assert_eq!(normalized_exact[0]["displayName"], "Soy Sauce");
+        assert_eq!(normalized_exact[0]["reason"], "exact");
+
+        let fuzzy = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=maton")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let fuzzy = response_json(fuzzy).await;
+        assert_eq!(fuzzy.as_array().unwrap().len(), 2);
+        assert!(fuzzy
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["reason"] == "similar"));
+
+        let fuzzy_selection = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": "Tomoto",
+                            "status": "have",
+                            "quantityNote": "",
+                            "canonicalIngredientId": id_for("Tomato")
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fuzzy_selection.status(), StatusCode::OK);
+        let still_advisory = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=tomoto")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(still_advisory).await[0]["reason"], "similar");
+
+        let confirmed_alias = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": "鸡胸脯肉",
+                            "status": "have",
+                            "quantityNote": "",
+                            "canonicalIngredientId": id_for("鸡胸肉")
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed_alias.status(), StatusCode::OK);
+        let alias = app
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=%E9%B8%A1%E8%83%B8%E8%84%AF%E8%82%89")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let alias = response_json(alias).await;
+        assert_eq!(alias.as_array().unwrap().len(), 1);
+        assert_eq!(alias[0]["displayName"], "鸡胸肉");
+        assert_eq!(alias[0]["reason"], "alias");
+    }
+
+    #[tokio::test]
+    async fn separate_cjk_ingredients_survive_recipe_recommend_shop_and_purchase() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "CJK lifecycle").await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "双油菜",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "visibility": "private",
+                            "ingredients": [
+                                {"name": "酱油", "quantityNote": "1 tbsp"},
+                                {"name": "油", "quantityNote": "1 tbsp"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let recipe = response_json(created).await;
+        let recipe_id = recipe["id"].as_str().unwrap().to_string();
+        let ingredients = recipe["ingredients"].as_array().unwrap();
+        assert_eq!(ingredients.len(), 2);
+        assert_ne!(
+            ingredients[0]["canonicalIngredientId"],
+            ingredients[1]["canonicalIngredientId"]
+        );
+
+        let soy_only = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Only soy",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "visibility": "private",
+                            "ingredients": [{"name": "酱油", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(soy_only.status(), StatusCode::CREATED);
+        let soy_only_id = response_json(soy_only).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let oil_required = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(json!({"required": ["油"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let oil_required = response_json(oil_required).await;
+        assert!(oil_required
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["recipe"]["id"] == recipe_id));
+        assert!(!oil_required
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["recipe"]["id"] == soy_only_id));
+
+        for ingredient in ingredients {
+            let added = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/recipes/{recipe_id}/shopping-list-items"))
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .body(Body::from(
+                            json!({
+                                "name": ingredient["name"],
+                                "canonicalIngredientId": ingredient["canonicalIngredientId"]
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!([StatusCode::OK, StatusCode::CREATED].contains(&added.status()));
+        }
+        let shopping = app
+            .clone()
+            .oneshot(
+                Request::get("/api/shopping-list")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let shopping = response_json(shopping).await;
+        assert_eq!(shopping.as_array().unwrap().len(), 2);
+        assert!(shopping
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "酱油"));
+        assert!(shopping
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "油"));
+
+        for (index, item) in shopping.as_array().unwrap().iter().enumerate() {
+            let purchased = app
+                .clone()
+                .oneshot(
+                    Request::post(format!(
+                        "/api/shopping-list/{}/purchase",
+                        item["id"].as_str().unwrap()
+                    ))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header(
+                        "idempotency-key",
+                        format!("{}.cjk-{index}", Utc::now().timestamp()),
+                    )
+                    .body(Body::from(
+                        json!({
+                            "disposition": "remove",
+                            "shoppingExpectedVersion": item["version"],
+                            "quantityNote": "",
+                            "autoAddToShoppingListWhenOut": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(purchased.status(), StatusCode::OK);
+        }
+        let pantry = app
+            .clone()
+            .oneshot(
+                Request::get("/api/pantry")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pantry = response_json(pantry).await;
+        let soy = pantry
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "酱油")
+            .unwrap();
+        let oil = pantry
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "油")
+            .unwrap();
+        assert_ne!(soy["canonicalIngredientId"], oil["canonicalIngredientId"]);
+
+        let recommendations = app
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let recommendations = response_json(recommendations).await;
+        let lifecycle = recommendations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == recipe_id)
+            .unwrap();
+        assert_eq!(lifecycle["status"], "READY");
+        assert_eq!(lifecycle["available"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shopping_does_not_offer_contained_cjk_terms_as_purchase_candidates() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "CJK shopping").await;
+        let pantry = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([{"name": "油", "status": "have", "quantityNote": ""}]).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pantry.status(), StatusCode::OK);
+        let shopping = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(json!({"name": "酱油"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shopping.status(), StatusCode::CREATED);
+        let shopping = response_json(shopping).await;
+        assert_eq!(shopping[0]["purchaseOptions"]["resolution"], "create");
+        assert_eq!(shopping[0]["purchaseOptions"]["candidates"], json!([]));
+        let purchased = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/shopping-list/{}/purchase",
+                    shopping[0]["id"].as_str().unwrap()
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .header(
+                    "idempotency-key",
+                    format!("{}.cjk-contained", Utc::now().timestamp()),
+                )
+                .body(Body::from(
+                    json!({
+                        "disposition": "remove",
+                        "shoppingExpectedVersion": shopping[0]["version"],
+                        "quantityNote": "",
+                        "autoAddToShoppingListWhenOut": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(purchased.status(), StatusCode::OK);
+        let pantry = app
+            .oneshot(
+                Request::get("/api/pantry")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pantry = response_json(pantry).await;
+        assert_eq!(pantry.as_array().unwrap().len(), 2);
+        assert!(pantry
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "油"));
+        assert!(pantry
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "酱油"));
+    }
+
+    #[tokio::test]
     async fn ingredient_suggestions_prefer_exact_matches_and_preserve_ambiguity() {
         let (app, _, pool) = app_with_runtime().await;
         let owner_cookie = login(&app, "Exact owner").await;
@@ -7849,9 +8349,10 @@ mod tests {
         .await
         .unwrap();
         let ambiguous = app
+            .clone()
             .oneshot(
                 Request::get("/api/ingredients/suggestions?q=tomato")
-                    .header("cookie", owner_cookie)
+                    .header("cookie", &owner_cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -7864,6 +8365,26 @@ mod tests {
             .unwrap()
             .iter()
             .all(|item| item["reason"] == "exact" || item["reason"] == "alias"));
+        let unsafe_implicit_resolution = app
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Ambiguous tomato",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "visibility": "private",
+                            "ingredients": [{"name": "Tomato", "quantityNote": ""}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsafe_implicit_resolution.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

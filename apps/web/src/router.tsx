@@ -2589,7 +2589,8 @@ export function ShoppingListPage() {
     setPurchase({
       item,
       pantryItemId: !needsAlternative && reuse ? candidate?.id ?? null : null,
-      createUsingCurrentName: !needsAlternative && item.purchaseOptions.resolution === 'create',
+      createUsingCurrentName: !needsAlternative
+        && (item.purchaseOptions.resolution === 'create' || item.purchaseOptions.resolution === 'choice'),
       expiresOn: !needsAlternative && candidate?.status !== 'out' ? candidate?.expiresOn ?? null : null,
       quantityNote: !needsAlternative ? candidate?.quantityNote ?? '' : '',
       autoAddToShoppingListWhenOut: !needsAlternative
@@ -2605,6 +2606,9 @@ export function ShoppingListPage() {
       ?.find((alternative) => alternative.id === purchase.selectedAlternativeId)
       ?.purchaseOptions ?? purchase.item.purchaseOptions
     : null
+  const purchaseIngredientName = purchase?.item.choiceAlternatives
+    ?.find((alternative) => alternative.id === purchase.selectedAlternativeId)
+    ?.name ?? purchase?.item.name ?? ''
   const purchaseNeedsAlternative = purchase?.item.purchaseOptions.resolution === 'selectAlternative'
     && !purchase.selectedAlternativeId
   const purchaseNeedsPantryChoice = activePurchaseOptions?.resolution === 'choice'
@@ -2808,7 +2812,7 @@ export function ShoppingListPage() {
             <Dialog.Content className="confirmation-sheet purchase-sheet">
               <div className="purchase-sheet-content">
                 <Dialog.Title>{t('shopping.updatePantry')}</Dialog.Title>
-                <Dialog.Description>{t('shopping.updatePantryDetail', { name: purchase.item.name })}</Dialog.Description>
+                <Dialog.Description>{t('shopping.updatePantryDetail', { name: purchaseIngredientName })}</Dialog.Description>
                 {purchaseMutation.error && (
                   <div className="error-summary" role="alert" tabIndex={-1} ref={errorSummaryRef}>
                     {purchaseMutation.error instanceof ApiError && purchaseMutation.error.status === 409
@@ -2852,7 +2856,7 @@ export function ShoppingListPage() {
                           autoAddToShoppingListWhenOut: false,
                         })}
                       />
-                      <span>{t('shopping.createCurrent', { name: purchase.item.name })}</span>
+                      <span>{t('shopping.createCurrent', { name: purchaseIngredientName })}</span>
                     </label>
                   </fieldset>
                 )}
@@ -2879,7 +2883,8 @@ export function ShoppingListPage() {
                               ...purchase,
                               selectedAlternativeId: alternative.id,
                               pantryItemId: candidate?.id ?? null,
-                              createUsingCurrentName: options.resolution === 'create',
+                              createUsingCurrentName: options.resolution === 'create'
+                                || options.resolution === 'choice',
                               expiresOn: candidate?.status === 'out' ? null : candidate?.expiresOn ?? null,
                               quantityNote: candidate?.quantityNote ?? '',
                               autoAddToShoppingListWhenOut: candidate?.autoAddToShoppingListWhenOut ?? false,

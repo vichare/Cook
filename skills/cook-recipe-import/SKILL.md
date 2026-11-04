@@ -83,6 +83,8 @@ Content-Type: application/json
 
 `schemaVersion`, `sourceUrl`, `title`, 1–100 groups, and at least one step are required. Groups are AND; 1–8 alternatives inside one group are OR; there may be at most 100 alternatives total. Preserve source alternatives and optionality, but never invent alternatives or mark an ingredient optional without source evidence. IDs must remain stable across retries/updates within that recipe or draft; the same source-local IDs may safely be reused in another resource. Within one group, do not repeat a canonical identity or unresolved normalized name. The source metadata, description, difficulty, whole-recipe estimated calories, warnings, and confidence are optional. Never include owner ID or visibility; Cook derives the owner and creates a private draft. Return the `reviewUrl` resolved against `COOK_BASE_URL` and tell the user that acceptance still requires browser review.
 
+Ingredient identity is whole-term and strict. Never infer that a shorter contained CJK term is equivalent to a longer one (`酱油` is not `油`; `鸡腿` is not `鸡翅`), never manufacture aliases, and never reuse a canonical ID unless Cook returned it for that exact source identity or the user explicitly confirmed the mapping.
+
 ## Create or update an owned recipe
 
 Prefer `schema/ai-recipe-v2.schema.json`. The v1 schema remains accepted for single required ingredients only. Never send both `ingredients` and `ingredientGroups`.

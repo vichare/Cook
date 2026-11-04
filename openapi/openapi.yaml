@@ -1441,7 +1441,10 @@ components:
       type: object
       required: [resolution, candidates]
       properties:
-        resolution: { type: string, enum: [reuse, create, choice, selectAlternative] }
+        resolution:
+          type: string
+          enum: [reuse, create, choice, selectAlternative]
+          description: Candidates are strict whole-term identities only. Advisory prefix, substring, and typo suggestions never become purchase candidates.
         candidates:
           type: array
           items: { $ref: "#/components/schemas/PantryPurchaseCandidate" }
@@ -1472,7 +1475,9 @@ components:
         disposition: { type: string, enum: [remove, keep] }
         shoppingExpectedVersion: { type: integer, minimum: 1 }
         pantryItemId: { type: [string, "null"], format: uuid }
-        createUsingCurrentName: { type: boolean, default: false }
+        createUsingCurrentName:
+          type: boolean
+          description: Explicit true forces creation and conflicts with an existing strict identity. When omitted, Cook reuses one unambiguous strict identity, creates using the current name when none exists, and requires pantryItemId when strict matches are ambiguous.
         pantryExpectedVersion: { type: [integer, "null"], minimum: 1 }
         expiresOn: { type: [string, "null"], format: date }
         quantityNote: { type: string, maxLength: 240 }
@@ -1531,7 +1536,10 @@ components:
         canonicalIngredientId: { type: string }
         displayName: { type: string }
         matchedText: { type: string }
-        reason: { type: string, enum: [exact, alias, prefix, substring, similar] }
+        reason:
+          type: string
+          enum: [exact, alias, prefix, substring, similar]
+          description: exact and alias are whole-term hard identities. Prefix/substring/similar are advisory only; aliases are never expanded. CJK has no substring or edit-distance matching, one-Han-character prefixes are disabled, and Latin typo matching is bounded by query length.
     RecommendationSettings:
       type: object
       required: [includeFavoriteRecipes, includeOwn, includeFavoriteAccounts, includeOtherPublic, verificationDays]
