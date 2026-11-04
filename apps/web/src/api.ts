@@ -1,10 +1,12 @@
 import type {
   PantryItem,
   Recipe,
+  IngredientGroup,
   CreatedImportToken,
   ImportDraft,
   ImportToken,
   Recommendation,
+  IngredientScope,
   RecommendationSettings,
   RecipeRevision,
   AuthConfig,
@@ -14,6 +16,7 @@ import type {
   PasskeySummary,
   SecuritySettings,
   ShoppingItem,
+  ShoppingDeleteResponse,
   ShoppingPurchaseResponse,
   PublicAuthorProfile,
   AiCapabilities,
@@ -32,7 +35,8 @@ export interface SaveRecipeInput {
   sourceAuthor: string | null
   sourceLicense: string | null
   sourceAttribution: string | null
-  ingredients: Recipe['ingredients']
+  ingredientModel: 'groups-v1'
+  ingredientGroups: IngredientGroup[]
 }
 
 export class ApiError extends Error {
@@ -244,8 +248,12 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(value),
     }),
-  deleteShoppingItem: (id: string) =>
-    request<ShoppingItem[]>(`/api/shopping-list/${id}`, { method: 'DELETE' }),
+  deleteShoppingItem: (id: string, expectedVersion: number, idempotencyKey: string) =>
+    request<ShoppingDeleteResponse>(`/api/shopping-list/${id}`, {
+      method: 'DELETE',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify({ expectedVersion }),
+    }),
   purchaseShoppingItem: (
     id: string,
     value: {
@@ -257,6 +265,7 @@ export const api = {
       expiresOn: string | null
       quantityNote: string
       autoAddToShoppingListWhenOut: boolean
+      selectedAlternativeId?: string | null
     },
     idempotencyKey: string,
   ) =>
@@ -271,7 +280,12 @@ export const api = {
     }),
   addRecipeIngredientToShopping: (
     recipeId: string,
-    value: { name: string; canonicalIngredientId: string | null },
+    value: {
+      name: string
+      canonicalIngredientId: string | null
+      groupId?: string | null
+      alternativeId?: string | null
+    },
   ) =>
     request<ShoppingItem[]>(`/api/recipes/${recipeId}/shopping-list-items`, {
       method: 'POST',
@@ -289,7 +303,7 @@ export const api = {
     preferred: Array<{ name: string; canonicalIngredientId: string | null }>
     required: Array<{ name: string; canonicalIngredientId: string | null }>
     excluded: Array<{ name: string; canonicalIngredientId: string | null }>
-    pantryOnly: boolean
+    ingredientScope: IngredientScope
     today: string
   }) =>
     request<Recommendation[]>('/api/recommendations', {
@@ -323,7 +337,8 @@ export const api = {
     id: string,
     value: Pick<
       ImportDraft,
-      'title' | 'description' | 'instructions' | 'difficulty' | 'estimatedCalories' | 'ingredients'
+      'title' | 'description' | 'instructions' | 'difficulty' | 'estimatedCalories'
+      | 'ingredientModel' | 'ingredientGroups'
     >,
   ) =>
     request<ImportDraft>(`/api/import-drafts/${id}`, {

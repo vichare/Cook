@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cook.vichare.net/schemas/ai-recipe-v2.schema.json",
+  "title": "Cook AI recipe create or update v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "ingredientModel", "ingredientGroups"],
+  "properties": {
+    "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "description": { "type": "string", "maxLength": 2000, "default": "" },
+    "instructions": { "type": "string", "maxLength": 20000, "default": "" },
+    "difficulty": { "type": ["integer", "null"], "minimum": 1, "maximum": 5 },
+    "estimatedCalories": { "type": ["integer", "null"], "minimum": 1, "maximum": 100000 },
+    "sourceUrl": { "type": ["string", "null"], "format": "uri", "maxLength": 2048 },
+    "sourceTitle": { "type": ["string", "null"], "maxLength": 200 },
+    "sourceAuthor": { "type": ["string", "null"], "maxLength": 200 },
+    "sourceLicense": { "type": ["string", "null"], "maxLength": 200 },
+    "sourceAttribution": { "type": ["string", "null"], "maxLength": 1000 },
+    "visibility": { "type": "string", "enum": ["private", "public"] },
+    "expectedVersion": { "type": "integer", "minimum": 1 },
+    "ingredientModel": { "const": "groups-v1" },
+    "ingredientGroups": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": { "$ref": "import-draft-v2.schema.json#/$defs/group" }
+    }
+  }
+}

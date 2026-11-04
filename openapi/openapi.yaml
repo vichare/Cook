@@ -390,10 +390,31 @@ paths:
         "200": { description: Updated private shopping list }
         "404": { description: Missing, cross-account, or not manually editable }
     delete:
-      description: Remove only the manual source. Recipe and automatic sources remain.
+      description: >
+        Idempotently remove every persisted manual or recipe source for this exact concrete or
+        choice item without changing pantry or recipes. An automatic-only derived item cannot be
+        permanently deleted; the response requires disabling auto-restock. If a concrete item also
+        has an automatic source, persisted sources are removed and the automatic item remains.
+        No deletion undo is advertised because the bounded replay record is not a safe state snapshot.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ShoppingDeleteInput" }
       responses:
-        "200": { description: Updated private shopping list }
-        "404": { description: Missing, cross-account, or no manual source }
+        "200":
+          description: Explicit deletion outcome and current private shopping list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShoppingDeleteResponse" }
+        "404": { description: Missing or cross-account item }
+        "409": { description: Stale expectedVersion or idempotency fingerprint conflict; refresh before retrying }
+        "429": { description: Delete rate or retained replay-action limit reached }
   /api/shopping-list/{id}/purchase:
     parameters:
       - in: path
@@ -440,7 +461,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/ShoppingItemInput" }
+            schema: { $ref: "#/components/schemas/RecipeShoppingInput" }
       responses:
         "201": { description: Updated private shopping list }
         "404": { description: Recipe or ingredient is not visible or does not match the recipe }
@@ -943,7 +964,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Missing or not owned }
     put:
-      description: Edits a pending import draft owned by the authenticated user.
+      description: Edits a pending import draft owned by the authenticated user. A legacy ingredients-only update of an existing OR or optional draft returns 400 ingredient_groups_required instead of flattening it.
       security:
         - sessionCookie: []
       requestBody:
@@ -1164,9 +1185,45 @@ components:
         canonicalIngredientId:
           type: [string, "null"]
           description: Canonical identity selected explicitly by the user. Omit or send null to keep the normalized input without alias binding.
+    IngredientAlternative:
+      type: object
+      additionalProperties: false
+      required: [id, name, quantityNote, sortOrder]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: Stable within its containing recipe, revision, or import draft. The same client ID may be reused in another resource.
+        name: { type: string, minLength: 1, maxLength: 120 }
+        quantityNote: { type: string, maxLength: 240, default: "" }
+        canonicalIngredientId: { type: [string, "null"] }
+        sortOrder: { type: integer, minimum: 0 }
+    IngredientGroup:
+      type: object
+      additionalProperties: false
+      required: [id, optional, note, sortOrder, alternatives]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: Stable within its containing recipe, revision, or import draft. The same client ID may be reused in another resource.
+        optional: { type: boolean, default: false }
+        note:
+          type: string
+          maxLength: 240
+          default: ""
+          description: Group-level guidance. For a single-alternative group, the deprecated ingredients projection uses the alternative quantityNote, not this note.
+        sortOrder: { type: integer, minimum: 0 }
+        alternatives:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: { $ref: "#/components/schemas/IngredientAlternative" }
     RecipeInput:
       type: object
-      required: [title, description, instructions, visibility, ingredients]
+      required: [title, description, instructions, visibility]
       properties:
         title: { type: string, minLength: 1, maxLength: 120 }
         description:
@@ -1203,12 +1260,24 @@ components:
         ingredients:
           type: array
           minItems: 1
+          maxItems: 100
           items: { $ref: "#/components/schemas/Ingredient" }
+          deprecated: true
+          description: Legacy write shape. Accepted only when ingredientGroups is absent and mapped to required single-alternative groups.
+        ingredientModel:
+          type: string
+          const: groups-v1
+        ingredientGroups:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: Ordered AND groups; alternatives within each group are OR. At most 100 alternatives across all groups.
+          items: { $ref: "#/components/schemas/IngredientGroup" }
     Recipe:
       allOf:
         - $ref: "#/components/schemas/RecipeInput"
         - type: object
-          required: [id, version, isOwner, authorHandle, authorNickname, difficulty, estimatedCalories, isFavorite, isFavoriteAuthor, source, coverImage]
+          required: [id, version, isOwner, authorHandle, authorNickname, difficulty, estimatedCalories, ingredientModel, ingredientGroups, ingredients, isFavorite, isFavoriteAuthor, source, coverImage]
           properties:
             id: { type: string, format: uuid }
             version: { type: integer, minimum: 1 }
@@ -1328,6 +1397,18 @@ components:
         canonicalIngredientId:
           type: [string, "null"]
           description: Canonical identity selected explicitly by the user. Similar or fuzzy candidates are not inferred.
+    RecipeShoppingInput:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, maxLength: 120 }
+        canonicalIngredientId: { type: [string, "null"] }
+        groupId:
+          type: [string, "null"]
+          description: Stable recipe ingredient group ID. Without alternativeId, adds an exact identity-set choice.
+        alternativeId:
+          type: [string, "null"]
+          description: Stable alternative ID selecting a concrete item from groupId.
     ShoppingItemSource:
       type: object
       required: [kind, label, recipeId]
@@ -1337,13 +1418,17 @@ components:
         recipeId: { type: [string, "null"], format: uuid }
     ShoppingItem:
       type: object
-      required: [id, name, canonicalIngredientId, automatic, pantryItemId, sources, version, purchaseOptions]
+      required: [id, name, canonicalIngredientId, choiceAlternatives, automatic, pantryItemId, sources, version, purchaseOptions]
       properties:
         id:
           type: string
           description: UUID for persisted items or an opaque auto-prefixed identifier for a purely derived item.
         name: { type: string }
         canonicalIngredientId: { type: [string, "null"] }
+        choiceAlternatives:
+          type: array
+          maxItems: 8
+          items: { $ref: "#/components/schemas/ShoppingChoiceAlternative" }
         automatic: { type: boolean }
         pantryItemId: { type: [string, "null"], format: uuid }
         version: { type: integer, minimum: 1 }
@@ -1356,10 +1441,18 @@ components:
       type: object
       required: [resolution, candidates]
       properties:
-        resolution: { type: string, enum: [reuse, create, choice] }
+        resolution: { type: string, enum: [reuse, create, choice, selectAlternative] }
         candidates:
           type: array
           items: { $ref: "#/components/schemas/PantryPurchaseCandidate" }
+    ShoppingChoiceAlternative:
+      type: object
+      required: [id, name, canonicalIngredientId, purchaseOptions]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        canonicalIngredientId: { type: [string, "null"] }
+        purchaseOptions: { $ref: "#/components/schemas/ShoppingPurchaseOptions" }
     PantryPurchaseCandidate:
       type: object
       required: [id, name, status, quantityNote, expiresOn, canonicalIngredientId, autoAddToShoppingListWhenOut, version]
@@ -1384,6 +1477,31 @@ components:
         expiresOn: { type: [string, "null"], format: date }
         quantityNote: { type: string, maxLength: 240 }
         autoAddToShoppingListWhenOut: { type: boolean }
+        selectedAlternativeId:
+          type: [string, "null"]
+          description: Required when purchasing a choice item; only the selected alternative is applied to pantry.
+    ShoppingDeleteInput:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion]
+      properties:
+        expectedVersion: { type: integer, minimum: 1 }
+    ShoppingDeleteResponse:
+      type: object
+      required: [outcome, requiresDisableAutoRestock, shoppingItems, undoAvailable]
+      properties:
+        outcome:
+          type: string
+          enum: [removed, automaticRemains, automaticOnly]
+        requiresDisableAutoRestock:
+          type: boolean
+          description: True when an automatic item remains or will reappear until pantry auto-restock is disabled.
+        shoppingItems:
+          type: array
+          items: { $ref: "#/components/schemas/ShoppingItem" }
+        undoAvailable:
+          type: boolean
+          const: false
     ShoppingPurchaseResponse:
       type: object
       required: [pantry, shoppingItems, purchaseActionId, undoAvailable]
@@ -1425,18 +1543,25 @@ components:
         verificationDays: { type: integer, minimum: 1, maximum: 90 }
     RecommendationRequest:
       type: object
+      description: ingredientScope is the intent-v1 control. Deprecated pantryOnly maps true to PANTRY_ONLY and false to ANY. Supplying both fields returns 400.
       properties:
         preferred: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
         required: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
         excluded: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
-        pantryOnly: { type: boolean }
+        ingredientScope:
+          type: string
+          enum: [ANY, PANTRY_ONLY, PANTRY_OR_LIST]
+          default: ANY
+        pantryOnly:
+          type: boolean
+          deprecated: true
         today:
           type: string
           format: date
           description: User-local calendar date used for date-only expiration classification. The server UTC date is used when omitted.
     Recommendation:
       type: object
-      required: [recipe, status, available, verify, missing, inShoppingList, reasons, reasonDetails, score, scoreBreakdown, primarySource, matchedSources, desiredMatches, ingredientReasons, appliedControls]
+      required: [recipe, status, available, verify, missing, inShoppingList, reasons, reasonDetails, score, scoreBreakdown, primarySource, matchedSources, desiredMatches, rankingIntent, ingredientReasons, ingredientGroupReasons, appliedControls]
       properties:
         recipe: { $ref: "#/components/schemas/Recipe" }
         status: { type: string, enum: [READY, VERIFY, SHOP, BLOCKED] }
@@ -1446,7 +1571,7 @@ components:
         inShoppingList:
           type: array
           items: { type: string }
-          description: Missing recipe ingredients whose canonical or owner-normalized unresolved identity is already active in this owner's shopping list.
+          description: Effective groups covered by this owner's active shopping list. A concrete item covers any one exact alternative identity; a choice item covers only the group's exact alternative identity set.
         reasons:
           type: array
           items: { type: string }
@@ -1482,9 +1607,19 @@ components:
                 required: [code]
                 properties:
                   code: { const: pantryOnlyBlocked }
-        score: { type: integer }
+              - type: object
+                required: [code, scope]
+                properties:
+                  code: { const: ingredientScopeBlocked }
+                  scope: { type: string, enum: [ANY, PANTRY_ONLY, PANTRY_OR_LIST] }
+        score:
+          type: integer
+          deprecated: true
+          description: Compatibility-only legacy score. intent-v1 never sorts by this value.
         scoreBreakdown:
           type: object
+          deprecated: true
+          description: Compatibility-only legacy fields. intent-v1 never sorts by these values.
           required: [statusBase, source, availability, desired, certainty, simplicity]
           properties:
             statusBase: { type: integer, enum: [0, 250, 500, 750] }
@@ -1515,6 +1650,60 @@ components:
           uniqueItems: true
           items: { $ref: "#/components/schemas/RecommendationSource" }
         desiredMatches: { type: array, items: { type: string } }
+        rankingIntent:
+          type: object
+          required: [version, scopeEligible, desiredTier, desiredMatched, desiredTotal, desiredCoverage, fulfillment, unplannedMissing, shoppingCovered, verify, effectiveGroups, source, available, availableCoverage, reasons]
+          properties:
+            version: { type: string, const: intent-v1 }
+            scopeEligible: { type: boolean }
+            desiredTier: { $ref: "#/components/schemas/IngredientGroupAction" }
+            desiredMatched: { type: integer, minimum: 0, maximum: 100 }
+            desiredTotal: { type: integer, minimum: 0, maximum: 100 }
+            desiredCoverage:
+              type: integer
+              minimum: 0
+              maximum: 10000
+              description: Basis points of distinct requested desired identities assigned to distinct scope-qualified groups.
+            fulfillment: { type: string, enum: [READY, VERIFY, SHOP, BLOCKED] }
+            unplannedMissing: { type: integer, minimum: 0, maximum: 100 }
+            shoppingCovered: { type: integer, minimum: 0, maximum: 100 }
+            verify: { type: integer, minimum: 0, maximum: 100 }
+            effectiveGroups: { type: integer, minimum: 0, maximum: 100 }
+            source: { $ref: "#/components/schemas/RecommendationSource" }
+            available: { type: integer, minimum: 0, maximum: 100 }
+            availableCoverage:
+              type: integer
+              minimum: 0
+              maximum: 10000
+              description: Basis points of effective groups confirmed available.
+            reasons:
+              type: array
+              items:
+                oneOf:
+                  - type: object
+                    required: [code, eligible]
+                    properties:
+                      code: { const: scopeEligible }
+                      eligible: { type: boolean }
+                  - type: object
+                    required: [code, matched, total]
+                    properties:
+                      code: { const: desiredCoverage }
+                      matched: { type: integer, minimum: 0, maximum: 100 }
+                      total: { type: integer, minimum: 0, maximum: 100 }
+                  - type: object
+                    required: [code, available, verify, shoppingCovered, unplannedMissing]
+                    properties:
+                      code: { const: fulfillment }
+                      available: { type: integer, minimum: 0, maximum: 100 }
+                      verify: { type: integer, minimum: 0, maximum: 100 }
+                      shoppingCovered: { type: integer, minimum: 0, maximum: 100 }
+                      unplannedMissing: { type: integer, minimum: 0, maximum: 100 }
+                  - type: object
+                    required: [code, source]
+                    properties:
+                      code: { const: source }
+                      source: { $ref: "#/components/schemas/RecommendationSource" }
         ingredientReasons:
           type: array
           items:
@@ -1524,14 +1713,41 @@ components:
               ingredient: { type: string }
               code: { type: string, enum: [AVAILABLE, UNKNOWN, STALE, EXPIRES_TODAY, EXPIRED, OUT, MISSING] }
               expiresOn: { type: [string, "null"], format: date }
+        ingredientGroupReasons:
+          type: array
+          description: Group-level evaluation. Optional groups are excluded unless a required filter promotes them.
+          items:
+            type: object
+            required: [groupId, label, optional, effective, action, code, selectedAlternativeId, alternatives]
+            properties:
+              groupId: { type: string }
+              label: { type: string }
+              optional: { type: boolean }
+              effective: { type: boolean }
+              action: { $ref: "#/components/schemas/IngredientGroupAction" }
+              code: { type: string, enum: [AVAILABLE, UNKNOWN, STALE, EXPIRES_TODAY, EXPIRED, OUT, MISSING] }
+              selectedAlternativeId: { type: [string, "null"] }
+              alternatives:
+                type: array
+                items:
+                  type: object
+                  required: [ingredient, code, expiresOn]
+                  properties:
+                    ingredient: { type: string }
+                    code: { type: string, enum: [AVAILABLE, UNKNOWN, STALE, EXPIRES_TODAY, EXPIRED, OUT, MISSING] }
+                    expiresOn: { type: [string, "null"], format: date }
         appliedControls:
           type: object
-          required: [preferred, required, excluded, pantryOnly, includeOwn, includeFavoriteRecipes, includeFavoriteAccounts, includeOtherPublic]
+          required: [preferred, required, excluded, ingredientScope, pantryOnly, includeOwn, includeFavoriteRecipes, includeFavoriteAccounts, includeOtherPublic]
           properties:
             preferred: { type: array, items: { type: string } }
             required: { type: array, items: { type: string } }
             excluded: { type: array, items: { type: string } }
-            pantryOnly: { type: boolean }
+            ingredientScope: { type: string, enum: [ANY, PANTRY_ONLY, PANTRY_OR_LIST] }
+            pantryOnly:
+              type: boolean
+              deprecated: true
+              description: True only when ingredientScope is PANTRY_ONLY.
             includeOwn: { type: boolean }
             includeFavoriteRecipes: { type: boolean }
             includeFavoriteAccounts: { type: boolean }
@@ -1539,6 +1755,9 @@ components:
     RecommendationSource:
       type: string
       enum: [OWN, FAVORITE_RECIPE, FAVORITE_ACCOUNT, OTHER_PUBLIC]
+    IngredientGroupAction:
+      type: string
+      enum: [AVAILABLE, VERIFY, SHOPPING_PLANNED, MISSING]
     PublicAuthorProfile:
       type: object
       required: [handle, nickname, recipes, nextCursor]
@@ -1624,7 +1843,12 @@ components:
     AiRecipeInput:
       type: object
       additionalProperties: false
-      required: [title, ingredients]
+      required: [title]
+      oneOf:
+        - required: [ingredients]
+          not: { required: [ingredientGroups] }
+        - required: [ingredientModel, ingredientGroups]
+          not: { required: [ingredients] }
       properties:
         title: { type: string, minLength: 1, maxLength: 120 }
         description: { type: string, maxLength: 2000, default: "" }
@@ -1653,6 +1877,13 @@ components:
           minItems: 1
           maxItems: 100
           items: { $ref: "#/components/schemas/Ingredient" }
+          deprecated: true
+        ingredientModel: { type: string, const: groups-v1 }
+        ingredientGroups:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: "#/components/schemas/IngredientGroup" }
         expectedVersion:
           type: integer
           minimum: 1
@@ -1671,7 +1902,7 @@ components:
             revision: { $ref: "#/components/schemas/RecipeRevision" }
     RecipeRevision:
       type: object
-      required: [id, recipeId, expectedVersion, title, description, instructions, difficulty, estimatedCalories, sourceUrl, sourceTitle, sourceAuthor, sourceLicense, sourceAttribution, ingredients, imageAction, imageAltText, imageUrl, imageSourceUrl, imageSourceLicense, imageSourceAttribution, status, createdAt, updatedAt]
+      required: [id, recipeId, expectedVersion, title, description, instructions, difficulty, estimatedCalories, sourceUrl, sourceTitle, sourceAuthor, sourceLicense, sourceAttribution, ingredientModel, ingredientGroups, ingredients, imageAction, imageAltText, imageUrl, imageSourceUrl, imageSourceLicense, imageSourceAttribution, status, createdAt, updatedAt]
       properties:
         id: { type: string, format: uuid }
         recipeId: { type: string, format: uuid }
@@ -1689,6 +1920,11 @@ components:
         ingredients:
           type: array
           items: { $ref: "#/components/schemas/Ingredient" }
+          deprecated: true
+        ingredientModel: { type: string, const: groups-v1 }
+        ingredientGroups:
+          type: array
+          items: { $ref: "#/components/schemas/IngredientGroup" }
         imageAction: { type: string, enum: [keep, replace, delete] }
         imageAltText: { type: [string, "null"] }
         imageUrl: { type: [string, "null"] }
@@ -1701,9 +1937,14 @@ components:
     ImportDraftSubmission:
       type: object
       additionalProperties: false
-      required: [schemaVersion, sourceUrl, title, ingredients, steps]
+      required: [schemaVersion, sourceUrl, title, steps]
+      oneOf:
+        - required: [ingredients]
+          not: { required: [ingredientGroups] }
+        - required: [ingredientModel, ingredientGroups]
+          not: { required: [ingredients] }
       properties:
-        schemaVersion: { type: string, const: "1.0" }
+        schemaVersion: { type: string, enum: ["1.0", "2.0"] }
         sourceUrl:
           type: string
           format: uri
@@ -1729,6 +1970,13 @@ components:
           minItems: 1
           maxItems: 100
           items: { $ref: "#/components/schemas/Ingredient" }
+          deprecated: true
+        ingredientModel: { type: string, const: groups-v1 }
+        ingredientGroups:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: "#/components/schemas/IngredientGroup" }
         steps:
           type: array
           minItems: 1
@@ -1745,7 +1993,7 @@ components:
     ImportDraftUpdate:
       type: object
       additionalProperties: false
-      required: [title, description, instructions, ingredients]
+      required: [title, description, instructions]
       properties:
         title: { type: string, minLength: 1, maxLength: 120 }
         description: { type: string, maxLength: 2000 }
@@ -1757,11 +2005,18 @@ components:
           minItems: 1
           maxItems: 100
           items: { $ref: "#/components/schemas/Ingredient" }
+          deprecated: true
+        ingredientModel: { type: string, const: groups-v1 }
+        ingredientGroups:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: "#/components/schemas/IngredientGroup" }
     ImportDraft:
       allOf:
         - $ref: "#/components/schemas/ImportDraftUpdate"
         - type: object
-          required: [id, sourceUrl, sourceTitle, sourceAuthor, sourceLicense, sourceAttribution, difficulty, estimatedCalories, warnings, confidence, status, acceptedRecipeId, reviewUrl, createdAt, updatedAt]
+          required: [id, sourceUrl, sourceTitle, sourceAuthor, sourceLicense, sourceAttribution, difficulty, estimatedCalories, ingredientModel, ingredientGroups, ingredients, warnings, confidence, status, acceptedRecipeId, reviewUrl, createdAt, updatedAt]
           properties:
             id: { type: string, format: uuid }
             sourceUrl: { type: string, format: uri }

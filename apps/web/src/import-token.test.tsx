@@ -116,12 +116,12 @@ describe('import token reveal', () => {
     expect(prompt).toContain('COOK_IMPORT_TOKEN')
     expect(prompt).toContain(`${baseUrl}/api/import/drafts`)
     expect(prompt).not.toContain(secret)
-    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.4.2/skills/')
+    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.5.0/skills/')
     expect(installInstructions).toContain(
-      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.2',
+      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.5.0',
     )
     expect(installInstructions).toContain(
-      'gh skill preview vichare/Cook cook-recipe-import@v0.4.2',
+      'gh skill preview vichare/Cook cook-recipe-import@v0.5.0',
     )
     expect(installInstructions).toContain('Do not copy only SKILL.md')
     expect(installInstructions).not.toContain('install skill from GitHub URL')
@@ -394,10 +394,10 @@ describe('import token reveal', () => {
     )
 
     fireEvent.click(screen.getByText('Request format'))
-    expect(screen.getByText(/"schemaVersion": "1.0"/)).toBeVisible()
+    expect(screen.getByText(/"schemaVersion": "2.0"/)).toBeVisible()
     expect(screen.getByText(/"expectedVersion": 3/)).toBeVisible()
     expect(screen.getByRole('link', { name: 'Open authoritative import-draft schema' }))
-      .toHaveAttribute('href', expect.stringContaining('import-draft-v1.schema.json'))
+      .toHaveAttribute('href', expect.stringContaining('import-draft-v2.schema.json'))
 
     fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
     expect(await screen.findByText(secret)).toBeVisible()

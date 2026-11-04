@@ -30,7 +30,7 @@ Use this skill only for content the user is authorized to access. Prefer the saf
 
 ## Import a private review draft
 
-Validate against `schema/import-draft-v1.schema.json`, then send:
+Prefer `schema/import-draft-v2.schema.json`. Use v1 only for a source that has no alternatives or optional ingredients; Cook maps every v1 ingredient to one required single-alternative group.
 
 ```http
 POST $COOK_BASE_URL/api/import/drafts
@@ -40,7 +40,7 @@ Content-Type: application/json
 
 ```json
 {
-  "schemaVersion": "1.0",
+  "schemaVersion": "2.0",
   "sourceUrl": "https://example.com/recipes/tomato-soup",
   "sourceTitle": "Tomato soup",
   "sourceAuthor": "Example author",
@@ -50,9 +50,27 @@ Content-Type: application/json
   "description": "A concise description.",
   "difficulty": 2,
   "estimatedCalories": 900,
-  "ingredients": [
-    { "name": "tomatoes", "quantityNote": "800 g" },
-    { "name": "onion", "quantityNote": "1" }
+  "ingredientModel": "groups-v1",
+  "ingredientGroups": [
+    {
+      "id": "tomato",
+      "optional": false,
+      "note": "",
+      "sortOrder": 0,
+      "alternatives": [
+        { "id": "fresh-tomato", "name": "tomatoes", "quantityNote": "800 g", "sortOrder": 0 },
+        { "id": "canned-tomato", "name": "canned tomatoes", "quantityNote": "2 cans", "sortOrder": 1 }
+      ]
+    },
+    {
+      "id": "garnish",
+      "optional": true,
+      "note": "for serving",
+      "sortOrder": 1,
+      "alternatives": [
+        { "id": "basil", "name": "basil", "quantityNote": "a few leaves", "sortOrder": 0 }
+      ]
+    }
   ],
   "steps": [
     "Chop the ingredients.",
@@ -63,11 +81,11 @@ Content-Type: application/json
 }
 ```
 
-`schemaVersion`, `sourceUrl`, `title`, at least one ingredient, and at least one step are required. The source metadata, description, difficulty, whole-recipe estimated calories, warnings, and confidence are optional and may be omitted or set to `null` where the schema permits. If present, `difficulty` is an integer from 1 to 5 and `estimatedCalories` is an integer from 1 to 100000 representing total kcal for the whole recipe, never per serving. Never include owner ID or visibility; Cook derives the owner and creates a private draft. Return the `reviewUrl` resolved against `COOK_BASE_URL` and tell the user that acceptance still requires browser review.
+`schemaVersion`, `sourceUrl`, `title`, 1–100 groups, and at least one step are required. Groups are AND; 1–8 alternatives inside one group are OR; there may be at most 100 alternatives total. Preserve source alternatives and optionality, but never invent alternatives or mark an ingredient optional without source evidence. IDs must remain stable across retries/updates within that recipe or draft; the same source-local IDs may safely be reused in another resource. Within one group, do not repeat a canonical identity or unresolved normalized name. The source metadata, description, difficulty, whole-recipe estimated calories, warnings, and confidence are optional. Never include owner ID or visibility; Cook derives the owner and creates a private draft. Return the `reviewUrl` resolved against `COOK_BASE_URL` and tell the user that acceptance still requires browser review.
 
 ## Create or update an owned recipe
 
-Validate against `schema/ai-recipe-v1.schema.json`.
+Prefer `schema/ai-recipe-v2.schema.json`. The v1 schema remains accepted for single required ingredients only. Never send both `ingredients` and `ingredientGroups`.
 
 Create:
 
@@ -127,7 +145,7 @@ Content-Type: application/json
 }
 ```
 
-`title` and at least one ingredient are required. `expectedVersion` is required for update and omitted for create. A stable idempotency key belongs to one source item/revision; do not generate a new key merely because a response was delayed. Without `recipes:publish`, changes to an owned public recipe create a pending owner-reviewed revision. There is no token recipe-delete endpoint.
+`title` and at least one ingredient group are required. Preserve the `ingredientModel`, group IDs, alternative IDs, ordering, optional flags, group notes, quantities, canonical IDs, and provenance returned by Cook. A legacy-only update of a recipe or import draft that already has OR or optional groups is rejected with `ingredient_groups_required`. `expectedVersion` is required for update and omitted for create. A stable idempotency key belongs to one source item/revision; do not generate a new key merely because a response was delayed. Without `recipes:publish`, changes to an owned public recipe create a pending owner-reviewed revision. There is no token recipe-delete endpoint.
 
 ## Cover images
 

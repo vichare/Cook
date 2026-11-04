@@ -40,6 +40,8 @@ impl LicensedRecipeImporter for FixtureImporter {
                     quantity_note: "one slice".into(),
                     canonical_ingredient_id: None,
                 }],
+                ingredient_model: None,
+                ingredient_groups: None,
             },
             source_url: "https://example.test/recipes/licensed-fixture".into(),
             license: "CC0-1.0".into(),

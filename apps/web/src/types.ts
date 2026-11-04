@@ -49,6 +49,19 @@ export interface Ingredient {
   canonicalIngredientId: string | null
 }
 
+export interface IngredientAlternative extends Ingredient {
+  id: string
+  sortOrder?: number
+}
+
+export interface IngredientGroup {
+  id: string
+  optional: boolean
+  note: string
+  sortOrder?: number
+  alternatives: IngredientAlternative[]
+}
+
 export interface IngredientReference {
   name: string
   canonicalIngredientId: string | null
@@ -74,6 +87,8 @@ export interface Recipe {
   difficulty: number | null
   estimatedCalories: number | null
   ingredients: Ingredient[]
+  ingredientModel?: 'groups-v1'
+  ingredientGroups?: IngredientGroup[]
   isFavorite: boolean
   isFavoriteAuthor: boolean
   coverImage: RecipeImage | null
@@ -121,6 +136,25 @@ export interface ShoppingItemSource {
   recipeId: string | null
 }
 
+export interface ShoppingPurchaseOptions {
+  resolution: 'reuse' | 'create' | 'choice' | 'selectAlternative'
+  candidates: Array<{
+    id: string
+    name: string
+    status: 'have' | 'out' | 'unknown'
+    quantityNote: string
+    expiresOn: string | null
+    canonicalIngredientId: string | null
+    autoAddToShoppingListWhenOut: boolean
+    version: number
+  }>
+}
+
+export interface ShoppingChoiceAlternative extends IngredientReference {
+  id: string
+  purchaseOptions?: ShoppingPurchaseOptions
+}
+
 export interface ShoppingItem {
   id: string
   name: string
@@ -129,19 +163,15 @@ export interface ShoppingItem {
   pantryItemId: string | null
   sources: ShoppingItemSource[]
   version: number
-  purchaseOptions: {
-    resolution: 'reuse' | 'create' | 'choice'
-    candidates: Array<{
-      id: string
-      name: string
-      status: 'have' | 'out' | 'unknown'
-      quantityNote: string
-      expiresOn: string | null
-      canonicalIngredientId: string | null
-      autoAddToShoppingListWhenOut: boolean
-      version: number
-    }>
-  }
+  choiceAlternatives?: ShoppingChoiceAlternative[]
+  purchaseOptions: ShoppingPurchaseOptions
+}
+
+export interface ShoppingDeleteResponse {
+  outcome: 'removed' | 'automaticRemains' | 'automaticOnly'
+  requiresDisableAutoRestock: boolean
+  shoppingItems: ShoppingItem[]
+  undoAvailable: boolean
 }
 
 export interface ShoppingPurchaseResponse {
@@ -180,22 +210,43 @@ export interface Recommendation {
   primarySource: RecommendationSource
   matchedSources: RecommendationSource[]
   desiredMatches: string[]
+  rankingIntent?: 'intent-v1' | {
+    version: 'intent-v1'
+    desiredMatched?: number
+    desiredTotal?: number
+  }
   ingredientReasons: Array<{
     ingredient: string
     code: 'AVAILABLE' | 'UNKNOWN' | 'STALE' | 'EXPIRES_TODAY' | 'EXPIRED' | 'OUT' | 'MISSING'
     expiresOn: string | null
   }>
+  ingredientGroupReasons?: Array<{
+    groupId: string
+    label: string
+    optional: boolean
+    effective: boolean
+    code: 'AVAILABLE' | 'UNKNOWN' | 'STALE' | 'EXPIRES_TODAY' | 'EXPIRED' | 'OUT' | 'MISSING'
+    selectedAlternativeId: string | null
+    alternatives: Array<{
+      ingredient: string
+      code: 'AVAILABLE' | 'UNKNOWN' | 'STALE' | 'EXPIRES_TODAY' | 'EXPIRED' | 'OUT' | 'MISSING'
+      expiresOn: string | null
+    }>
+  }>
   appliedControls: {
     preferred: string[]
     required: string[]
     excluded: string[]
-    pantryOnly: boolean
+    ingredientScope?: IngredientScope
+    pantryOnly?: boolean
     includeOwn: boolean
     includeFavoriteRecipes: boolean
     includeFavoriteAccounts: boolean
     includeOtherPublic: boolean
   }
 }
+
+export type IngredientScope = 'ANY' | 'PANTRY_ONLY' | 'PANTRY_OR_LIST'
 
 export type RecommendationSource = 'OWN' | 'FAVORITE_RECIPE' | 'FAVORITE_ACCOUNT' | 'OTHER_PUBLIC'
 
@@ -250,6 +301,8 @@ export interface RecipeRevision {
   sourceLicense: string | null
   sourceAttribution: string | null
   ingredients: Ingredient[]
+  ingredientModel?: 'groups-v1'
+  ingredientGroups?: IngredientGroup[]
   imageAction: 'keep' | 'replace' | 'delete'
   imageAltText: string | null
   imageUrl: string | null
@@ -279,6 +332,8 @@ export interface ImportDraft {
   difficulty: number | null
   estimatedCalories: number | null
   ingredients: Ingredient[]
+  ingredientModel?: 'groups-v1'
+  ingredientGroups?: IngredientGroup[]
   warnings: string[]
   confidence: number | null
   status: 'draft' | 'consumed' | 'discarded'

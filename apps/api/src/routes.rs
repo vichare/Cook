@@ -31,21 +31,23 @@ use crate::{
         clean_display_name, match_reason, normalize_ingredient, split_ingredient_list, MatchReason,
     },
     models::{
-        normalize_nickname, IngredientInput, LocaleInput, PantryItem, PantryItemInput,
-        PantryStatus, ProfileInput, Recipe, RecipeImage, RecipeInput, RecipeSource,
-        RecommendationRequest, RecommendationSettings, User,
+        normalize_nickname, IngredientAlternativeInput, IngredientGroupInput, IngredientInput,
+        LocaleInput, PantryItem, PantryItemInput, PantryStatus, ProfileInput, Recipe, RecipeImage,
+        RecipeInput, RecipeSource, RecommendationRequest, RecommendationSettings, User,
     },
     passwordless::{
         email_address, map_email_error, map_passkey_error, normalize_email, purpose,
         PasskeySummary, EMAIL_LINK_PURPOSE, EMAIL_SIGN_IN_PURPOSE,
     },
-    recommendation::{recommend_limited, Recommendation},
+    recommendation::{recommend_limited_with_shopping, Recommendation},
     shopping, AppState,
 };
 
 const MAX_PANTRY_ITEMS_PER_OWNER: i64 = 500;
 const MAX_INGREDIENT_ALIASES_PER_OWNER: i64 = 2_000;
 const MAX_INGREDIENT_SUGGESTION_CANDIDATES: i64 = 5_000;
+const MAX_RECOMMENDATION_CANDIDATES: i64 = 10_000;
+const MAX_RECOMMENDATION_INGREDIENT_ROWS: i64 = MAX_RECOMMENDATION_CANDIDATES * 100;
 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
@@ -115,7 +117,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/shopping-list/{id}",
-            put(shopping::update_manual_item).delete(shopping::delete_manual_item),
+            put(shopping::update_manual_item).delete(shopping::delete_item),
         )
         .route(
             "/api/shopping-list/{id}/purchase",
@@ -1220,6 +1222,25 @@ async fn update_recipe(
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or(AppError::NotFound)?;
+    if input.ingredient_groups.is_none() {
+        let requires_groups: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+               SELECT 1 FROM recipe_ingredient_groups g
+               WHERE g.recipe_id = ? AND (
+                 g.optional = 1 OR
+                 g.note <> '' OR
+                 (SELECT COUNT(*) FROM recipe_ingredient_alternatives a
+                  WHERE a.group_id = g.id) > 1
+               )
+             )",
+        )
+        .bind(&id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if requires_groups != 0 {
+            return Err(AppError::Validation("ingredient_groups_required".into()));
+        }
+    }
     let result = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?, visibility = ?,
          difficulty = ?, estimated_calories = ?, source_url = ?, source_title = ?,
@@ -1250,7 +1271,8 @@ async fn update_recipe(
                 .into(),
         ));
     }
-    replace_ingredients(&mut transaction, &id, &user.id, &input.ingredients).await?;
+    let groups = effective_ingredient_groups(&input)?;
+    replace_ingredient_groups(&mut transaction, &id, &user.id, &groups).await?;
     if previous_visibility == "public" && input.visibility == "private" {
         sqlx::query(
             "UPDATE recipe_images SET id = ?, version = version + 1, updated_at = ?
@@ -1629,6 +1651,16 @@ async fn get_recommendations(
     } else {
         Utc::now()
     };
+    request.ingredient_scope = Some(match (request.ingredient_scope, request.pantry_only) {
+        (Some(_), Some(_)) => {
+            return Err(AppError::Validation(
+                "ingredientScope and deprecated pantryOnly cannot be supplied together".into(),
+            ));
+        }
+        (Some(scope), None) => scope,
+        (None, Some(true)) => crate::models::IngredientScope::PantryOnly,
+        (None, Some(false) | None) => crate::models::IngredientScope::Any,
+    });
     request.preferred = expand_ingredient_references(request.preferred);
     request.required = expand_ingredient_references(request.required);
     request.excluded = expand_ingredient_references(request.excluded);
@@ -1646,34 +1678,20 @@ async fn get_recommendations(
     }
     resolve_recommendation_request(&state.pool, &user.id, &mut request).await?;
     let settings = load_settings(&state.pool, &user.id).await?;
-    let pantry = load_pantry(&state.pool, &user.id).await?;
     let mut transaction = state.pool.begin().await?;
-    let active_shopping = shopping::active_identity_keys_tx(&mut transaction, &user.id).await?;
+    let pantry = load_pantry_tx(&mut transaction, &user.id).await?;
+    let active_shopping = shopping::active_coverage_tx(&mut transaction, &user.id).await?;
     let candidates = load_candidate_recipes(&mut transaction, &user.id, &settings).await?;
     pause_after_recommendation_selection(&user.id).await;
-    let mut recommendations = recommend_limited(
+    let mut recommendations = recommend_limited_with_shopping(
         candidates,
         &pantry,
+        &active_shopping,
         &request,
         &settings,
         recommendation_time,
         limit,
     );
-    for recommendation in &mut recommendations {
-        recommendation.in_shopping_list = recommendation
-            .recipe
-            .ingredients
-            .iter()
-            .filter(|ingredient| recommendation.missing.contains(&ingredient.name))
-            .filter(|ingredient| {
-                active_shopping.contains(&shopping::dedupe_key(
-                    ingredient.canonical_ingredient_id.as_deref(),
-                    &normalize_ingredient(&ingredient.name),
-                ))
-            })
-            .map(|ingredient| ingredient.name.clone())
-            .collect();
-    }
     hydrate_recommendation_recipes(&mut transaction, &user.id, &mut recommendations).await?;
     transaction.commit().await?;
     discard_unauthorized_recommendations(&state.pool, &user.id, &mut recommendations).await?;
@@ -1774,26 +1792,7 @@ pub(crate) fn validate_recipe(input: &RecipeInput) -> AppResult<()> {
             "recipe title, description, or instructions exceed the allowed length".into(),
         ));
     }
-    if input.ingredients.is_empty()
-        || input
-            .ingredients
-            .iter()
-            .any(|item| item.name.trim().is_empty())
-    {
-        return Err(AppError::Validation(
-            "at least one named ingredient is required".into(),
-        ));
-    }
-    if input.ingredients.len() > 100
-        || input
-            .ingredients
-            .iter()
-            .any(|item| item.name.chars().count() > 120 || item.quantity_note.chars().count() > 240)
-    {
-        return Err(AppError::Validation(
-            "recipes may contain at most 100 ingredients with 120-character names and 240-character notes".into(),
-        ));
-    }
+    validate_ingredient_groups(&effective_ingredient_groups(input)?)?;
     if input.visibility != "private" && input.visibility != "public" {
         return Err(AppError::Validation(
             "visibility must be private or public".into(),
@@ -1816,6 +1815,128 @@ pub(crate) fn validate_recipe(input: &RecipeInput) -> AppResult<()> {
         ));
     }
     validate_recipe_source(input)?;
+    Ok(())
+}
+
+pub(crate) fn effective_ingredient_groups(
+    input: &RecipeInput,
+) -> AppResult<Vec<IngredientGroupInput>> {
+    if input.ingredient_groups.is_some() && !input.ingredients.is_empty() {
+        return Err(AppError::Validation(
+            "ingredients and ingredientGroups cannot both be provided".into(),
+        ));
+    }
+    if let Some(groups) = &input.ingredient_groups {
+        if input.ingredient_model.as_deref() != Some("groups-v1") {
+            return Err(AppError::Validation(
+                "ingredientModel must be groups-v1 when ingredientGroups is provided".into(),
+            ));
+        }
+        return Ok(groups.clone());
+    }
+    if input.ingredient_model.is_some() {
+        return Err(AppError::Validation(
+            "ingredientModel is only valid with ingredientGroups".into(),
+        ));
+    }
+    Ok(expand_ingredient_inputs(input.ingredients.clone())
+        .into_iter()
+        .enumerate()
+        .map(|(index, ingredient)| IngredientGroupInput {
+            id: Uuid::new_v4().to_string(),
+            optional: false,
+            note: String::new(),
+            sort_order: index as i64,
+            alternatives: vec![IngredientAlternativeInput {
+                id: Uuid::new_v4().to_string(),
+                name: ingredient.name,
+                quantity_note: ingredient.quantity_note,
+                canonical_ingredient_id: ingredient.canonical_ingredient_id,
+                sort_order: 0,
+            }],
+        })
+        .collect())
+}
+
+pub(crate) fn validate_ingredient_groups(groups: &[IngredientGroupInput]) -> AppResult<()> {
+    if groups.is_empty() || groups.len() > 100 {
+        return Err(AppError::Validation(
+            "ingredientGroups must contain between 1 and 100 groups".into(),
+        ));
+    }
+    if groups
+        .iter()
+        .map(|group| group.alternatives.len())
+        .sum::<usize>()
+        > 100
+    {
+        return Err(AppError::Validation(
+            "ingredientGroups may contain at most 100 alternatives".into(),
+        ));
+    }
+    let mut group_ids = std::collections::HashSet::new();
+    let mut group_orders = std::collections::HashSet::new();
+    for group in groups {
+        if group.id.trim().is_empty()
+            || group.id.chars().count() > 120
+            || !group_ids.insert(group.id.clone())
+        {
+            return Err(AppError::Validation(
+                "ingredient group ids must be non-empty, unique, and at most 120 characters".into(),
+            ));
+        }
+        if group.sort_order < 0 || !group_orders.insert(group.sort_order) {
+            return Err(AppError::Validation(
+                "ingredient group sortOrder values must be non-negative and unique".into(),
+            ));
+        }
+        if group.note.chars().count() > 240 {
+            return Err(AppError::Validation(
+                "ingredient group notes may use at most 240 characters".into(),
+            ));
+        }
+        if group.alternatives.is_empty() || group.alternatives.len() > 8 {
+            return Err(AppError::Validation(
+                "each ingredient group needs between 1 and 8 alternatives".into(),
+            ));
+        }
+        let mut alternative_ids = std::collections::HashSet::new();
+        let mut alternative_orders = std::collections::HashSet::new();
+        let mut identities = std::collections::HashSet::new();
+        for alternative in &group.alternatives {
+            if alternative.id.trim().is_empty()
+                || alternative.id.chars().count() > 120
+                || !alternative_ids.insert(alternative.id.clone())
+            {
+                return Err(AppError::Validation(
+                    "ingredient alternative ids must be non-empty, unique within a group, and at most 120 characters".into(),
+                ));
+            }
+            if alternative.sort_order < 0 || !alternative_orders.insert(alternative.sort_order) {
+                return Err(AppError::Validation(
+                    "ingredient alternative sortOrder values must be non-negative and unique within a group".into(),
+                ));
+            }
+            if alternative.name.trim().is_empty()
+                || alternative.name.chars().count() > 120
+                || alternative.quantity_note.chars().count() > 240
+            {
+                return Err(AppError::Validation(
+                    "ingredient alternatives require a name of at most 120 characters and a quantity note of at most 240 characters".into(),
+                ));
+            }
+            let identity = alternative
+                .canonical_ingredient_id
+                .as_deref()
+                .map(|id| format!("id:{id}"))
+                .unwrap_or_else(|| format!("name:{}", normalize_ingredient(&alternative.name)));
+            if !identities.insert(identity) {
+                return Err(AppError::Validation(
+                    "ingredient alternatives must be unique by canonical or unresolved identity within a group".into(),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2057,12 +2178,19 @@ async fn canonical_ingredient_is_visible(
              WHERE ri.canonical_ingredient_id = c.id
                AND (r.owner_id = ? OR r.visibility = 'public')
            ) OR EXISTS (
+             SELECT 1 FROM recipe_ingredient_alternatives ria
+             JOIN recipe_ingredient_groups rig ON rig.id = ria.group_id
+             JOIN recipes r ON r.id = rig.recipe_id
+             WHERE ria.canonical_ingredient_id = c.id
+               AND (r.owner_id = ? OR r.visibility = 'public')
+           ) OR EXISTS (
              SELECT 1 FROM ingredient_aliases a
              WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?
            )
          )",
     )
     .bind(canonical_id)
+    .bind(owner_id)
     .bind(owner_id)
     .bind(owner_id)
     .bind(owner_id)
@@ -2082,6 +2210,25 @@ pub(crate) async fn validate_ingredient_selections(
                 return Err(AppError::Validation(
                     "selected canonical ingredient is not available to this account".into(),
                 ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn validate_group_selections(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner_id: &str,
+    groups: &[IngredientGroupInput],
+) -> AppResult<()> {
+    for group in groups {
+        for alternative in &group.alternatives {
+            if let Some(selected_id) = alternative.canonical_ingredient_id.as_deref() {
+                if !canonical_ingredient_is_visible(transaction, owner_id, selected_id).await? {
+                    return Err(AppError::Validation(
+                        "selected canonical ingredient is not available to this account".into(),
+                    ));
+                }
             }
         }
     }
@@ -2176,11 +2323,19 @@ async fn canonical_ingredient_is_visible_pool(
              WHERE ri.canonical_ingredient_id = c.id
                AND (r.owner_id = ? OR r.visibility = 'public')
            )
+           OR EXISTS (
+             SELECT 1 FROM recipe_ingredient_alternatives ria
+             JOIN recipe_ingredient_groups rig ON rig.id = ria.group_id
+             JOIN recipes r ON r.id = rig.recipe_id
+             WHERE ria.canonical_ingredient_id = c.id
+               AND (r.owner_id = ? OR r.visibility = 'public')
+           )
            OR EXISTS (SELECT 1 FROM ingredient_aliases a
                       WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?)
          )",
     )
     .bind(canonical_id)
+    .bind(owner_id)
     .bind(owner_id)
     .bind(owner_id)
     .bind(owner_id)
@@ -2242,61 +2397,120 @@ async fn save_recipe(
     .bind(optional_text(&input.source_attribution))
     .execute(&mut *transaction)
     .await?;
-    insert_ingredients(&mut transaction, id, owner_id, &input.ingredients).await?;
+    let groups = effective_ingredient_groups(input)?;
+    insert_ingredient_groups(&mut transaction, id, owner_id, &groups).await?;
     transaction.commit().await?;
     Ok(())
 }
 
-pub(crate) async fn replace_ingredients(
+pub(crate) async fn replace_ingredient_groups(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     recipe_id: &str,
     owner_id: &str,
-    ingredients: &[IngredientInput],
+    groups: &[IngredientGroupInput],
 ) -> AppResult<()> {
-    let ingredients = resolve_ingredients(transaction, owner_id, ingredients).await?;
+    let mut groups = groups.to_vec();
+    for group in &mut groups {
+        for alternative in &mut group.alternatives {
+            alternative.canonical_ingredient_id = Some(
+                resolve_canonical_ingredient(
+                    transaction,
+                    owner_id,
+                    &alternative.name,
+                    alternative.canonical_ingredient_id.as_deref(),
+                )
+                .await?,
+            );
+        }
+    }
+    sqlx::query("DELETE FROM recipe_ingredient_groups WHERE recipe_id = ?")
+        .bind(recipe_id)
+        .execute(&mut **transaction)
+        .await?;
     sqlx::query("DELETE FROM recipe_ingredients WHERE recipe_id = ?")
         .bind(recipe_id)
         .execute(&mut **transaction)
         .await?;
-    insert_resolved_ingredients(transaction, recipe_id, &ingredients).await
+    insert_ingredient_groups_inner(transaction, recipe_id, owner_id, &groups, true).await
 }
 
-pub(crate) async fn insert_ingredients(
+pub(crate) async fn insert_ingredient_groups(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     recipe_id: &str,
     owner_id: &str,
-    ingredients: &[IngredientInput],
+    groups: &[IngredientGroupInput],
 ) -> AppResult<()> {
-    let ingredients = resolve_ingredients(transaction, owner_id, ingredients).await?;
-    insert_resolved_ingredients(transaction, recipe_id, &ingredients).await
+    insert_ingredient_groups_inner(transaction, recipe_id, owner_id, groups, false).await
 }
 
-async fn resolve_ingredients(
+async fn insert_ingredient_groups_inner(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    recipe_id: &str,
     owner_id: &str,
-    ingredients: &[IngredientInput],
-) -> AppResult<Vec<(IngredientInput, String)>> {
-    let ingredients = expand_ingredient_inputs(ingredients.to_vec());
-    let mut resolved = Vec::with_capacity(ingredients.len());
-    for ingredient in ingredients {
-        let canonical_id = resolve_canonical_ingredient(
-            transaction,
-            owner_id,
-            &ingredient.name,
-            ingredient.canonical_ingredient_id.as_deref(),
+    groups: &[IngredientGroupInput],
+    canonical_ids_prevalidated: bool,
+) -> AppResult<()> {
+    validate_ingredient_groups(groups)?;
+    let mut ordered_groups = groups.iter().collect::<Vec<_>>();
+    ordered_groups.sort_by_key(|group| group.sort_order);
+    for group in ordered_groups {
+        let group_sort = group.sort_order;
+        let persisted_group_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO recipe_ingredient_groups
+             (id, recipe_id, external_id, optional, note, sort_order)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
+        .bind(&persisted_group_id)
+        .bind(recipe_id)
+        .bind(&group.id)
+        .bind(group.optional)
+        .bind(group.note.trim())
+        .bind(group_sort)
+        .execute(&mut **transaction)
         .await?;
-        resolved.push((ingredient, canonical_id));
-    }
-    Ok(resolved)
-}
-
-async fn insert_resolved_ingredients(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    recipe_id: &str,
-    ingredients: &[(IngredientInput, String)],
-) -> AppResult<()> {
-    for (index, (ingredient, canonical_id)) in ingredients.iter().enumerate() {
+        let mut resolved = Vec::with_capacity(group.alternatives.len());
+        let mut ordered_alternatives = group.alternatives.iter().collect::<Vec<_>>();
+        ordered_alternatives.sort_by_key(|alternative| alternative.sort_order);
+        for alternative in ordered_alternatives {
+            let canonical_id = if canonical_ids_prevalidated {
+                alternative
+                    .canonical_ingredient_id
+                    .clone()
+                    .ok_or_else(|| AppError::Data("resolved ingredient is missing an id".into()))?
+            } else {
+                resolve_canonical_ingredient(
+                    transaction,
+                    owner_id,
+                    &alternative.name,
+                    alternative.canonical_ingredient_id.as_deref(),
+                )
+                .await?
+            };
+            sqlx::query(
+                "INSERT INTO recipe_ingredient_alternatives
+                 (id, group_id, external_id, name, normalized_name, quantity_note,
+                  canonical_ingredient_id, sort_order)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&persisted_group_id)
+            .bind(&alternative.id)
+            .bind(clean_display_name(&alternative.name))
+            .bind(normalize_ingredient(&alternative.name))
+            .bind(alternative.quantity_note.trim())
+            .bind(&canonical_id)
+            .bind(alternative.sort_order)
+            .execute(&mut **transaction)
+            .await?;
+            resolved.push((alternative, canonical_id));
+        }
+        let display_name = resolved
+            .iter()
+            .map(|(alternative, _)| clean_display_name(&alternative.name))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let display_canonical = (resolved.len() == 1).then(|| resolved[0].1.clone());
         sqlx::query(
             "INSERT INTO recipe_ingredients
              (id, recipe_id, name, normalized_name, quantity_note, sort_order,
@@ -2305,14 +2519,15 @@ async fn insert_resolved_ingredients(
         )
         .bind(Uuid::new_v4().to_string())
         .bind(recipe_id)
-        .bind(clean_display_name(&ingredient.name))
-        .bind(normalize_ingredient(&ingredient.name))
-        .bind(ingredient.quantity_note.trim())
-        .bind(
-            i64::try_from(index)
-                .map_err(|_| AppError::Validation("too many ingredients".into()))?,
-        )
-        .bind(canonical_id)
+        .bind(&display_name)
+        .bind(normalize_ingredient(&display_name))
+        .bind(if resolved.len() == 1 {
+            resolved[0].0.quantity_note.trim()
+        } else {
+            group.note.trim()
+        })
+        .bind(group_sort)
+        .bind(display_canonical)
         .execute(&mut **transaction)
         .await?;
     }
@@ -2393,8 +2608,15 @@ pub(crate) async fn load_visible_recipes(
         } else {
             None
         };
+        let ingredients = load_ingredients(pool, &recipe_id).await?;
+        let mut ingredient_groups = load_ingredient_groups(pool, &recipe_id).await?;
+        if ingredient_groups.is_empty() {
+            ingredient_groups = legacy_projection_groups(&recipe_id, &ingredients);
+        }
         recipes.push(Recipe {
-            ingredients: load_ingredients(pool, &recipe_id).await?,
+            ingredient_model: "groups-v1".into(),
+            ingredient_groups,
+            ingredients,
             cover_image: load_recipe_image_meta(pool, &recipe_id).await?,
             id: recipe_id,
             is_owner: owner_id == user_id,
@@ -2466,7 +2688,9 @@ async fn load_candidate_recipes(
             OR (? AND r.visibility = 'public'
                     AND EXISTS(SELECT 1 FROM favorite_accounts fa
                                WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id))
-            OR (? AND r.owner_id <> ? AND r.visibility = 'public')",
+            OR (? AND r.owner_id <> ? AND r.visibility = 'public')
+         ORDER BY r.id
+         LIMIT ?",
     )
     .bind(user_id)
     .bind(user_id)
@@ -2479,8 +2703,14 @@ async fn load_candidate_recipes(
     .bind(user_id)
     .bind(settings.include_other_public)
     .bind(user_id)
+    .bind(MAX_RECOMMENDATION_CANDIDATES + 1)
     .fetch_all(&mut **transaction)
     .await?;
+    if rows.len() as i64 > MAX_RECOMMENDATION_CANDIDATES {
+        return Err(AppError::PayloadTooLarge(
+            "recommendation candidate limit exceeded".into(),
+        ));
+    }
     let ingredient_rows = sqlx::query(
         "WITH candidates AS (
            SELECT r.id
@@ -2493,11 +2723,14 @@ async fn load_candidate_recipes(
                       AND EXISTS(SELECT 1 FROM favorite_accounts fa
                                  WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id))
               OR (? AND r.owner_id <> ? AND r.visibility = 'public')
+           ORDER BY r.id
+           LIMIT ?
          )
          SELECT ri.recipe_id, ri.name, ri.quantity_note, ri.canonical_ingredient_id
          FROM recipe_ingredients ri
          JOIN candidates c ON c.id = ri.recipe_id
-         ORDER BY ri.recipe_id, ri.sort_order",
+         ORDER BY ri.recipe_id, ri.sort_order
+         LIMIT ?",
     )
     .bind(settings.include_own)
     .bind(user_id)
@@ -2508,8 +2741,15 @@ async fn load_candidate_recipes(
     .bind(user_id)
     .bind(settings.include_other_public)
     .bind(user_id)
+    .bind(MAX_RECOMMENDATION_CANDIDATES)
+    .bind(MAX_RECOMMENDATION_INGREDIENT_ROWS + 1)
     .fetch_all(&mut **transaction)
     .await?;
+    if ingredient_rows.len() as i64 > MAX_RECOMMENDATION_INGREDIENT_ROWS {
+        return Err(AppError::PayloadTooLarge(
+            "recommendation ingredient row limit exceeded".into(),
+        ));
+    }
     let mut ingredients = std::collections::HashMap::<String, Vec<IngredientInput>>::new();
     for row in ingredient_rows {
         ingredients
@@ -2521,13 +2761,91 @@ async fn load_candidate_recipes(
                 canonical_ingredient_id: row.get("canonical_ingredient_id"),
             });
     }
+    let group_rows = sqlx::query(
+        "WITH candidates AS (
+           SELECT r.id FROM recipes r
+           WHERE (? AND r.owner_id = ?)
+              OR (? AND EXISTS(SELECT 1 FROM favorites f
+                               WHERE f.user_id = ? AND f.recipe_id = r.id)
+                      AND (r.owner_id = ? OR r.visibility = 'public'))
+              OR (? AND r.visibility = 'public'
+                      AND EXISTS(SELECT 1 FROM favorite_accounts fa
+                                 WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id))
+              OR (? AND r.owner_id <> ? AND r.visibility = 'public')
+           ORDER BY r.id
+           LIMIT ?
+         )
+         SELECT g.recipe_id, g.external_id AS group_id, g.optional, g.note,
+                g.sort_order AS group_sort, a.external_id AS alternative_id, a.name,
+                a.quantity_note, a.canonical_ingredient_id,
+                a.sort_order AS alternative_sort
+         FROM recipe_ingredient_groups g
+         JOIN candidates c ON c.id = g.recipe_id
+         JOIN recipe_ingredient_alternatives a ON a.group_id = g.id
+         ORDER BY g.recipe_id, g.sort_order, a.sort_order
+         LIMIT ?",
+    )
+    .bind(settings.include_own)
+    .bind(user_id)
+    .bind(settings.include_favorite_recipes)
+    .bind(user_id)
+    .bind(user_id)
+    .bind(settings.include_favorite_accounts)
+    .bind(user_id)
+    .bind(settings.include_other_public)
+    .bind(user_id)
+    .bind(MAX_RECOMMENDATION_CANDIDATES)
+    .bind(MAX_RECOMMENDATION_INGREDIENT_ROWS + 1)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if group_rows.len() as i64 > MAX_RECOMMENDATION_INGREDIENT_ROWS {
+        return Err(AppError::PayloadTooLarge(
+            "recommendation ingredient row limit exceeded".into(),
+        ));
+    }
+    let mut groups = std::collections::HashMap::<String, Vec<IngredientGroupInput>>::new();
+    for row in group_rows {
+        let recipe_id: String = row.get("recipe_id");
+        let group_id: String = row.get("group_id");
+        let recipe_groups = groups.entry(recipe_id).or_default();
+        if recipe_groups
+            .last()
+            .is_none_or(|group| group.id != group_id)
+        {
+            recipe_groups.push(IngredientGroupInput {
+                id: group_id,
+                optional: row.get("optional"),
+                note: row.get("note"),
+                sort_order: row.get("group_sort"),
+                alternatives: Vec::new(),
+            });
+        }
+        recipe_groups
+            .last_mut()
+            .expect("group was inserted")
+            .alternatives
+            .push(IngredientAlternativeInput {
+                id: row.get("alternative_id"),
+                name: row.get("name"),
+                quantity_note: row.get("quantity_note"),
+                canonical_ingredient_id: row.get("canonical_ingredient_id"),
+                sort_order: row.get("alternative_sort"),
+            });
+    }
     Ok(rows
         .into_iter()
         .map(|row| {
             let id: String = row.get("id");
             let owner_id: String = row.get("owner_id");
+            let recipe_ingredients = ingredients.remove(&id).unwrap_or_default();
+            let mut recipe_groups = groups.remove(&id).unwrap_or_default();
+            if recipe_groups.is_empty() {
+                recipe_groups = legacy_projection_groups(&id, &recipe_ingredients);
+            }
             Recipe {
-                ingredients: ingredients.remove(&id).unwrap_or_default(),
+                ingredients: recipe_ingredients,
+                ingredient_model: "groups-v1".into(),
+                ingredient_groups: recipe_groups,
                 id,
                 is_owner: owner_id == user_id,
                 owner_id,
@@ -2694,6 +3012,72 @@ pub(crate) async fn load_ingredients(
         .collect())
 }
 
+fn legacy_projection_groups(
+    recipe_id: &str,
+    ingredients: &[IngredientInput],
+) -> Vec<IngredientGroupInput> {
+    ingredients
+        .iter()
+        .enumerate()
+        .map(|(index, ingredient)| IngredientGroupInput {
+            id: format!("legacy:{recipe_id}:group:{index}"),
+            optional: false,
+            note: String::new(),
+            sort_order: index as i64,
+            alternatives: vec![IngredientAlternativeInput {
+                id: format!("legacy:{recipe_id}:alternative:{index}"),
+                name: ingredient.name.clone(),
+                quantity_note: ingredient.quantity_note.clone(),
+                canonical_ingredient_id: ingredient.canonical_ingredient_id.clone(),
+                sort_order: 0,
+            }],
+        })
+        .collect()
+}
+
+pub(crate) async fn load_ingredient_groups(
+    pool: &SqlitePool,
+    recipe_id: &str,
+) -> AppResult<Vec<IngredientGroupInput>> {
+    let rows = sqlx::query(
+        "SELECT g.external_id AS group_id, g.optional, g.note, g.sort_order AS group_sort,
+                a.external_id AS alternative_id, a.name, a.quantity_note,
+                a.canonical_ingredient_id, a.sort_order AS alternative_sort
+         FROM recipe_ingredient_groups g
+         JOIN recipe_ingredient_alternatives a ON a.group_id = g.id
+         WHERE g.recipe_id = ?
+         ORDER BY g.sort_order, a.sort_order",
+    )
+    .bind(recipe_id)
+    .fetch_all(pool)
+    .await?;
+    let mut groups = Vec::<IngredientGroupInput>::new();
+    for row in rows {
+        let group_id: String = row.get("group_id");
+        if groups.last().is_none_or(|group| group.id != group_id) {
+            groups.push(IngredientGroupInput {
+                id: group_id,
+                optional: row.get("optional"),
+                note: row.get("note"),
+                sort_order: row.get("group_sort"),
+                alternatives: Vec::new(),
+            });
+        }
+        groups
+            .last_mut()
+            .expect("group was inserted")
+            .alternatives
+            .push(IngredientAlternativeInput {
+                id: row.get("alternative_id"),
+                name: row.get("name"),
+                quantity_note: row.get("quantity_note"),
+                canonical_ingredient_id: row.get("canonical_ingredient_id"),
+                sort_order: row.get("alternative_sort"),
+            });
+    }
+    Ok(groups)
+}
+
 async fn ensure_visible_recipe(pool: &SqlitePool, user_id: &str, recipe_id: &str) -> AppResult<()> {
     let exists: Option<(i64,)> = sqlx::query_as(
         "SELECT 1 FROM recipes WHERE id = ? AND (owner_id = ? OR visibility = 'public')",
@@ -2705,18 +3089,19 @@ async fn ensure_visible_recipe(pool: &SqlitePool, user_id: &str, recipe_id: &str
     exists.map(|_| ()).ok_or(AppError::NotFound)
 }
 
+type PantryRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    i64,
+);
+
 async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryItem>> {
-    type PantryRow = (
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        bool,
-        i64,
-    );
     let rows: Vec<PantryRow> = sqlx::query_as(
         "SELECT id, name, status, quantity_note, confirmed_at, expires_on,
                 canonical_ingredient_id, auto_add_to_shopping_list_when_out, version
@@ -2726,9 +3111,6 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
     .bind(MAX_PANTRY_ITEMS_PER_OWNER + 1)
     .fetch_all(pool)
     .await?;
-    if rows.len() as i64 > MAX_PANTRY_ITEMS_PER_OWNER {
-        return Err(AppError::Validation("pantry item limit exceeded".into()));
-    }
     let alias_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT canonical_ingredient_id, alias_normalized
          FROM ingredient_aliases WHERE owner_id = ?
@@ -2738,6 +3120,41 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
     .bind(MAX_INGREDIENT_ALIASES_PER_OWNER + 1)
     .fetch_all(pool)
     .await?;
+    pantry_from_rows(rows, alias_rows)
+}
+
+async fn load_pantry_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+) -> AppResult<Vec<PantryItem>> {
+    let rows: Vec<PantryRow> = sqlx::query_as(
+        "SELECT id, name, status, quantity_note, confirmed_at, expires_on,
+                canonical_ingredient_id, auto_add_to_shopping_list_when_out, version
+         FROM pantry_items WHERE owner_id = ? ORDER BY normalized_name LIMIT ?",
+    )
+    .bind(user_id)
+    .bind(MAX_PANTRY_ITEMS_PER_OWNER + 1)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let alias_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT canonical_ingredient_id, alias_normalized
+         FROM ingredient_aliases WHERE owner_id = ?
+         ORDER BY alias_normalized LIMIT ?",
+    )
+    .bind(user_id)
+    .bind(MAX_INGREDIENT_ALIASES_PER_OWNER + 1)
+    .fetch_all(&mut **transaction)
+    .await?;
+    pantry_from_rows(rows, alias_rows)
+}
+
+fn pantry_from_rows(
+    rows: Vec<PantryRow>,
+    alias_rows: Vec<(String, String)>,
+) -> AppResult<Vec<PantryItem>> {
+    if rows.len() as i64 > MAX_PANTRY_ITEMS_PER_OWNER {
+        return Err(AppError::Validation("pantry item limit exceeded".into()));
+    }
     if alias_rows.len() as i64 > MAX_INGREDIENT_ALIASES_PER_OWNER {
         return Err(AppError::Validation(
             "ingredient alias limit exceeded".into(),
@@ -2920,6 +3337,28 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         response_json(response).await
+    }
+
+    async fn delete_shopping_item(
+        app: &axum::Router,
+        cookie: &str,
+        item_id: &str,
+        expected_version: i64,
+        key: &str,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::delete(format!("/api/shopping-list/{item_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .header("idempotency-key", key)
+                    .body(Body::from(
+                        json!({"expectedVersion": expected_version}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     async fn save_locale(app: &axum::Router, cookie: &str, locale: &str) -> Value {
@@ -3281,7 +3720,7 @@ mod tests {
             app.oneshot(
                 Request::post("/api/recommendations")
                     .header("content-type", "application/json")
-                    .header("cookie", viewer_cookie)
+                    .header("cookie", &viewer_cookie)
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -3330,7 +3769,7 @@ mod tests {
                 .oneshot(
                     Request::post("/api/recommendations")
                         .header("content-type", "application/json")
-                        .header("cookie", viewer_cookie)
+                        .header("cookie", &viewer_cookie)
                         .body(Body::from("{}"))
                         .unwrap(),
                 )
@@ -3415,10 +3854,11 @@ mod tests {
 
         let started = Instant::now();
         let response = app
+            .clone()
             .oneshot(
                 Request::post("/api/recommendations?limit=37")
                     .header("content-type", "application/json")
-                    .header("cookie", viewer_cookie)
+                    .header("cookie", &viewer_cookie)
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -3429,6 +3869,27 @@ mod tests {
         let recommendations = response_json(response).await;
         assert_eq!(recommendations.as_array().unwrap().len(), 37);
         eprintln!("10k candidate recommendation duration: {elapsed:?}");
+
+        sqlx::query(
+            "INSERT INTO recipes
+               (id, owner_id, title, description, instructions, visibility, created_at, updated_at)
+             VALUES ('scale-recipe-over-limit', 'scale-author-0001', 'Over limit',
+                     '', '', 'public', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let over_limit = app
+            .oneshot(
+                Request::post("/api/recommendations?limit=37")
+                    .header("content-type", "application/json")
+                    .header("cookie", viewer_cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(over_limit.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
@@ -3684,6 +4145,133 @@ mod tests {
             .find(|item| item["recipe"]["id"] == other_recipe["id"])
             .unwrap();
         assert_eq!(other_result["inShoppingList"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn recommendation_scope_uses_owner_exact_choices_and_rejects_legacy_conflicts() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Scope owner").await;
+        let other_cookie = login(&app, "Scope other").await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Public choice",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "visibility": "public",
+                            "ingredientModel": "groups-v1",
+                            "ingredientGroups": [{
+                                "id": "fat",
+                                "optional": false,
+                                "note": "",
+                                "sortOrder": 0,
+                                "alternatives": [
+                                    {"id": "butter", "name": "butter", "quantityNote": "", "sortOrder": 0},
+                                    {"id": "oil", "name": "oil", "quantityNote": "", "sortOrder": 1}
+                                ]
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = response_json(created).await;
+        let recipe_id = created["id"].as_str().unwrap();
+        let added = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/shopping-list-items"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(json!({"groupId": "fat"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(added.status(), StatusCode::CREATED);
+
+        let owner = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({"ingredientScope": "PANTRY_OR_LIST"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let owner = response_json(owner).await;
+        let owner_result = owner
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == recipe_id)
+            .unwrap();
+        assert_eq!(owner_result["status"], "SHOP");
+        assert_eq!(owner_result["rankingIntent"]["scopeEligible"], true);
+        assert_eq!(
+            owner_result["ingredientGroupReasons"][0]["action"],
+            "SHOPPING_PLANNED"
+        );
+        assert_eq!(
+            owner_result["appliedControls"]["ingredientScope"],
+            "PANTRY_OR_LIST"
+        );
+
+        let other = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", other_cookie)
+                    .body(Body::from(
+                        json!({"ingredientScope": "PANTRY_OR_LIST"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let other = response_json(other).await;
+        let other_result = other
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == recipe_id)
+            .unwrap();
+        assert_eq!(other_result["status"], "BLOCKED");
+        assert_eq!(other_result["rankingIntent"]["scopeEligible"], false);
+        assert_eq!(
+            other_result["ingredientGroupReasons"][0]["action"],
+            "MISSING"
+        );
+
+        let conflict = app
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "ingredientScope": "PANTRY_ONLY",
+                            "pantryOnly": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -5292,6 +5880,186 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn grouped_ids_are_resource_scoped_and_legacy_updates_cannot_flatten_import_drafts() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Grouped owner").await;
+        let recipe_payload = json!({
+            "title": "Scoped IDs",
+            "description": "",
+            "instructions": "Cook.",
+            "visibility": "private",
+            "ingredientModel": "groups-v1",
+            "ingredientGroups": [{
+                "id": "reusable-group",
+                "optional": false,
+                "note": "group note",
+                "sortOrder": 0,
+                "alternatives": [{
+                    "id": "reusable-alternative",
+                    "name": "beans",
+                    "quantityNote": "2 cups",
+                    "sortOrder": 0
+                }]
+            }]
+        });
+        let mut first_recipe = None;
+        for title in ["First scoped recipe", "Second scoped recipe"] {
+            let mut payload = recipe_payload.clone();
+            payload["title"] = json!(title);
+            let created = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/recipes")
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let created = response_json(created).await;
+            assert_eq!(created["ingredientGroups"][0]["id"], "reusable-group");
+            assert_eq!(
+                created["ingredientGroups"][0]["alternatives"][0]["id"],
+                "reusable-alternative"
+            );
+            assert_eq!(created["ingredients"][0]["quantityNote"], "2 cups");
+            if first_recipe.is_none() {
+                first_recipe = Some((
+                    created["id"].as_str().unwrap().to_string(),
+                    created["version"].as_i64().unwrap(),
+                ));
+            }
+        }
+        let (first_recipe_id, first_recipe_version) = first_recipe.unwrap();
+        let legacy_recipe_update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/recipes/{first_recipe_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("if-match", format!("\"recipe-v{first_recipe_version}\""))
+                    .body(Body::from(
+                        json!({
+                            "title": "Legacy flatten attempt",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "visibility": "private",
+                            "ingredients": [{"name": "beans", "quantityNote": "2 cups"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_recipe_update.status(), StatusCode::BAD_REQUEST);
+
+        let token = create_import_token(&app, &cookie).await;
+        let secret = token["secret"].as_str().unwrap();
+        let grouped_import = json!({
+            "schemaVersion": "2.0",
+            "sourceUrl": "https://example.test/grouped",
+            "title": "Grouped draft",
+            "ingredientModel": "groups-v1",
+            "ingredientGroups": [{
+                "id": "reusable-group",
+                "optional": true,
+                "note": "optional spread",
+                "sortOrder": 0,
+                "alternatives": [
+                    {"id": "reusable-alternative", "name": "butter", "quantityNote": "1 tbsp", "sortOrder": 0},
+                    {"id": "oil", "name": "oil", "quantityNote": "2 tbsp", "sortOrder": 1}
+                ]
+            }],
+            "steps": ["Cook."]
+        });
+        let first = submit_import(&app, secret, grouped_import.clone()).await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first = response_json(first).await;
+        let draft_id = first["id"].as_str().unwrap();
+        let second = submit_import(&app, secret, grouped_import).await;
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let single = submit_import(
+            &app,
+            secret,
+            json!({
+                "schemaVersion": "2.0",
+                "sourceUrl": "https://example.test/single-grouped",
+                "title": "Single grouped draft",
+                "ingredientModel": "groups-v1",
+                "ingredientGroups": [{
+                    "id": "reusable-group",
+                    "optional": false,
+                    "note": "draft group note",
+                    "sortOrder": 0,
+                    "alternatives": [{
+                        "id": "reusable-alternative",
+                        "name": "lentils",
+                        "quantityNote": "3 cups",
+                        "sortOrder": 0
+                    }]
+                }],
+                "steps": ["Cook."]
+            }),
+        )
+        .await;
+        assert_eq!(single.status(), StatusCode::CREATED);
+        let single = response_json(single).await;
+        assert_eq!(single["ingredients"][0]["quantityNote"], "3 cups");
+        let single_draft_id = single["id"].as_str().unwrap();
+        let single_legacy_update = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/import-drafts/{single_draft_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Flattened single",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "ingredients": [{"name": "lentils", "quantityNote": "3 cups"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(single_legacy_update.status(), StatusCode::BAD_REQUEST);
+
+        let legacy_update = app
+            .oneshot(
+                Request::put(format!("/api/import-drafts/{draft_id}"))
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Flattened",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "ingredients": [{"name": "butter", "quantityNote": "1 tbsp"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_update.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8(
+            to_bytes(legacy_update.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec()
+        )
+        .unwrap()
+        .contains("ingredient_groups_required"));
     }
 
     #[tokio::test]
@@ -7123,6 +7891,470 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(me.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn shopping_choice_purchase_applies_only_selected_alternative_and_undo_restores_choice() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Flexible toast",
+                            "description": "",
+                            "instructions": "Toast.",
+                            "visibility": "private",
+                            "ingredientModel": "groups-v1",
+                            "ingredientGroups": [{
+                                "id": "spread",
+                                "optional": false,
+                                "note": "",
+                                "sortOrder": 0,
+                                "alternatives": [
+                                    {"id": "butter", "name": "butter", "quantityNote": "", "sortOrder": 0},
+                                    {"id": "oil", "name": "olive oil", "quantityNote": "", "sortOrder": 1}
+                                ]
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let recipe = response_json(created).await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        let added = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/shopping-list-items"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(json!({"groupId": "spread"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(added.status(), StatusCode::CREATED);
+        let items = response_json(added).await;
+        assert_eq!(
+            items[0]["purchaseOptions"]["resolution"],
+            "selectAlternative"
+        );
+        assert_eq!(items[0]["choiceAlternatives"].as_array().unwrap().len(), 2);
+        let item_id = items[0]["id"].as_str().unwrap();
+        let version = items[0]["version"].as_i64().unwrap();
+        let purchase_key = format!("{}.choice-purchase", Utc::now().timestamp());
+        let purchased = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/{item_id}/purchase"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("idempotency-key", purchase_key)
+                    .body(Body::from(
+                        json!({
+                            "disposition": "remove",
+                            "shoppingExpectedVersion": version,
+                            "selectedAlternativeId": "oil",
+                            "createUsingCurrentName": true,
+                            "quantityNote": "",
+                            "autoAddToShoppingListWhenOut": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(purchased.status(), StatusCode::OK);
+        let purchased = response_json(purchased).await;
+        assert_eq!(purchased["pantry"]["name"], "olive oil");
+        assert!(purchased["shoppingItems"].as_array().unwrap().is_empty());
+        let action_id = purchased["purchaseActionId"].as_str().unwrap();
+        let undone = app
+            .oneshot(
+                Request::post(format!("/api/shopping-list/purchases/{action_id}/undo"))
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(undone.status(), StatusCode::OK);
+        let restored = response_json(undone).await;
+        assert_eq!(
+            restored[0]["choiceAlternatives"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn shopping_delete_is_versioned_idempotent_owner_scoped_and_leaves_pantry_and_recipes() {
+        let app = build_app(Config::test()).await.unwrap();
+        let owner_cookie = login(&app, "Owner").await;
+        let other_cookie = login(&app, "Other").await;
+        let pantry = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!([{"name": "milk", "status": "have", "quantityNote": "1 carton"}])
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pantry_before = response_json(pantry).await;
+
+        let manual = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(json!({"name": "salt"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let manual = response_json(manual).await;
+        let manual_id = manual[0]["id"].as_str().unwrap();
+        let manual_version = manual[0]["version"].as_i64().unwrap();
+        let key = format!("{}.delete-manual", Utc::now().timestamp());
+        let first =
+            delete_shopping_item(&app, &owner_cookie, manual_id, manual_version, &key).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+        assert_eq!(first_body["outcome"], "removed");
+        assert_eq!(first_body["undoAvailable"], false);
+        for _ in 0..2 {
+            let replay =
+                delete_shopping_item(&app, &owner_cookie, manual_id, manual_version, &key).await;
+            assert_eq!(replay.status(), StatusCode::OK);
+            assert_eq!(response_json(replay).await, first_body);
+        }
+
+        let pantry_after = app
+            .clone()
+            .oneshot(
+                Request::get("/api/pantry")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(pantry_after).await, pantry_before);
+
+        let recipe = create_recipe(&app, &owner_cookie, "private").await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        let recipe_item = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/recipes/{recipe_id}/shopping-list-items"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(json!({"name": "water"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let recipe_item = response_json(recipe_item).await;
+        let recipe_item_id = recipe_item[0]["id"].as_str().unwrap();
+        let recipe_item_version = recipe_item[0]["version"].as_i64().unwrap();
+        let deleted_recipe_source = delete_shopping_item(
+            &app,
+            &owner_cookie,
+            recipe_item_id,
+            recipe_item_version,
+            &format!("{}.delete-recipe", Utc::now().timestamp()),
+        )
+        .await;
+        assert_eq!(deleted_recipe_source.status(), StatusCode::OK);
+        let recipe_after = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(recipe_after).await["ingredients"],
+            recipe["ingredients"]
+        );
+
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(json!({"name": "pepper"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stale = response_json(stale).await;
+        let stale_id = stale[0]["id"].as_str().unwrap();
+        let stale_version = stale[0]["version"].as_i64().unwrap();
+        let bumped = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(json!({"name": "pepper"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bumped.status(), StatusCode::CREATED);
+        let conflict = delete_shopping_item(
+            &app,
+            &owner_cookie,
+            stale_id,
+            stale_version,
+            &format!("{}.delete-stale", Utc::now().timestamp()),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let other = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &other_cookie)
+                    .body(Body::from(json!({"name": "private spice"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let other = response_json(other).await;
+        let cross_account = delete_shopping_item(
+            &app,
+            &owner_cookie,
+            other[0]["id"].as_str().unwrap(),
+            other[0]["version"].as_i64().unwrap(),
+            &format!("{}.delete-cross-account", Utc::now().timestamp()),
+        )
+        .await;
+        assert_eq!(cross_account.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn shopping_delete_handles_automatic_only_and_merged_without_mutating_pantry() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let pantry = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": "milk",
+                            "status": "out",
+                            "quantityNote": "1 carton",
+                            "autoAddToShoppingListWhenOut": true
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pantry_before = response_json(pantry).await;
+        let canonical_id = pantry_before[0]["canonicalIngredientId"].as_str().unwrap();
+        let automatic_id = format!("auto:{}", pantry_before[0]["id"].as_str().unwrap());
+        let automatic_version = pantry_before[0]["version"].as_i64().unwrap();
+        let automatic = delete_shopping_item(
+            &app,
+            &cookie,
+            &automatic_id,
+            automatic_version,
+            &format!("{}.delete-automatic", Utc::now().timestamp()),
+        )
+        .await;
+        assert_eq!(automatic.status(), StatusCode::OK);
+        let automatic = response_json(automatic).await;
+        assert_eq!(automatic["outcome"], "automaticOnly");
+        assert_eq!(automatic["requiresDisableAutoRestock"], true);
+        assert_eq!(automatic["shoppingItems"][0]["id"], automatic_id);
+
+        let merged = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({"name": "milk", "canonicalIngredientId": canonical_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let merged = response_json(merged).await;
+        let persisted = merged
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| !item["id"].as_str().unwrap().starts_with("auto:"))
+            .unwrap();
+        assert!(persisted["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["kind"] == "automatic"));
+        let deleted = delete_shopping_item(
+            &app,
+            &cookie,
+            persisted["id"].as_str().unwrap(),
+            persisted["version"].as_i64().unwrap(),
+            &format!("{}.delete-merged", Utc::now().timestamp()),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted = response_json(deleted).await;
+        assert_eq!(deleted["outcome"], "automaticRemains");
+        assert_eq!(deleted["requiresDisableAutoRestock"], true);
+        assert_eq!(deleted["shoppingItems"][0]["id"], automatic_id);
+        let pantry_after = app
+            .oneshot(
+                Request::get("/api/pantry")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(pantry_after).await, pantry_before);
+    }
+
+    #[tokio::test]
+    async fn shopping_choice_delete_removes_only_the_exact_choice_item() {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Two choices",
+                            "description": "",
+                            "instructions": "Cook.",
+                            "visibility": "private",
+                            "ingredientModel": "groups-v1",
+                            "ingredientGroups": [
+                                {
+                                    "id": "fat",
+                                    "optional": false,
+                                    "note": "",
+                                    "sortOrder": 0,
+                                    "alternatives": [
+                                        {"id": "butter", "name": "butter", "quantityNote": "", "sortOrder": 0},
+                                        {"id": "oil", "name": "oil", "quantityNote": "", "sortOrder": 1}
+                                    ]
+                                },
+                                {
+                                    "id": "herb",
+                                    "optional": false,
+                                    "note": "",
+                                    "sortOrder": 1,
+                                    "alternatives": [
+                                        {"id": "basil", "name": "basil", "quantityNote": "", "sortOrder": 0},
+                                        {"id": "parsley", "name": "parsley", "quantityNote": "", "sortOrder": 1}
+                                    ]
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let recipe = response_json(created).await;
+        let recipe_id = recipe["id"].as_str().unwrap();
+        for group_id in ["fat", "herb"] {
+            let added = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/recipes/{recipe_id}/shopping-list-items"))
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .body(Body::from(json!({"groupId": group_id}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(added.status(), StatusCode::CREATED);
+        }
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::get("/api/shopping-list")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed = response_json(listed).await;
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+        let fat = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "butter / oil")
+            .unwrap();
+        let deleted = delete_shopping_item(
+            &app,
+            &cookie,
+            fat["id"].as_str().unwrap(),
+            fat["version"].as_i64().unwrap(),
+            &format!("{}.delete-choice", Utc::now().timestamp()),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted = response_json(deleted).await;
+        assert_eq!(deleted["outcome"], "removed");
+        assert_eq!(deleted["shoppingItems"].as_array().unwrap().len(), 1);
+        assert_eq!(deleted["shoppingItems"][0]["name"], "basil / parsley");
+        let recipe_after = app
+            .oneshot(
+                Request::get(format!("/api/recipes/{recipe_id}"))
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(recipe_after).await["ingredientGroups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

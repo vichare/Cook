@@ -15,8 +15,8 @@ use crate::{
     error::{AppError, AppResult},
     ingredients::{bounded_levenshtein, clean_display_name, normalize_ingredient},
     models::{
-        PantryItem, PantryPurchaseCandidate, PantryStatus, ShoppingItem, ShoppingItemInput,
-        ShoppingItemSource, ShoppingPurchaseOptions,
+        PantryItem, PantryPurchaseCandidate, PantryStatus, ShoppingChoiceAlternative, ShoppingItem,
+        ShoppingItemInput, ShoppingItemSource, ShoppingPurchaseOptions,
     },
     routes::CurrentUser,
     AppState,
@@ -31,13 +31,20 @@ const MAX_SHOPPING_ITEMS_PER_OWNER: i64 = 500;
 const MAX_SHOPPING_SOURCES_PER_OWNER: i64 = 10_000;
 const MAX_INGREDIENT_ALIASES_PER_OWNER: i64 = 2_000;
 const PURCHASE_RATE_WINDOW_SECONDS: i64 = 60;
+const DELETE_ACTION_CAP: i64 = 200;
+const DELETE_RATE_LIMIT: i64 = 60;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecipeShoppingInput {
+    #[serde(default)]
     name: String,
     #[serde(default)]
     canonical_ingredient_id: Option<String>,
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    alternative_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -57,6 +64,8 @@ pub struct PurchaseInput {
     quantity_note: String,
     #[serde(default)]
     auto_add_to_shopping_list_when_out: bool,
+    #[serde(default)]
+    selected_alternative_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -64,6 +73,29 @@ pub struct PurchaseInput {
 enum PurchaseDisposition {
     Remove,
     Keep,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteInput {
+    expected_version: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DeleteOutcome {
+    Removed,
+    AutomaticRemains,
+    AutomaticOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResponse {
+    outcome: DeleteOutcome,
+    requires_disable_auto_restock: bool,
+    shopping_items: Vec<ShoppingItem>,
+    undo_available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +129,10 @@ struct ShoppingSnapshot {
     name: String,
     normalized_name: String,
     canonical_ingredient_id: Option<String>,
+    #[serde(default)]
+    choice_key: Option<String>,
+    #[serde(default)]
+    choice_alternatives: Vec<ShoppingChoiceAlternative>,
     version: i64,
     sources: Vec<SourceSnapshot>,
 }
@@ -116,6 +152,7 @@ struct StoredItem {
     name: String,
     normalized_name: String,
     canonical_ingredient_id: Option<String>,
+    choice_alternatives: Vec<ShoppingChoiceAlternative>,
     sources: Vec<ShoppingItemSource>,
     version: i64,
 }
@@ -201,37 +238,99 @@ pub async fn update_manual_item(
     Ok(Json(load_shopping_items(&state, &user.id).await?))
 }
 
-pub async fn delete_manual_item(
+pub async fn delete_item(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    headers: HeaderMap,
     Path(item_id): Path<String>,
-) -> AppResult<Json<Vec<ShoppingItem>>> {
-    let mut transaction = state.pool.begin().await?;
-    require_manual_source(&mut transaction, &user.id, &item_id).await?;
-    sqlx::query("DELETE FROM shopping_item_sources WHERE item_id = ? AND source_type = 'manual'")
-        .bind(&item_id)
-        .execute(&mut *transaction)
-        .await?;
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM shopping_item_sources WHERE item_id = ?")
-            .bind(&item_id)
-            .fetch_one(&mut *transaction)
-            .await?;
-    if remaining == 0 {
-        sqlx::query("DELETE FROM shopping_items WHERE id = ? AND owner_id = ?")
-            .bind(&item_id)
-            .bind(&user.id)
-            .execute(&mut *transaction)
-            .await?;
-    } else {
-        sqlx::query("UPDATE shopping_items SET version = version + 1, updated_at = ? WHERE id = ?")
-            .bind(Utc::now().timestamp())
-            .bind(&item_id)
-            .execute(&mut *transaction)
-            .await?;
+    Json(input): Json<DeleteInput>,
+) -> AppResult<Json<DeleteResponse>> {
+    if input.expected_version < 1 {
+        return Err(AppError::Validation(
+            "expectedVersion must be at least 1".into(),
+        ));
     }
+    let now = Utc::now().timestamp();
+    let key = idempotency_key(&headers, now)?;
+    let fingerprint: [u8; 32] =
+        Sha256::digest(serde_json::to_vec(&(&item_id, &input)).unwrap()).into();
+    let mut transaction = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    cleanup_delete_actions(&mut transaction, now).await?;
+    if let Some(response) = replay_delete(&mut transaction, &user.id, &key, &fingerprint).await? {
+        transaction.commit().await?;
+        return Ok(Json(response));
+    }
+    enforce_delete_rate_limit(&mut transaction, &user.id, now).await?;
+    enforce_delete_capacity(&mut transaction, &user.id, now).await?;
+
+    let response = if let Some(snapshot) =
+        load_shopping_snapshot(&mut transaction, &user.id, &item_id).await?
+    {
+        if snapshot.version != input.expected_version {
+            return Err(AppError::Conflict(
+                "shopping item changed; refresh and retry".into(),
+            ));
+        }
+        let automatic_remains =
+            has_automatic_identity(&mut transaction, &user.id, &snapshot).await?;
+        let deleted =
+            sqlx::query("DELETE FROM shopping_items WHERE id = ? AND owner_id = ? AND version = ?")
+                .bind(&item_id)
+                .bind(&user.id)
+                .bind(input.expected_version)
+                .execute(&mut *transaction)
+                .await?;
+        if deleted.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "shopping item changed; refresh and retry".into(),
+            ));
+        }
+        DeleteResponse {
+            outcome: if automatic_remains {
+                DeleteOutcome::AutomaticRemains
+            } else {
+                DeleteOutcome::Removed
+            },
+            requires_disable_auto_restock: automatic_remains,
+            shopping_items: load_shopping_items_tx(&mut transaction, &user.id).await?,
+            undo_available: false,
+        }
+    } else if let Some(pantry_id) = item_id.strip_prefix("auto:") {
+        let pantry = load_pantry_snapshot(&mut transaction, &user.id, pantry_id)
+            .await?
+            .filter(|item| item.status == "out" && item.auto_add_to_shopping_list_when_out)
+            .ok_or(AppError::NotFound)?;
+        if pantry.version != input.expected_version {
+            return Err(AppError::Conflict(
+                "shopping item changed; refresh and retry".into(),
+            ));
+        }
+        DeleteResponse {
+            outcome: DeleteOutcome::AutomaticOnly,
+            requires_disable_auto_restock: true,
+            shopping_items: load_shopping_items_tx(&mut transaction, &user.id).await?,
+            undo_available: false,
+        }
+    } else {
+        return Err(AppError::NotFound);
+    };
+    sqlx::query(
+        "INSERT INTO shopping_delete_actions
+         (id, owner_id, shopping_item_id, idempotency_key, request_fingerprint,
+          response_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&user.id)
+    .bind(&item_id)
+    .bind(&key)
+    .bind(fingerprint.as_slice())
+    .bind(serde_json::to_string(&response).map_err(|error| AppError::Data(error.to_string()))?)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
-    Ok(Json(load_shopping_items(&state, &user.id).await?))
+    Ok(Json(response))
 }
 
 pub async fn add_recipe_ingredient(
@@ -241,34 +340,98 @@ pub async fn add_recipe_ingredient(
     Json(input): Json<RecipeShoppingInput>,
 ) -> AppResult<(StatusCode, Json<Vec<ShoppingItem>>)> {
     let mut transaction = state.pool.begin().await?;
-    let normalized = normalize_ingredient(&input.name);
-    let ingredient = sqlx::query(
-        "SELECT r.title, ri.name, ri.canonical_ingredient_id
-         FROM recipes r JOIN recipe_ingredients ri ON ri.recipe_id = r.id
-         WHERE r.id = ? AND (r.owner_id = ? OR r.visibility = 'public')
-           AND ((? IS NOT NULL AND ri.canonical_ingredient_id = ?)
-             OR (? IS NULL AND ri.normalized_name = ?))
-         ORDER BY ri.sort_order LIMIT 1",
+    if input.group_id.is_none() && input.alternative_id.is_some() {
+        return Err(AppError::Validation(
+            "alternativeId requires groupId".into(),
+        ));
+    }
+    let recipe_title: String = sqlx::query_scalar(
+        "SELECT title FROM recipes
+         WHERE id = ? AND (owner_id = ? OR visibility = 'public')",
     )
     .bind(&recipe_id)
     .bind(&user.id)
-    .bind(&input.canonical_ingredient_id)
-    .bind(&input.canonical_ingredient_id)
-    .bind(&input.canonical_ingredient_id)
-    .bind(&normalized)
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or(AppError::NotFound)?;
-    let recipe_title: String = ingredient.get("title");
-    let ingredient_name: String = ingredient.get("name");
-    let canonical_id: Option<String> = ingredient.get("canonical_ingredient_id");
-    let (item_id, _) = upsert_stored_item(
-        &mut transaction,
-        &user.id,
-        &ingredient_name,
-        canonical_id.as_deref(),
-    )
-    .await?;
+    let item_id = if let Some(group_id) = input.group_id.as_deref() {
+        let rows = sqlx::query(
+            "SELECT a.external_id AS id, a.name, a.canonical_ingredient_id
+             FROM recipe_ingredient_groups g
+             JOIN recipe_ingredient_alternatives a ON a.group_id = g.id
+             WHERE g.external_id = ? AND g.recipe_id = ?
+             ORDER BY a.sort_order",
+        )
+        .bind(group_id)
+        .bind(&recipe_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if rows.is_empty() {
+            return Err(AppError::NotFound);
+        }
+        let alternatives = rows
+            .into_iter()
+            .map(|row| ShoppingChoiceAlternative {
+                id: row.get("id"),
+                name: row.get("name"),
+                canonical_ingredient_id: row.get("canonical_ingredient_id"),
+                purchase_options: None,
+            })
+            .collect::<Vec<_>>();
+        if input.alternative_id.is_some() || alternatives.len() == 1 {
+            let alternative = if let Some(alternative_id) = input.alternative_id.as_deref() {
+                alternatives
+                    .iter()
+                    .find(|alternative| alternative.id == alternative_id)
+                    .ok_or_else(|| {
+                        AppError::Validation(
+                            "selected alternative does not belong to the ingredient group".into(),
+                        )
+                    })?
+            } else {
+                &alternatives[0]
+            };
+            upsert_stored_item(
+                &mut transaction,
+                &user.id,
+                &alternative.name,
+                alternative.canonical_ingredient_id.as_deref(),
+            )
+            .await?
+            .0
+        } else {
+            upsert_choice_item(&mut transaction, &user.id, &alternatives)
+                .await?
+                .0
+        }
+    } else {
+        let normalized = normalize_ingredient(&input.name);
+        let ingredient = sqlx::query(
+            "SELECT ri.name, ri.canonical_ingredient_id
+             FROM recipe_ingredients ri
+             WHERE ri.recipe_id = ? AND ((? IS NOT NULL AND ri.canonical_ingredient_id = ?)
+               OR (? IS NULL AND ri.normalized_name = ?))
+             ORDER BY ri.sort_order LIMIT 1",
+        )
+        .bind(&recipe_id)
+        .bind(&input.canonical_ingredient_id)
+        .bind(&input.canonical_ingredient_id)
+        .bind(&input.canonical_ingredient_id)
+        .bind(&normalized)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        upsert_stored_item(
+            &mut transaction,
+            &user.id,
+            &ingredient.get::<String, _>("name"),
+            ingredient
+                .get::<Option<String>, _>("canonical_ingredient_id")
+                .as_deref(),
+        )
+        .await?
+        .0
+    };
     insert_source(
         &mut transaction,
         &item_id,
@@ -309,10 +472,41 @@ pub async fn purchase_item(
     let automatic_pantry_id = item_id.strip_prefix("auto:").map(str::to_string);
     let (name, normalized_name, canonical_id, shopping_version) =
         if let Some(snapshot) = &shopping_before {
+            let selected_choice = if snapshot.choice_alternatives.is_empty() {
+                if input.selected_alternative_id.is_some() {
+                    return Err(AppError::Validation(
+                        "selectedAlternativeId is only valid for a shopping choice".into(),
+                    ));
+                }
+                None
+            } else {
+                let selected_id = input.selected_alternative_id.as_deref().ok_or_else(|| {
+                    AppError::Validation(
+                        "selectedAlternativeId is required for a shopping choice".into(),
+                    )
+                })?;
+                Some(
+                    snapshot
+                        .choice_alternatives
+                        .iter()
+                        .find(|alternative| alternative.id == selected_id)
+                        .ok_or_else(|| {
+                            AppError::Validation(
+                                "selectedAlternativeId is not in this shopping choice".into(),
+                            )
+                        })?,
+                )
+            };
             (
-                snapshot.name.clone(),
-                snapshot.normalized_name.clone(),
-                snapshot.canonical_ingredient_id.clone(),
+                selected_choice
+                    .map(|alternative| alternative.name.clone())
+                    .unwrap_or_else(|| snapshot.name.clone()),
+                selected_choice
+                    .map(|alternative| normalize_ingredient(&alternative.name))
+                    .unwrap_or_else(|| snapshot.normalized_name.clone()),
+                selected_choice
+                    .and_then(|alternative| alternative.canonical_ingredient_id.clone())
+                    .or_else(|| snapshot.canonical_ingredient_id.clone()),
                 snapshot.version,
             )
         } else if let Some(pantry_id) = &automatic_pantry_id {
@@ -605,28 +799,36 @@ pub async fn undo_purchase(
     }
     if disposition == "remove" {
         if let Some(snapshot) = shopping_before {
-            let identity_conflict: Option<String> =
-                if let Some(canonical_id) = &snapshot.canonical_ingredient_id {
-                    sqlx::query_scalar(
-                        "SELECT id FROM shopping_items
+            let identity_conflict: Option<String> = if let Some(choice_key) = &snapshot.choice_key {
+                sqlx::query_scalar(
+                    "SELECT id FROM shopping_items
+                         WHERE owner_id = ? AND choice_key = ? AND completed_at IS NULL",
+                )
+                .bind(&user.id)
+                .bind(choice_key)
+                .fetch_optional(&mut *transaction)
+                .await?
+            } else if let Some(canonical_id) = &snapshot.canonical_ingredient_id {
+                sqlx::query_scalar(
+                    "SELECT id FROM shopping_items
                      WHERE owner_id = ? AND canonical_ingredient_id = ?
                        AND completed_at IS NULL",
-                    )
-                    .bind(&user.id)
-                    .bind(canonical_id)
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                } else {
-                    sqlx::query_scalar(
-                        "SELECT id FROM shopping_items
+                )
+                .bind(&user.id)
+                .bind(canonical_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+            } else {
+                sqlx::query_scalar(
+                    "SELECT id FROM shopping_items
                      WHERE owner_id = ? AND canonical_ingredient_id IS NULL
                        AND normalized_name = ? AND completed_at IS NULL",
-                    )
-                    .bind(&user.id)
-                    .bind(&snapshot.normalized_name)
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                };
+                )
+                .bind(&user.id)
+                .bind(&snapshot.normalized_name)
+                .fetch_optional(&mut *transaction)
+                .await?
+            };
             if identity_conflict.is_some() {
                 return Err(AppError::Conflict(
                     "shopping ingredient was re-added after purchase".into(),
@@ -672,12 +874,18 @@ async fn load_shopping_items(state: &AppState, owner_id: &str) -> AppResult<Vec<
     Ok(items)
 }
 
-pub(crate) async fn active_identity_keys_tx(
+#[derive(Default)]
+pub(crate) struct ActiveShoppingCoverage {
+    pub concrete_identity_keys: HashSet<String>,
+    pub exact_choice_keys: HashSet<String>,
+}
+
+pub(crate) async fn active_coverage_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     owner_id: &str,
-) -> AppResult<HashSet<String>> {
-    let persistent: Vec<(Option<String>, String)> = sqlx::query_as(
-        "SELECT canonical_ingredient_id, normalized_name
+) -> AppResult<ActiveShoppingCoverage> {
+    let persistent: Vec<(Option<String>, String, Option<String>)> = sqlx::query_as(
+        "SELECT canonical_ingredient_id, normalized_name, choice_key
          FROM shopping_items
          WHERE owner_id = ? AND completed_at IS NULL",
     )
@@ -693,13 +901,36 @@ pub(crate) async fn active_identity_keys_tx(
     .bind(owner_id)
     .fetch_all(&mut **transaction)
     .await?;
-    Ok(persistent
-        .into_iter()
-        .chain(automatic)
-        .map(|(canonical_id, normalized_name)| {
-            dedupe_key(canonical_id.as_deref(), &normalized_name)
-        })
-        .collect())
+    let mut coverage = ActiveShoppingCoverage {
+        concrete_identity_keys: automatic
+            .into_iter()
+            .map(|(canonical_id, normalized_name)| {
+                dedupe_key(canonical_id.as_deref(), &normalized_name)
+            })
+            .collect::<HashSet<_>>(),
+        ..Default::default()
+    };
+    for (canonical_id, normalized_name, choice_key) in persistent {
+        if let Some(choice_key) = choice_key {
+            coverage.exact_choice_keys.insert(choice_key);
+        } else {
+            coverage
+                .concrete_identity_keys
+                .insert(dedupe_key(canonical_id.as_deref(), &normalized_name));
+        }
+    }
+    Ok(coverage)
+}
+
+pub(crate) fn exact_choice_key<I>(identities: I) -> String
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut identities = identities.into_iter().collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    let digest = Sha256::digest(identities.join("\n").as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn load_shopping_items_tx(
@@ -707,7 +938,7 @@ async fn load_shopping_items_tx(
     owner_id: &str,
 ) -> AppResult<Vec<ShoppingItem>> {
     let rows = sqlx::query(
-        "SELECT id, name, normalized_name, canonical_ingredient_id, version
+        "SELECT id, name, normalized_name, canonical_ingredient_id, choice_key, choice_json, version
          FROM shopping_items WHERE owner_id = ? AND completed_at IS NULL
          ORDER BY normalized_name, id LIMIT ?",
     )
@@ -751,15 +982,26 @@ async fn load_shopping_items_tx(
     for row in rows {
         let canonical_id: Option<String> = row.get("canonical_ingredient_id");
         let normalized_name: String = row.get("normalized_name");
+        let choice_key: Option<String> = row.get("choice_key");
+        let choice_alternatives = row
+            .get::<Option<String>, _>("choice_json")
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| AppError::Data(format!("invalid shopping choice: {error}")))?
+            .unwrap_or_default();
         let id: String = row.get("id");
         let sources = sources_by_item.remove(&id).unwrap_or_default();
         items.insert(
-            dedupe_key(canonical_id.as_deref(), &normalized_name),
+            choice_key
+                .as_deref()
+                .map(|key| format!("choice:{key}"))
+                .unwrap_or_else(|| dedupe_key(canonical_id.as_deref(), &normalized_name)),
             StoredItem {
                 id,
                 name: row.get("name"),
                 normalized_name,
                 canonical_ingredient_id: canonical_id,
+                choice_alternatives,
                 sources,
                 version: row.get("version"),
             },
@@ -785,6 +1027,7 @@ async fn load_shopping_items_tx(
             name: row.get("name"),
             normalized_name,
             canonical_ingredient_id: canonical_id,
+            choice_alternatives: Vec::new(),
             sources: Vec::new(),
             version: row.get("version"),
         });
@@ -798,14 +1041,45 @@ async fn load_shopping_items_tx(
     }
     let pantry_context = load_pantry_candidate_context_tx(transaction, owner_id).await?;
     let mut result = Vec::new();
-    for (key, item) in items {
-        let candidates = pantry_candidates_from_context(
-            &pantry_context,
-            &item.normalized_name,
-            item.canonical_ingredient_id.as_deref(),
-        );
+    for (key, mut item) in items {
+        for alternative in &mut item.choice_alternatives {
+            let normalized = normalize_ingredient(&alternative.name);
+            let candidates = pantry_candidates_from_context(
+                &pantry_context,
+                &normalized,
+                alternative.canonical_ingredient_id.as_deref(),
+            );
+            let resolution = if deterministic_reuse(
+                &candidates,
+                alternative.canonical_ingredient_id.as_deref(),
+                &normalized,
+            )
+            .is_some()
+            {
+                "reuse"
+            } else if candidates.is_empty() {
+                "create"
+            } else {
+                "choice"
+            };
+            alternative.purchase_options = Some(ShoppingPurchaseOptions {
+                resolution: resolution.into(),
+                candidates,
+            });
+        }
+        let candidates = if item.choice_alternatives.is_empty() {
+            pantry_candidates_from_context(
+                &pantry_context,
+                &item.normalized_name,
+                item.canonical_ingredient_id.as_deref(),
+            )
+        } else {
+            Vec::new()
+        };
         let automatic = automatic_ids.contains_key(&key);
-        let resolution = if deterministic_reuse(
+        let resolution = if !item.choice_alternatives.is_empty() {
+            "selectAlternative"
+        } else if deterministic_reuse(
             &candidates,
             item.canonical_ingredient_id.as_deref(),
             &item.normalized_name,
@@ -822,6 +1096,7 @@ async fn load_shopping_items_tx(
             id: item.id,
             name: item.name,
             canonical_ingredient_id: item.canonical_ingredient_id,
+            choice_alternatives: item.choice_alternatives,
             automatic,
             pantry_item_id: automatic_ids.get(&key).cloned(),
             sources: item.sources,
@@ -971,7 +1246,7 @@ async fn load_shopping_snapshot(
     item_id: &str,
 ) -> AppResult<Option<ShoppingSnapshot>> {
     let row = sqlx::query(
-        "SELECT id, name, normalized_name, canonical_ingredient_id, version
+        "SELECT id, name, normalized_name, canonical_ingredient_id, choice_key, choice_json, version
          FROM shopping_items WHERE id = ? AND owner_id = ? AND completed_at IS NULL",
     )
     .bind(item_id)
@@ -1000,6 +1275,13 @@ async fn load_shopping_snapshot(
         name: row.get("name"),
         normalized_name: row.get("normalized_name"),
         canonical_ingredient_id: row.get("canonical_ingredient_id"),
+        choice_key: row.get("choice_key"),
+        choice_alternatives: row
+            .get::<Option<String>, _>("choice_json")
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| AppError::Data(format!("invalid shopping choice: {error}")))?
+            .unwrap_or_default(),
         version: row.get("version"),
         sources,
     }))
@@ -1035,6 +1317,40 @@ async fn load_shopping_snapshot_by_identity(
         Some(id) => load_shopping_snapshot(transaction, owner_id, &id).await,
         None => Ok(None),
     }
+}
+
+async fn has_automatic_identity(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    item: &ShoppingSnapshot,
+) -> AppResult<bool> {
+    if item.choice_key.is_some() {
+        return Ok(false);
+    }
+    let exists: Option<i64> = if let Some(canonical_id) = item.canonical_ingredient_id.as_deref() {
+        sqlx::query_scalar(
+            "SELECT 1 FROM pantry_items
+             WHERE owner_id = ? AND status = 'out'
+               AND auto_add_to_shopping_list_when_out = 1
+               AND canonical_ingredient_id = ?",
+        )
+        .bind(owner_id)
+        .bind(canonical_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT 1 FROM pantry_items
+             WHERE owner_id = ? AND status = 'out'
+               AND auto_add_to_shopping_list_when_out = 1
+               AND canonical_ingredient_id IS NULL AND normalized_name = ?",
+        )
+        .bind(owner_id)
+        .bind(&item.normalized_name)
+        .fetch_optional(&mut **transaction)
+        .await?
+    };
+    Ok(exists.is_some())
 }
 
 async fn load_pantry_snapshot(
@@ -1140,8 +1456,8 @@ async fn restore_shopping(
     sqlx::query(
         "INSERT INTO shopping_items
          (id, owner_id, name, normalized_name, canonical_ingredient_id, completed_at,
-          created_at, updated_at, version)
-         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+          created_at, updated_at, version, choice_key, choice_json)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
     )
     .bind(&item.id)
     .bind(owner_id)
@@ -1151,6 +1467,12 @@ async fn restore_shopping(
     .bind(Utc::now().timestamp())
     .bind(Utc::now().timestamp())
     .bind(item.version)
+    .bind(&item.choice_key)
+    .bind(
+        (!item.choice_alternatives.is_empty())
+            .then(|| serde_json::to_string(&item.choice_alternatives))
+            .transpose()?,
+    )
     .execute(&mut **transaction)
     .await?;
     for source in &item.sources {
@@ -1221,6 +1543,103 @@ async fn upsert_stored_item(
     .bind(name)
     .bind(normalized)
     .bind(canonical_id)
+    .bind(Utc::now().timestamp())
+    .bind(Utc::now().timestamp())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(map_unique_conflict)
+}
+
+async fn upsert_choice_item(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    alternatives: &[ShoppingChoiceAlternative],
+) -> AppResult<(String, i64)> {
+    if alternatives.len() < 2 || alternatives.len() > 8 {
+        return Err(AppError::Validation(
+            "shopping choices require between 2 and 8 alternatives".into(),
+        ));
+    }
+    for alternative in alternatives {
+        let existing: Option<(String, i64)> =
+            if let Some(canonical_id) = alternative.canonical_ingredient_id.as_deref() {
+                sqlx::query_as(
+                    "SELECT id, version FROM shopping_items
+                     WHERE owner_id = ? AND completed_at IS NULL
+                       AND choice_key IS NULL AND canonical_ingredient_id = ?",
+                )
+                .bind(owner_id)
+                .bind(canonical_id)
+                .fetch_optional(&mut **transaction)
+                .await?
+            } else {
+                sqlx::query_as(
+                    "SELECT id, version FROM shopping_items
+                     WHERE owner_id = ? AND completed_at IS NULL
+                       AND choice_key IS NULL AND canonical_ingredient_id IS NULL
+                       AND normalized_name = ?",
+                )
+                .bind(owner_id)
+                .bind(normalize_ingredient(&alternative.name))
+                .fetch_optional(&mut **transaction)
+                .await?
+            };
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+    }
+    let mut identities = alternatives
+        .iter()
+        .map(|alternative| {
+            alternative
+                .canonical_ingredient_id
+                .as_deref()
+                .map(|id| format!("id:{id}"))
+                .unwrap_or_else(|| format!("name:{}", normalize_ingredient(&alternative.name)))
+        })
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    if identities.len() != alternatives.len() {
+        return Err(AppError::Validation(
+            "shopping choice alternatives must have distinct identities".into(),
+        ));
+    }
+    let choice_json =
+        serde_json::to_string(alternatives).map_err(|error| AppError::Data(error.to_string()))?;
+    let choice_key = exact_choice_key(identities);
+    let display = alternatives
+        .iter()
+        .map(|alternative| alternative.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM shopping_items WHERE owner_id = ? AND completed_at IS NULL",
+    )
+    .bind(owner_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if count >= MAX_SHOPPING_ITEMS_PER_OWNER {
+        return Err(AppError::Validation(
+            "shopping list item limit exceeded".into(),
+        ));
+    }
+    sqlx::query_as(
+        "INSERT INTO shopping_items
+         (id, owner_id, name, normalized_name, canonical_ingredient_id, choice_key,
+          choice_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+         ON CONFLICT(owner_id, choice_key) WHERE choice_key IS NOT NULL
+         DO UPDATE SET completed_at = NULL, version = shopping_items.version + 1,
+           updated_at = excluded.updated_at
+         RETURNING id, version",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(owner_id)
+    .bind(&display)
+    .bind(format!("choice:{choice_key}"))
+    .bind(choice_key)
+    .bind(choice_json)
     .bind(Utc::now().timestamp())
     .bind(Utc::now().timestamp())
     .fetch_one(&mut **transaction)
@@ -1428,6 +1847,92 @@ async fn replay_purchase(
     serde_json::from_str(&row.get::<String, _>("response_json"))
         .map(Some)
         .map_err(|error| AppError::Data(error.to_string()))
+}
+
+async fn replay_delete(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    key: &str,
+    fingerprint: &[u8; 32],
+) -> AppResult<Option<DeleteResponse>> {
+    let row = sqlx::query(
+        "SELECT request_fingerprint, response_json FROM shopping_delete_actions
+         WHERE owner_id = ? AND idempotency_key = ?",
+    )
+    .bind(owner_id)
+    .bind(key)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let previous: Vec<u8> = row.get("request_fingerprint");
+    if previous.as_slice() != fingerprint {
+        return Err(AppError::Conflict(
+            "Idempotency-Key was already used for a different shopping deletion".into(),
+        ));
+    }
+    serde_json::from_str(&row.get::<String, _>("response_json"))
+        .map(Some)
+        .map_err(|error| AppError::Data(error.to_string()))
+}
+
+async fn cleanup_delete_actions(
+    transaction: &mut Transaction<'_, Sqlite>,
+    now: i64,
+) -> AppResult<()> {
+    sqlx::query(
+        "DELETE FROM shopping_delete_actions WHERE rowid IN (
+           SELECT rowid FROM shopping_delete_actions
+           WHERE created_at < ? ORDER BY created_at LIMIT ?)",
+    )
+    .bind(now - PURCHASE_REPLAY_SECONDS)
+    .bind(PURCHASE_CLEANUP_BATCH)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn enforce_delete_capacity(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    now: i64,
+) -> AppResult<()> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM shopping_delete_actions WHERE owner_id = ? AND created_at >= ?",
+    )
+    .bind(owner_id)
+    .bind(now - PURCHASE_REPLAY_SECONDS)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if count >= DELETE_ACTION_CAP {
+        Err(AppError::RateLimited)
+    } else {
+        Ok(())
+    }
+}
+
+async fn enforce_delete_rate_limit(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    now: i64,
+) -> AppResult<()> {
+    let window = now - now.rem_euclid(PURCHASE_RATE_WINDOW_SECONDS);
+    let count: i64 = sqlx::query_scalar(
+        "INSERT INTO public_api_rate_limits (rate_key, window_started_at, request_count)
+         VALUES (?, ?, 1) ON CONFLICT(rate_key) DO UPDATE SET
+           window_started_at = CASE WHEN public_api_rate_limits.window_started_at < excluded.window_started_at
+             THEN excluded.window_started_at ELSE public_api_rate_limits.window_started_at END,
+           request_count = CASE WHEN public_api_rate_limits.window_started_at < excluded.window_started_at
+             THEN 1 ELSE public_api_rate_limits.request_count + 1 END RETURNING request_count",
+    )
+    .bind(format!("shopping-delete:{owner_id}"))
+    .bind(window)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if count > DELETE_RATE_LIMIT {
+        Err(AppError::RateLimited)
+    } else {
+        Ok(())
+    }
 }
 
 async fn cleanup_purchase_actions(

@@ -7,6 +7,7 @@ import {
   createRoute,
   createRouter,
   useNavigate,
+  useSearch,
 } from '@tanstack/react-router'
 import { QueryClient, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -16,6 +17,7 @@ import { ApiError, api } from './api'
 import { MarkdownEditor, SafeMarkdown } from './MarkdownEditor'
 import type {
   ImportDraft,
+  IngredientScope,
   IngredientReference,
   PantryItem,
   PantryStatus,
@@ -24,15 +26,20 @@ import type {
   RecommendationSource,
   RecommendationSettings,
   RecommendationReason,
+  ShoppingItem,
   SecuritySettings as SecuritySettingsData,
   User,
 } from './types'
 import { IngredientCombobox } from './IngredientCombobox'
 import {
+  asIngredientReference,
+  emptyIngredientGroup,
   expirationLabel,
   expirationRelativeDays,
   expirationShortcut,
+  ingredientIdentity,
   localDateValue,
+  recipeIngredientGroups,
   normalizeIngredient,
   splitIngredientList,
 } from './ingredients'
@@ -61,6 +68,7 @@ const recommendationsRoute = createRoute({
 const recipesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/recipes',
+  validateSearch: z.object({ scope: z.enum(['mine']).optional() }),
   component: RecipesPage,
 })
 const newRecipeRoute = createRoute({
@@ -86,6 +94,7 @@ const editRecipeRoute = createRoute({
 const pantryRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/pantry',
+  validateSearch: z.object({ status: z.enum(['have', 'out', 'unknown']).optional() }),
   component: PantryPage,
 })
 const shoppingRoute = createRoute({
@@ -440,18 +449,31 @@ export function EmailOtpLogin({
   )
 }
 
-function HomePage() {
+export function HomePage() {
   const { formatNumber, t } = useI18n()
   const recipes = useQuery({ queryKey: ['recipes'], queryFn: api.recipes })
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
+  const ownedRecipes = recipes.data?.filter((recipe) => recipe.isOwner).length
+  const availableItems = pantry.data?.filter((item) => item.status === 'have').length
   return (
     <Page title={t('home.title')} intro={t('home.intro')}>
       <div className="metric-grid">
-        <Metric label={t('home.visibleRecipes')} value={recipes.data ? formatNumber(recipes.data.length) : '—'} />
-        <Metric label={t('home.pantryItems')} value={pantry.data ? formatNumber(pantry.data.length) : '—'} />
         <Metric
+          to="/recipes"
+          search={{ scope: 'mine' }}
+          label={t('home.myRecipes')}
+          value={ownedRecipes === undefined ? '—' : formatNumber(ownedRecipes)}
+        />
+        <Metric
+          to="/pantry"
+          label={t('home.pantryItems')}
+          value={pantry.data ? formatNumber(pantry.data.length) : '—'}
+        />
+        <Metric
+          to="/pantry"
+          search={{ status: 'have' }}
           label={t('home.confirmedAvailable')}
-          value={pantry.data ? formatNumber(pantry.data.filter((item) => item.status === 'have').length) : '—'}
+          value={availableItems === undefined ? '—' : formatNumber(availableItems)}
         />
       </div>
       <div className="action-grid">
@@ -479,19 +501,20 @@ export function RecommendationsPage() {
     preferred: [] as IngredientReference[],
     required: [] as IngredientReference[],
     excluded: [] as IngredientReference[],
-    pantryOnly: false,
+    ingredientScope: 'ANY' as IngredientScope,
   })
   const [submitted, setSubmitted] = useState({
     preferred: [] as IngredientReference[],
     required: [] as IngredientReference[],
     excluded: [] as IngredientReference[],
-    pantryOnly: false,
+    ingredientScope: 'ANY' as IngredientScope,
     today: localDateValue(new Date()),
   })
   const recommendations = useQuery({
     queryKey: ['recommendations', submitted],
     queryFn: () => api.recommendations(submitted),
   })
+  const shopping = useQuery({ queryKey: ['shopping-list'], queryFn: api.shoppingItems })
   const verifyNames = useMemo(
     () => [...new Set(recommendations.data?.flatMap((item) => item.verify) ?? [])].slice(0, 5),
     [recommendations.data],
@@ -508,27 +531,24 @@ export function RecommendationsPage() {
       identity,
     }: {
       recipeId: string
-      ingredient: IngredientReference
+      ingredient: IngredientReference & {
+        groupId?: string | null
+        alternativeId?: string | null
+      }
       identity: string
     }) => api.addRecipeIngredientToShopping(recipeId, ingredient).then((items) => ({
       items,
       identity,
+      recipeId,
       name: ingredient.name,
     })),
-    onSuccess: ({ items, identity, name }) => {
+    onSuccess: ({ items, recipeId, name }) => {
       queryClient.setQueryData(['shopping-list'], items)
       queryClient.setQueriesData<Recommendation[]>({ queryKey: ['recommendations'] }, (current) =>
         current?.map((recommendation) => {
-          const names = recommendation.recipe.ingredients
-            .filter((ingredient) =>
-              ingredientIdentity(ingredient) === identity
-              && recommendation.missing.some(
-                (missing) => normalizeIngredient(missing) === normalizeIngredient(ingredient.name),
-              ))
-            .map((ingredient) => ingredient.name)
-          return names.length === 0 ? recommendation : {
+          return recommendation.recipe.id !== recipeId ? recommendation : {
             ...recommendation,
-            inShoppingList: [...new Set([...recommendation.inShoppingList, ...names])],
+            inShoppingList: [...new Set([...recommendation.inShoppingList, name])],
           }
         }),
       )
@@ -539,6 +559,101 @@ export function RecommendationsPage() {
       setPendingShoppingIdentity((current) => current === variables.identity ? null : current)
     },
   })
+  const renderRecommendationCard = (result: Recommendation) => {
+    const desiredCoverage = recommendationDesiredCoverage(result, submitted.preferred.length)
+    const shoppingCoverage = recommendationShoppingCoverage(result, shopping.data ?? [])
+    return (
+      <article className="recommendation-card" key={result.recipe.id}>
+        <div className="card-heading">
+          <div>
+            <span className={`status ${result.status.toLowerCase()}`}>{t(`status.${result.status}`)}</span>
+            <h2>
+              <Link
+                className="recipe-title-link"
+                to="/recipes/$recipeId"
+                params={{ recipeId: result.recipe.id }}
+              >
+                {result.recipe.title}
+              </Link>
+            </h2>
+          </div>
+        </div>
+        {(result.recipe.coverImage || result.recipe.description) && (
+          <div className="recommendation-preview">
+            {result.recipe.coverImage && (
+              <img
+                src={result.recipe.coverImage.url}
+                alt={result.recipe.coverImage.altText ?? ''}
+              />
+            )}
+            {result.recipe.description && (
+              <div className="recommendation-description">
+                <SafeMarkdown value={result.recipe.description} />
+              </div>
+            )}
+          </div>
+        )}
+        <div className="recommendation-intent-summary">
+          <span className="recommendation-source-chip">{t('recommend.sourceSummary', {
+            source: recommendationSourceLabel(result.primarySource, t),
+          })}</span>
+          {desiredCoverage.matched > 0 && (
+            <span className="recommendation-source-chip">
+              {t('recommend.desiredCoverage', desiredCoverage)}
+            </span>
+          )}
+        </div>
+        <RecommendationIngredientGroups
+          recommendation={result}
+          shoppingItems={shopping.data ?? []}
+          pendingIdentity={pendingShoppingIdentity}
+          onAdd={(ingredient, groupId, alternativeId) => {
+            const identity = groupId
+              ? `g:${groupId}:${alternativeId ?? 'any'}`
+              : ingredientIdentity(ingredient)
+            if (shoppingAddInFlight.current.has(identity)) return
+            shoppingAddInFlight.current.add(identity)
+            setPendingShoppingIdentity(identity)
+            addShopping.mutate({
+              recipeId: result.recipe.id,
+              ingredient: groupId ? { ...ingredient, groupId, alternativeId } : ingredient,
+              identity,
+            })
+          }}
+        />
+        <details>
+          <summary>{t('recommend.scoreDetails')}</summary>
+          <RecipeMetadata
+            difficulty={result.recipe.difficulty}
+            estimatedCalories={result.recipe.estimatedCalories}
+            formatNumber={formatNumber}
+            t={t}
+          />
+          {desiredCoverage.total > 0 && (
+            <p>{t('recommend.reason.desiredCoverage', desiredCoverage)}</p>
+          )}
+          {shoppingCoverage.total > 0 && (
+            <p>{t('recommend.reason.shoppingCoverage', shoppingCoverage)}</p>
+          )}
+          <p>
+            {result.reasonDetails
+              .map((reason) => recommendationReasonLabel(reason, t, formatDate, formatNumber))
+              .join(' · ')}
+          </p>
+          <ul className="plain-list" aria-label={t('recommend.ingredientReasons')}>
+            {result.ingredientReasons.map((reason) => (
+              <li key={`${reason.ingredient}-${reason.code}`}>
+                {recommendationIngredientReasonLabel(reason, t, formatDate)}
+              </li>
+            ))}
+          </ul>
+          <p>{t('recommend.matchedSources', {
+            sources: result.matchedSources.map((source) => recommendationSourceLabel(source, t)).join(', '),
+          })}</p>
+        </details>
+      </article>
+    )
+  }
 
   return (
     <Page title={t('recommend.title')} intro={t('recommend.intro')}>
@@ -564,14 +679,25 @@ export function RecommendationsPage() {
           values={filters.excluded}
           onChange={(excluded) => setFilters({ ...filters, excluded })}
         />
-        <label className="check-row">
-          <input
-            type="checkbox"
-            checked={filters.pantryOnly}
-            onChange={(event) => setFilters({ ...filters, pantryOnly: event.target.checked })}
-          />
-          {t('recommend.pantryOnly')}
-        </label>
+        <fieldset className="recommendation-scope">
+          <legend>{t('recommend.scopeLegend')}</legend>
+          <p className="field-note">{t('recommend.scopeHelp')}</p>
+          {(['ANY', 'PANTRY_ONLY', 'PANTRY_OR_LIST'] as const).map((scope) => (
+            <label className="choice-card" key={scope}>
+              <input
+                type="radio"
+                name="ingredient-scope"
+                value={scope}
+                checked={filters.ingredientScope === scope}
+                onChange={() => setFilters({ ...filters, ingredientScope: scope })}
+              />
+              <span>
+                <strong>{t(`recommend.scope.${scope}`)}</strong>
+                <small>{t(`recommend.scope.${scope}.detail`)}</small>
+              </span>
+            </label>
+          ))}
+        </fieldset>
         <button className="button primary">{t('recommend.refresh')}</button>
       </form>
       {verifyNames.length > 0 && (
@@ -583,133 +709,41 @@ export function RecommendationsPage() {
         </div>
       )}
       <QueryState query={recommendations} empty={t('recommend.noMatches')}>
-        <div>
-          {(['READY', 'VERIFY', 'SHOP', 'BLOCKED'] as const).map((status) => {
-            const results = recommendations.data?.filter((result) => result.status === status) ?? []
-            if (results.length === 0) return null
-            return <section key={status} aria-labelledby={`recommend-${status}`}>
-              <h2 id={`recommend-${status}`}>{t(`recommend.group.${status}`)}</h2>
-              <div className="card-list">
-              {results.map((result) => (
-            <article className="recommendation-card" key={result.recipe.id}>
-              <div className="card-heading">
-                <div>
-                  <span className={`status ${result.status.toLowerCase()}`}>{t(`status.${result.status}`)}</span>
-                  <h2>
-                    <Link
-                      className="recipe-title-link"
-                      to="/recipes/$recipeId"
-                      params={{ recipeId: result.recipe.id }}
-                    >
-                      {result.recipe.title}
-                    </Link>
-                  </h2>
-                </div>
-              </div>
-              {(result.recipe.coverImage || result.recipe.description) && (
-                <div className="recommendation-preview">
-                  {result.recipe.coverImage && (
-                    <img
-                      src={result.recipe.coverImage.url}
-                      alt={result.recipe.coverImage.altText ?? ''}
-                    />
-                  )}
-                  {result.recipe.description && (
-                    <div className="recommendation-description">
-                      <SafeMarkdown value={result.recipe.description} />
-                    </div>
-                  )}
-                </div>
-              )}
-              <span className="recommendation-source-chip">{t('recommend.sourceSummary', {
-                source: recommendationSourceLabel(result.primarySource, t),
-              })}</span>
-              <IngredientSummary label={t('recommend.available')} items={result.available} />
-              <IngredientSummary label={t('recommend.verify')} items={result.verify} />
-              {result.missing.length > 0 && (
-                <div className="ingredient-summary" aria-label={t('recommend.missing')}>
-                  <strong>{t('recommend.missing')}</strong>
-                  <ul className="ingredient-summary-list">
-                    {result.missing.map((name) => {
-                      const ingredient = result.recipe.ingredients.find(
-                        (candidate) => normalizeIngredient(candidate.name) === normalizeIngredient(name),
-                      )
-                      const reference = {
-                        name,
-                        canonicalIngredientId: ingredient?.canonicalIngredientId ?? null,
-                      }
-                      const identity = ingredientIdentity(reference)
-                      const inShoppingList = result.inShoppingList.some(
-                        (candidate) => normalizeIngredient(candidate) === normalizeIngredient(name),
-                      )
-                      return (
-                        <li key={name}>
-                          <span>{name}</span>
-                          {inShoppingList ? (
-                            <span className="shopping-membership-status">
-                              <span className="sr-only">{t('shopping.inList', { name })}</span>
-                              <span aria-hidden="true">{t('shopping.inListShort')}</span>
-                            </span>
-                          ) : (
-                            <button
-                              type="button"
-                              className="button ghost"
-                              disabled={pendingShoppingIdentity === identity}
-                              aria-label={pendingShoppingIdentity === identity
-                                ? t('shopping.addingMissing', { name })
-                                : t('shopping.addMissing', { name })}
-                              onClick={() => {
-                                if (shoppingAddInFlight.current.has(identity)) return
-                                shoppingAddInFlight.current.add(identity)
-                                setPendingShoppingIdentity(identity)
-                                addShopping.mutate({
-                                  recipeId: result.recipe.id,
-                                  ingredient: reference,
-                                  identity,
-                                })
-                              }}
-                            >
-                              {pendingShoppingIdentity === identity
-                                ? t('shopping.addingMissing', { name })
-                                : t('shopping.addMissingShort')}
-                            </button>
-                          )}
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </div>
-              )}
-              <details>
-                <summary>{t('recommend.scoreDetails')}</summary>
-                <RecipeMetadata
-                  difficulty={result.recipe.difficulty}
-                  estimatedCalories={result.recipe.estimatedCalories}
-                  formatNumber={formatNumber}
-                  t={t}
-                />
-                <p>
-                  {result.reasonDetails
-                    .map((reason) => recommendationReasonLabel(reason, t, formatDate, formatNumber))
-                    .join(' · ')}
-                </p>
-                <ul className="plain-list" aria-label={t('recommend.ingredientReasons')}>
-                  {result.ingredientReasons.map((reason) => (
-                    <li key={`${reason.ingredient}-${reason.code}`}>
-                      {recommendationIngredientReasonLabel(reason, t, formatDate)}
-                    </li>
-                  ))}
-                </ul>
-                <p>{t('recommend.matchedSources', {
-                  sources: result.matchedSources.map((source) => recommendationSourceLabel(source, t)).join(', '),
-                })}</p>
-                <p>{recommendationScoreLabel(result, t, formatNumber)}</p>
-              </details>
-            </article>
-              ))}
-              </div>
-            </section>
-          })}
+        <div className="recommendation-results">
+          {(() => {
+            const active = recommendations.data?.filter((result) => result.status !== 'BLOCKED') ?? []
+            const blocked = recommendations.data?.filter((result) => result.status === 'BLOCKED') ?? []
+            const usesPreferred = active.filter((result) => result.desiredMatches.length > 0)
+            const hasDesired = usesPreferred.length > 0
+            const other = hasDesired
+              ? active.filter((result) => result.desiredMatches.length === 0)
+              : active
+            return (
+              <>
+                {hasDesired && (
+                  <section aria-labelledby="recommend-preferred">
+                    <h2 id="recommend-preferred">{t('recommend.usesPreferred')}</h2>
+                    <div className="card-list">{usesPreferred.map(renderRecommendationCard)}</div>
+                  </section>
+                )}
+                {other.length > 0 && (
+                  <section aria-labelledby="recommend-other">
+                    <h2 id="recommend-other">
+                      {t(hasDesired ? 'recommend.otherRecommendations' : 'recommend.results')}
+                    </h2>
+                    <div className="card-list">{other.map(renderRecommendationCard)}</div>
+                  </section>
+                )}
+                {blocked.length > 0 && (
+                  <details className="blocked-recommendations">
+                    <summary>{t('recommend.blockedSummary', { count: formatNumber(blocked.length) })}</summary>
+                    <p>{t('recommend.blockedHelp')}</p>
+                    <div className="card-list">{blocked.map(renderRecommendationCard)}</div>
+                  </details>
+                )}
+              </>
+            )
+          })()}
         </div>
       </QueryState>
       {shoppingNotice && (
@@ -721,12 +755,6 @@ export function RecommendationsPage() {
       <PantryConfirmation open={confirmOpen} onOpenChange={setConfirmOpen} names={verifyNames} />
     </Page>
   )
-}
-
-function ingredientIdentity(ingredient: IngredientReference): string {
-  return ingredient.canonicalIngredientId
-    ? `c:${ingredient.canonicalIngredientId}`
-    : `n:${normalizeIngredient(ingredient.name)}`
 }
 
 function IngredientFilterInput({
@@ -789,6 +817,7 @@ function IngredientFilterInput({
 
 export function RecipesPage() {
   const { formatNumber, t } = useI18n()
+  const search = useSearch({ strict: false }) as { scope?: 'mine' }
   const recipes = useQuery({ queryKey: ['recipes'], queryFn: api.recipes })
   const queryClient = useQueryClient()
   const favorite = useMutation({
@@ -805,9 +834,15 @@ export function RecipesPage() {
         </Link>
       }
     >
+      {search.scope === 'mine' && (
+        <div className="active-filter" role="status">
+          <span>{t('recipes.filterMine')}</span>
+          <Link className="button ghost" to="/recipes" search={{}}>{t('common.clearFilter')}</Link>
+        </div>
+      )}
       <QueryState query={recipes} empty={t('recipes.empty')}>
         <div className="card-list">
-          {recipes.data?.map((recipe) => (
+          {recipes.data?.filter((recipe) => search.scope !== 'mine' || recipe.isOwner).map((recipe) => (
             <article className="recipe-card" key={recipe.id}>
               {recipe.coverImage && (
                 <img
@@ -1039,7 +1074,11 @@ export function RecipeDetailContent({ recipe }: { recipe: Recipe }) {
             )}
             {recipe.description && <SafeMarkdown value={recipe.description} />}
             <h2>{t('recipe.ingredients')}</h2>
-            <RecipeIngredientList ingredients={recipe.ingredients} />
+            <RecipeIngredientList
+              ingredients={recipe.ingredients}
+              ingredientModel={recipe.ingredientModel}
+              ingredientGroups={recipe.ingredientGroups}
+            />
             <h2>{t('recipe.method')}</h2>
             {recipe.instructions ? (
               <SafeMarkdown value={recipe.instructions} />
@@ -1250,7 +1289,11 @@ function RevisionReview({ recipeId }: { recipeId: string }) {
           <details>
             <summary>{t('recipe.reviewRevision')}</summary>
             <h4>{t('recipe.ingredients')}</h4>
-            <RecipeIngredientList ingredients={revision.ingredients} />
+            <RecipeIngredientList
+              ingredients={revision.ingredients}
+              ingredientModel={revision.ingredientModel}
+              ingredientGroups={revision.ingredientGroups}
+            />
             <h4>{t('recipe.method')}</h4>
             <SafeMarkdown value={revision.instructions} />
           </details>
@@ -1327,11 +1370,39 @@ export function recipeSchema(t: Translate) {
   sourceAuthor: z.string().max(200),
   sourceLicense: z.string().max(200),
   sourceAttribution: z.string().max(1000),
-  ingredients: z.array(z.object({
-    name: z.string().trim().min(1, t('recipe.ingredientRequired')),
-    quantityNote: z.string(),
-    canonicalIngredientId: z.string().nullable(),
-  })).min(1),
+  ingredientGroups: z.array(z.object({
+    id: z.string().min(1),
+    optional: z.boolean(),
+    note: z.string().max(240, t('recipe.groupNoteTooLong')),
+    alternatives: z.array(z.object({
+      id: z.string().min(1),
+      name: z.string().trim().min(1, t('recipe.ingredientRequired')).max(120),
+      quantityNote: z.string().max(240),
+      canonicalIngredientId: z.string().nullable(),
+    })).min(1).max(8, t('recipe.alternativeLimit')),
+  })).min(1).max(100, t('recipe.groupLimit')).superRefine((groups, context) => {
+    if (groups.reduce((total, group) => total + group.alternatives.length, 0) > 100) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: t('recipe.totalAlternativeLimit'),
+      })
+    }
+    groups.forEach((group, groupIndex) => {
+      const seen = new Set<string>()
+      group.alternatives.forEach((alternative, alternativeIndex) => {
+        const identity = ingredientIdentity(alternative)
+        if (seen.has(identity)) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [groupIndex, 'alternatives', alternativeIndex, 'name'],
+            message: t('recipe.duplicateIngredient'),
+          })
+        } else {
+          seen.add(identity)
+        }
+      })
+    })
+  }),
   })
 }
 export type RecipeForm = z.infer<ReturnType<typeof recipeSchema>>
@@ -1377,7 +1448,7 @@ function RecipeMetadata({
 }
 
 export function pantryStatusForIngredient(
-  ingredient: Recipe['ingredients'][number],
+  ingredient: IngredientReference & { quantityNote?: string },
   pantry: PantryItem[],
 ): 'available' | 'out' | 'unsure' | 'verify' | null {
   const normalized = normalizeIngredient(ingredient.name)
@@ -1386,7 +1457,7 @@ export function pantryStatusForIngredient(
       return candidate.canonicalIngredientId === ingredient.canonicalIngredientId
     }
     return normalizeIngredient(candidate.name) === normalized
-      || candidate.aliases?.includes(normalized) === true
+      || candidate.aliases?.some((alias) => normalizeIngredient(alias) === normalized) === true
   })
   if (!item) return null
   if (item.status === 'out') return 'out'
@@ -1395,14 +1466,31 @@ export function pantryStatusForIngredient(
   return 'available'
 }
 
-export function RecipeIngredientList({ ingredients }: { ingredients: Recipe['ingredients'] }) {
+export function pantryStatusForGroup(
+  alternatives: IngredientReference[],
+  pantry: PantryItem[],
+): 'available' | 'out' | 'unsure' | 'verify' | null {
+  const statuses = alternatives.map((alternative) => pantryStatusForIngredient(alternative, pantry))
+  if (statuses.includes('available')) return 'available'
+  if (statuses.includes('verify')) return 'verify'
+  if (statuses.includes('unsure')) return 'unsure'
+  if (statuses.includes('out')) return 'out'
+  return null
+}
+
+export function RecipeIngredientList({
+  ingredients,
+  ingredientModel,
+  ingredientGroups,
+}: Pick<Recipe, 'ingredients' | 'ingredientModel' | 'ingredientGroups'>) {
   const { t } = useI18n()
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
+  const groups = recipeIngredientGroups({ ingredients, ingredientModel, ingredientGroups })
   return (
     <ul className="recipe-ingredient-list">
-      {ingredients.map((ingredient, index) => {
+      {groups.map((group) => {
         const status = pantry.data
-          ? pantryStatusForIngredient(ingredient, pantry.data)
+          ? pantryStatusForGroup(group.alternatives, pantry.data)
           : null
         const statusKey = status
           ? `recipe.pantryStatus.${status}` as
@@ -1412,15 +1500,22 @@ export function RecipeIngredientList({ ingredients }: { ingredients: Recipe['ing
             | 'recipe.pantryStatus.verify'
           : null
         return (
-          <li key={`${ingredient.name}-${index}`}>
-            <span>
-              {ingredient.name} {ingredient.quantityNote && <span>— {ingredient.quantityNote}</span>}
-            </span>
+          <li key={group.id} className="ingredient-group-display">
+            <div className="ingredient-group-alternatives">
+              {group.alternatives.map((alternative, index) => (
+                <span key={alternative.id}>
+                  {index > 0 && <span className="ingredient-or">{t('recipe.or')}</span>}
+                  <span>{alternative.name}{alternative.quantityNote && <> — {alternative.quantityNote}</>}</span>
+                </span>
+              ))}
+              {group.optional && <span className="optional-badge">{t('recipe.optional')}</span>}
+              {group.note && <small>{group.note}</small>}
+            </div>
             {statusKey && (
               <span
                 className={`pantry-status-badge pantry-status-${status}`}
                 aria-label={t('recipe.pantryStatusLabel', {
-                  name: ingredient.name,
+                  name: group.alternatives.map((alternative) => alternative.name).join(` ${t('recipe.or')} `),
                   status: t(statusKey),
                 })}
               >
@@ -1547,13 +1642,7 @@ function recipeMatchesForm(recipe: Recipe, value: RecipeForm): boolean {
     && (recipe.source?.author ?? '') === value.sourceAuthor.trim()
     && (recipe.source?.license ?? '') === value.sourceLicense.trim()
     && (recipe.source?.attribution ?? '') === value.sourceAttribution.trim()
-    && recipe.ingredients.length === value.ingredients.length
-    && recipe.ingredients.every((ingredient, index) => {
-      const submitted = value.ingredients[index]
-      return ingredient.name === submitted.name
-        && ingredient.quantityNote === submitted.quantityNote
-        && ingredient.canonicalIngredientId === submitted.canonicalIngredientId
-    })
+    && JSON.stringify(recipeIngredientGroups(recipe)) === JSON.stringify(value.ingredientGroups)
 }
 
 function coverMetadataMatches(recipe: Recipe, metadata: CoverMetadata): boolean {
@@ -1655,6 +1744,7 @@ export async function persistRecipeEdit({
   let saved: Recipe
   const payload = {
     ...value,
+    ingredientModel: 'groups-v1' as const,
     sourceUrl: value.sourceUrl.trim() || null,
     sourceTitle: value.sourceTitle.trim() || null,
     sourceAuthor: value.sourceAuthor.trim() || null,
@@ -1712,6 +1802,151 @@ export async function persistRecipeEdit({
   })
 }
 
+function IngredientGroupEditor({
+  form,
+  groupIndex,
+  canRemove,
+  onRemove,
+  onAppendGroups,
+}: {
+  form: UseFormReturn<RecipeForm>
+  groupIndex: number
+  canRemove: boolean
+  onRemove: () => void
+  onAppendGroups: (names: string[]) => void
+}) {
+  const { t } = useI18n()
+  const alternatives = useFieldArray({
+    control: form.control,
+    name: `ingredientGroups.${groupIndex}.alternatives`,
+  })
+  return (
+    <fieldset className="ingredient-group-card">
+      <legend>{t('recipe.ingredientGroupNumber', { number: groupIndex + 1 })}</legend>
+      <div className="ingredient-group-options">
+        <label className="check-row">
+          <input type="checkbox" {...form.register(`ingredientGroups.${groupIndex}.optional`)} />
+          {t('recipe.optionalIngredient')}
+        </label>
+        <label>
+          {t('recipe.groupNote')}
+          <input
+            maxLength={240}
+            {...form.register(`ingredientGroups.${groupIndex}.note`)}
+            placeholder={t('recipe.groupNotePlaceholder')}
+          />
+        </label>
+      </div>
+      <div className="alternative-list">
+        {alternatives.fields.map((field, alternativeIndex) => {
+          const error = form.formState.errors.ingredientGroups?.[groupIndex]
+            ?.alternatives?.[alternativeIndex]?.name
+          const errorId = `recipe-group-${groupIndex}-alternative-${alternativeIndex}-error`
+          return (
+            <div className="ingredient-row" key={field.id}>
+              <div>
+                <IngredientCombobox
+                  label={t('recipe.alternativeNumber', {
+                    group: groupIndex + 1,
+                    number: alternativeIndex + 1,
+                  })}
+                  value={{
+                    name: form.watch(`ingredientGroups.${groupIndex}.alternatives.${alternativeIndex}.name`),
+                    canonicalIngredientId: form.watch(`ingredientGroups.${groupIndex}.alternatives.${alternativeIndex}.canonicalIngredientId`),
+                  }}
+                  onChange={(value) => {
+                    form.setValue(`ingredientGroups.${groupIndex}.alternatives.${alternativeIndex}.name`, value.name, { shouldDirty: true })
+                    form.setValue(`ingredientGroups.${groupIndex}.alternatives.${alternativeIndex}.canonicalIngredientId`, value.canonicalIngredientId, { shouldDirty: true })
+                  }}
+                  onPasteList={(names) => {
+                    form.setValue(`ingredientGroups.${groupIndex}.alternatives.${alternativeIndex}.name`, names[0], { shouldDirty: true })
+                    form.setValue(`ingredientGroups.${groupIndex}.alternatives.${alternativeIndex}.canonicalIngredientId`, null, { shouldDirty: true })
+                    onAppendGroups(names.slice(1))
+                  }}
+                  placeholder={t('recommend.filterPlaceholder')}
+                  invalid={Boolean(error)}
+                  describedBy={error ? errorId : undefined}
+                />
+                <FieldError id={errorId} message={error?.message} />
+              </div>
+              <label>
+                <span className="sr-only">{t('recipe.quantityForAlternative', {
+                  group: groupIndex + 1,
+                  number: alternativeIndex + 1,
+                })}</span>
+                <input
+                  {...form.register(`ingredientGroups.${groupIndex}.alternatives.${alternativeIndex}.quantityNote`)}
+                  maxLength={240}
+                  placeholder={t('recipe.quantityNote')}
+                />
+              </label>
+              {alternatives.fields.length > 1 && (
+                <button
+                  type="button"
+                  className="button ghost"
+                  onClick={() => alternatives.remove(alternativeIndex)}
+                  aria-label={t('recipe.removeAlternative', { number: alternativeIndex + 1 })}
+                >
+                  {t('common.remove')}
+                </button>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      <div className="form-actions">
+        <button
+          type="button"
+          className="button secondary"
+          disabled={alternatives.fields.length >= 8}
+          onClick={() => alternatives.append({
+            id: crypto.randomUUID(),
+            name: '',
+            quantityNote: '',
+            canonicalIngredientId: null,
+          })}
+        >
+          {t('recipe.addAlternative')}
+        </button>
+        {canRemove && (
+          <button type="button" className="button ghost" onClick={onRemove}>
+            {t('recipe.removeGroup')}
+          </button>
+        )}
+      </div>
+    </fieldset>
+  )
+}
+
+export function IngredientGroupsEditor({ form }: { form: UseFormReturn<RecipeForm> }) {
+  const { t } = useI18n()
+  const groups = useFieldArray({ control: form.control, name: 'ingredientGroups' })
+  return (
+    <fieldset className="ingredient-groups-editor">
+      <legend>{t('recipe.ingredients')}</legend>
+      <p className="field-note">{t('recipe.ingredientGroupsHelp')}</p>
+      {groups.fields.map((field, groupIndex) => (
+        <IngredientGroupEditor
+          key={field.id}
+          form={form}
+          groupIndex={groupIndex}
+          canRemove={groups.fields.length > 1}
+          onRemove={() => groups.remove(groupIndex)}
+          onAppendGroups={(names) => names.forEach((name) => groups.append(emptyIngredientGroup(name)))}
+        />
+      ))}
+      <button
+        type="button"
+        className="button secondary"
+        disabled={groups.fields.length >= 100}
+        onClick={() => groups.append(emptyIngredientGroup())}
+      >
+        {t('recipe.addIngredient')}
+      </button>
+    </fieldset>
+  )
+}
+
 export function RecipeEditorForm({
   recipe,
   onSaved,
@@ -1753,7 +1988,7 @@ export function RecipeEditorForm({
       sourceAuthor: recipe.source?.author ?? '',
       sourceLicense: recipe.source?.license ?? '',
       sourceAttribution: recipe.source?.attribution ?? '',
-      ingredients: recipe.ingredients,
+      ingredientGroups: recipeIngredientGroups(recipe),
     } : {
       title: '',
       description: '',
@@ -1766,10 +2001,9 @@ export function RecipeEditorForm({
       sourceAuthor: '',
       sourceLicense: '',
       sourceAttribution: '',
-      ingredients: [{ name: '', quantityNote: '', canonicalIngredientId: null }],
+      ingredientGroups: [emptyIngredientGroup()],
     },
   })
-  const fields = useFieldArray({ control: form.control, name: 'ingredients' })
   const save = useMutation({
     mutationFn: (value: RecipeForm) => persistRecipeEdit({
       value,
@@ -1789,17 +2023,24 @@ export function RecipeEditorForm({
       await onSaved(saved.id)
     },
   })
-  const ingredientErrors = Array.isArray(form.formState.errors.ingredients)
-    ? form.formState.errors.ingredients
+  const ingredientErrors = Array.isArray(form.formState.errors.ingredientGroups)
+    ? form.formState.errors.ingredientGroups
     : []
   const validationMessages = [
     form.formState.errors.title?.message,
     form.formState.errors.difficulty?.message,
     form.formState.errors.estimatedCalories?.message,
-    ...ingredientErrors.map((error, index) =>
-      error?.name?.message
-        ? t('recipe.ingredientError', { number: index + 1, message: error.name.message })
-        : undefined,
+    ...ingredientErrors.flatMap((error, groupIndex) =>
+      Array.isArray(error?.alternatives)
+        ? error.alternatives.map((alternative: { name?: { message?: string } } | undefined, alternativeIndex: number) =>
+          alternative?.name?.message
+            ? t('recipe.alternativeError', {
+              group: groupIndex + 1,
+              number: alternativeIndex + 1,
+              message: alternative.name.message,
+            })
+            : undefined)
+        : [error?.message],
     ),
   ].filter((message): message is string => Boolean(message))
   return (
@@ -1870,59 +2111,7 @@ export function RecipeEditorForm({
           setCoverMutationKey(newCoverMutationKey())
         }}
       />
-      <fieldset>
-        <legend>{t('recipe.ingredients')}</legend>
-        {fields.fields.map((field, index) => (
-          <div className="ingredient-row" key={field.id}>
-            <div>
-              <IngredientCombobox
-                label={t('recipe.ingredientNumber', { number: index + 1 })}
-                value={{
-                  name: form.watch(`ingredients.${index}.name`),
-                  canonicalIngredientId: form.watch(`ingredients.${index}.canonicalIngredientId`),
-                }}
-                onChange={(value) => {
-                  form.setValue(`ingredients.${index}.name`, value.name, { shouldDirty: true })
-                  form.setValue(`ingredients.${index}.canonicalIngredientId`, value.canonicalIngredientId, { shouldDirty: true })
-                }}
-                onPasteList={(names) => {
-                  form.setValue(`ingredients.${index}.name`, names[0], { shouldDirty: true })
-                  form.setValue(`ingredients.${index}.canonicalIngredientId`, null, { shouldDirty: true })
-                  for (const name of names.slice(1)) {
-                    fields.append({ name, quantityNote: '', canonicalIngredientId: null })
-                  }
-                }}
-                placeholder={t('recommend.filterPlaceholder')}
-                invalid={Boolean(form.formState.errors.ingredients?.[index]?.name)}
-                describedBy={
-                  form.formState.errors.ingredients?.[index]?.name
-                    ? `recipe-ingredient-${index}-error`
-                    : undefined
-                }
-              />
-              <FieldError
-                id={`recipe-ingredient-${index}-error`}
-                message={form.formState.errors.ingredients?.[index]?.name?.message}
-              />
-            </div>
-            <label>
-              <span className="sr-only">{t('recipe.quantityFor', { number: index + 1 })}</span>
-              <input
-                {...form.register(`ingredients.${index}.quantityNote`)}
-                placeholder={t('recipe.quantityNote')}
-              />
-            </label>
-            {fields.fields.length > 1 && (
-              <button type="button" className="button ghost" onClick={() => fields.remove(index)}>
-                {t('common.remove')}
-              </button>
-            )}
-          </div>
-        ))}
-        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '', canonicalIngredientId: null })}>
-          {t('recipe.addIngredient')}
-        </button>
-      </fieldset>
+      <IngredientGroupsEditor form={form} />
       <button className="button primary" disabled={save.isPending}>
         {save.isPending ? t('recipe.saving') : t('recipe.saveRecipe')}
       </button>
@@ -2053,8 +2242,9 @@ export function RecipeCoverFields({
   )
 }
 
-function PantryPage() {
+export function PantryPage() {
   const { formatDate, t } = useI18n()
+  const search = useSearch({ strict: false }) as { status?: PantryStatus }
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
   const queryClient = useQueryClient()
   const [draft, setDraft] = useState({
@@ -2093,6 +2283,12 @@ function PantryPage() {
   })
   return (
     <Page title={t('pantry.title')} intro={t('pantry.intro')}>
+      {search.status && (
+        <div className="active-filter" role="status">
+          <span>{t('pantry.filterStatus', { status: pantryStatusLabel(search.status, t) })}</span>
+          <Link className="button ghost" to="/pantry" search={{}}>{t('common.clearFilter')}</Link>
+        </div>
+      )}
       <form
         ref={pantryFormRef}
         className="inline-form pantry-form"
@@ -2166,7 +2362,7 @@ function PantryPage() {
       {save.error && <ErrorText error={save.error} />}
       <QueryState query={pantry} empty={t('pantry.empty')}>
         <div className="pantry-table" role="table" aria-label={t('pantry.itemsLabel')}>
-          {pantry.data?.map((item) => (
+          {pantry.data?.filter((item) => !search.status || item.status === search.status).map((item) => (
             <div className="pantry-row" role="row" key={item.id} id={`pantry-${item.id}`}>
               <strong role="cell">{item.name}</strong>
               <span role="cell" className={`status ${item.status === 'have' ? 'ready' : item.status === 'out' ? 'shop' : 'verify'}`}>
@@ -2225,6 +2421,8 @@ export function ShoppingListPage() {
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
   const [draft, setDraft] = useState<IngredientReference>({ name: '', canonicalIngredientId: null })
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [removeCandidate, setRemoveCandidate] = useState<NonNullable<typeof shopping.data>[number] | null>(null)
+  const [shoppingNotice, setShoppingNotice] = useState<string | null>(null)
   const [purchase, setPurchase] = useState<{
     item: NonNullable<typeof shopping.data>[number]
     pantryItemId: string | null
@@ -2232,6 +2430,7 @@ export function ShoppingListPage() {
     expiresOn: string | null
     quantityNote: string
     autoAddToShoppingListWhenOut: boolean
+    selectedAlternativeId: string | null
     idempotencyKey: string
   } | null>(null)
   const [banner, setBanner] = useState<{
@@ -2241,6 +2440,9 @@ export function ShoppingListPage() {
     kept: boolean
   } | null>(null)
   const errorSummaryRef = useRef<HTMLDivElement>(null)
+  const removeErrorRef = useRef<HTMLDivElement>(null)
+  const removeTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const removeKeys = useRef(new Map<string, string>())
   useEffect(() => {
     setPurchase((current) => {
       if (!current) return current
@@ -2257,10 +2459,67 @@ export function ShoppingListPage() {
       setEditingId(null)
     },
   })
+  const removeMutation = useMutation({
+    mutationFn: (item: NonNullable<typeof shopping.data>[number]) => {
+      const idempotencyKey = removeKeys.current.get(item.id)
+        ?? `${Math.floor(Date.now() / 1000)}.${crypto.randomUUID()}`
+      removeKeys.current.set(item.id, idempotencyKey)
+      return api.deleteShoppingItem(item.id, item.version, idempotencyKey)
+        .then((response) => ({ item, response }))
+    },
+    onSuccess: ({ item, response }) => {
+      queryClient.setQueryData(['shopping-list'], response.shoppingItems)
+      void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+      removeKeys.current.delete(item.id)
+      setShoppingNotice(t(
+        response.requiresDisableAutoRestock
+          ? 'shopping.removeAutomaticRemains'
+          : 'shopping.removeSuccess',
+        { name: item.name },
+      ))
+      setRemoveCandidate(null)
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) {
+        void queryClient.invalidateQueries({ queryKey: ['shopping-list'] })
+        void queryClient.invalidateQueries({ queryKey: ['pantry'] })
+        void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+      }
+      queueMicrotask(() => removeErrorRef.current?.focus())
+    },
+  })
+  const disableAutomatic = useMutation({
+    mutationFn: (item: NonNullable<typeof shopping.data>[number]) => {
+      const pantryItem = pantry.data?.find((value) => value.id === item.pantryItemId)
+      if (!pantryItem) throw new Error(t('shopping.autoPantryMissing'))
+      return api.savePantry([{ ...pantryItem, autoAddToShoppingListWhenOut: false }])
+        .then((items) => ({ item, items }))
+    },
+    onSuccess: async ({ item, items }) => {
+      queryClient.setQueryData(['pantry'], items)
+      await Promise.all([
+        shopping.refetch(),
+        queryClient.invalidateQueries({ queryKey: ['recommendations'] }),
+      ])
+      setShoppingNotice(t('shopping.autoDisabled', { name: item.name }))
+      setRemoveCandidate(null)
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) {
+        void queryClient.invalidateQueries({ queryKey: ['shopping-list'] })
+        void queryClient.invalidateQueries({ queryKey: ['pantry'] })
+        void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+      }
+      queueMicrotask(() => removeErrorRef.current?.focus())
+    },
+  })
   const purchaseMutation = useMutation({
     mutationFn: ({ disposition }: { disposition: 'remove' | 'keep' }) => {
       if (!purchase) throw new Error('No purchase is open')
-      const candidate = purchase.item.purchaseOptions.candidates.find(
+      const options = purchase.item.choiceAlternatives
+        ?.find((alternative) => alternative.id === purchase.selectedAlternativeId)
+        ?.purchaseOptions ?? purchase.item.purchaseOptions
+      const candidate = options.candidates.find(
         (value) => value.id === purchase.pantryItemId,
       )
       return api.purchaseShoppingItem(
@@ -2274,6 +2533,7 @@ export function ShoppingListPage() {
           expiresOn: purchase.expiresOn,
           quantityNote: purchase.quantityNote,
           autoAddToShoppingListWhenOut: purchase.autoAddToShoppingListWhenOut,
+          selectedAlternativeId: purchase.selectedAlternativeId,
         },
         purchase.idempotencyKey,
       )
@@ -2325,17 +2585,31 @@ export function ShoppingListPage() {
     const candidate = item.purchaseOptions.candidates.find((value) => value.id === item.pantryItemId)
       ?? item.purchaseOptions.candidates[0]
     const reuse = item.purchaseOptions.resolution === 'reuse'
+    const needsAlternative = item.purchaseOptions.resolution === 'selectAlternative'
     setPurchase({
       item,
-      pantryItemId: reuse ? candidate?.id ?? null : null,
-      createUsingCurrentName: item.purchaseOptions.resolution === 'create',
-      expiresOn: candidate?.status === 'out' ? null : candidate?.expiresOn ?? null,
-      quantityNote: candidate?.quantityNote ?? '',
-      autoAddToShoppingListWhenOut: candidate?.autoAddToShoppingListWhenOut ?? false,
+      pantryItemId: !needsAlternative && reuse ? candidate?.id ?? null : null,
+      createUsingCurrentName: !needsAlternative && item.purchaseOptions.resolution === 'create',
+      expiresOn: !needsAlternative && candidate?.status !== 'out' ? candidate?.expiresOn ?? null : null,
+      quantityNote: !needsAlternative ? candidate?.quantityNote ?? '' : '',
+      autoAddToShoppingListWhenOut: !needsAlternative
+        ? candidate?.autoAddToShoppingListWhenOut ?? false
+        : false,
+      selectedAlternativeId: null,
       idempotencyKey: `${Math.floor(Date.now() / 1000)}.${crypto.randomUUID()}`,
     })
     purchaseMutation.reset()
   }
+  const activePurchaseOptions = purchase
+    ? purchase.item.choiceAlternatives
+      ?.find((alternative) => alternative.id === purchase.selectedAlternativeId)
+      ?.purchaseOptions ?? purchase.item.purchaseOptions
+    : null
+  const purchaseNeedsAlternative = purchase?.item.purchaseOptions.resolution === 'selectAlternative'
+    && !purchase.selectedAlternativeId
+  const purchaseNeedsPantryChoice = activePurchaseOptions?.resolution === 'choice'
+    && !purchase?.pantryItemId
+    && !purchase?.createUsingCurrentName
   return (
     <Page title={t('shopping.title')} intro={t('shopping.intro')}>
       <form
@@ -2384,15 +2658,33 @@ export function ShoppingListPage() {
             : <ErrorText error={undoMutation.error} />}
         </div>
       )}
-      {listMutation.error && <ErrorText error={listMutation.error} />}
+      {shoppingNotice && <p role="status" aria-live="polite">{shoppingNotice}</p>}
+      {!removeCandidate && (listMutation.error || removeMutation.error || disableAutomatic.error) && (
+        <div className="error-summary" role="alert" tabIndex={-1} ref={removeErrorRef}>
+          {(removeMutation.error instanceof ApiError && removeMutation.error.status === 409)
+            || (disableAutomatic.error instanceof ApiError && disableAutomatic.error.status === 409)
+            ? t('shopping.removeConflict')
+            : <ErrorText error={listMutation.error ?? removeMutation.error ?? disableAutomatic.error} />}
+        </div>
+      )}
       <QueryState query={shopping} empty={t('shopping.empty')}>
         <div className="card-list" aria-label={t('shopping.itemsLabel')}>
           {items.map((item) => {
             const canEdit = item.sources.some((source) => source.kind === 'manual')
+            const hasPersistentSource = item.sources.some((source) => source.kind !== 'automatic')
             return (
               <article className="recipe-card" key={item.id}>
                 <strong>{item.name}</strong>
                 <span>{item.sources.map((source) => sourceLabel(source.kind, source.label)).join(' · ')}</span>
+                {item.automatic && (
+                  <p className="field-help">
+                    {t(
+                      hasPersistentSource
+                        ? 'shopping.automaticMergedHelp'
+                        : 'shopping.automaticOnlyHelp',
+                    )}
+                  </p>
+                )}
                 <div className="form-actions">
                   <button
                     type="button"
@@ -2404,38 +2696,109 @@ export function ShoppingListPage() {
                     <button
                       type="button"
                       className="button ghost"
-                      onClick={() => {
-                        const pantryItem = pantry.data?.find((value) => value.id === item.pantryItemId)
-                        if (pantryItem) {
-                          void api.savePantry([{ ...pantryItem, autoAddToShoppingListWhenOut: false }])
-                            .then((values) => {
-                              queryClient.setQueryData(['pantry'], values)
-                              void Promise.all([
-                                shopping.refetch(),
-                                queryClient.invalidateQueries({ queryKey: ['recommendations'] }),
-                              ])
-                            })
-                        }
-                      }}
+                      disabled={disableAutomatic.isPending}
+                      onClick={() => disableAutomatic.mutate(item)}
                     >{t('shopping.disableAutomatic')}</button>
                   )}
                   {canEdit && (
-                    <>
-                      <button type="button" className="button ghost" onClick={() => {
-                        setEditingId(item.id)
-                        setDraft({ name: item.name, canonicalIngredientId: item.canonicalIngredientId })
-                      }}>{t('shopping.edit')}</button>
-                      <button type="button" className="button ghost" onClick={() => listMutation.mutate(() => api.deleteShoppingItem(item.id))}>
-                        {t('shopping.delete')}
-                      </button>
-                    </>
+                    <button type="button" className="button ghost" onClick={() => {
+                      setEditingId(item.id)
+                      setDraft({ name: item.name, canonicalIngredientId: item.canonicalIngredientId })
+                    }}>{t('shopping.edit')}</button>
                   )}
+                  <button
+                    type="button"
+                    className="button secondary destructive"
+                    disabled={removeMutation.isPending || disableAutomatic.isPending}
+                    aria-label={t('shopping.removeLabel', { name: item.name })}
+                    onClick={(event) => {
+                      setShoppingNotice(null)
+                      removeMutation.reset()
+                      disableAutomatic.reset()
+                      if (item.automatic) {
+                        removeTriggerRef.current = event.currentTarget
+                        setRemoveCandidate(item)
+                      } else {
+                        removeMutation.mutate(item)
+                      }
+                    }}
+                  >
+                    {t('shopping.remove')}
+                  </button>
                 </div>
               </article>
             )
           })}
         </div>
       </QueryState>
+      <Dialog.Root
+        open={removeCandidate !== null}
+        onOpenChange={(open) => {
+          if (!open && !removeMutation.isPending && !disableAutomatic.isPending) {
+            setRemoveCandidate(null)
+          }
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          {removeCandidate && (
+            <Dialog.Content
+              className="confirmation-sheet remove-shopping-dialog"
+              onCloseAutoFocus={(event) => {
+                event.preventDefault()
+                removeTriggerRef.current?.focus()
+              }}
+            >
+              <Dialog.Title>{t('shopping.removeDialogTitle')}</Dialog.Title>
+              <Dialog.Description>
+                {t(
+                  removeCandidate.sources.some((source) => source.kind !== 'automatic')
+                    ? 'shopping.removeMergedDetail'
+                    : 'shopping.removeAutomaticOnlyDetail',
+                  { name: removeCandidate.name },
+                )}
+              </Dialog.Description>
+              {(removeMutation.error || disableAutomatic.error) && (
+                <div className="error-summary" role="alert" tabIndex={-1} ref={removeErrorRef}>
+                  {(removeMutation.error instanceof ApiError && removeMutation.error.status === 409)
+                    || (disableAutomatic.error instanceof ApiError && disableAutomatic.error.status === 409)
+                    ? t('shopping.removeConflict')
+                    : <ErrorText error={removeMutation.error ?? disableAutomatic.error} />}
+                </div>
+              )}
+              <div className="dialog-actions">
+                {removeCandidate.sources.some((source) => source.kind !== 'automatic') && (
+                  <button
+                    type="button"
+                    className="button secondary destructive"
+                    disabled={removeMutation.isPending || disableAutomatic.isPending}
+                    onClick={() => removeMutation.mutate(removeCandidate)}
+                  >
+                    {t('shopping.removePersistent')}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={removeMutation.isPending || disableAutomatic.isPending}
+                  onClick={() => disableAutomatic.mutate(removeCandidate)}
+                >
+                  {t('shopping.disableAutomatic')}
+                </button>
+                <Dialog.Close asChild>
+                  <button
+                    type="button"
+                    className="button ghost"
+                    disabled={removeMutation.isPending || disableAutomatic.isPending}
+                  >
+                    {t('common.cancel')}
+                  </button>
+                </Dialog.Close>
+              </div>
+            </Dialog.Content>
+          )}
+        </Dialog.Portal>
+      </Dialog.Root>
       <Dialog.Root open={purchase !== null} onOpenChange={(open) => {
         if (!open && !purchaseMutation.isPending) setPurchase(null)
       }}>
@@ -2453,11 +2816,11 @@ export function ShoppingListPage() {
                       : t('shopping.networkError')}
                   </div>
                 )}
-                {purchase.item.purchaseOptions.resolution === 'choice' && (
+                {activePurchaseOptions?.resolution === 'choice' && (
                   <fieldset>
                     <legend>{t('shopping.matchRequired')}</legend>
                     <p>{t('shopping.matchGuidance')}</p>
-                    {purchase.item.purchaseOptions.candidates.map((candidate) => (
+                    {activePurchaseOptions.candidates.map((candidate) => (
                       <label className="choice-card" key={candidate.id}>
                         <input
                           type="radio"
@@ -2493,7 +2856,41 @@ export function ShoppingListPage() {
                     </label>
                   </fieldset>
                 )}
-                {purchase.item.purchaseOptions.resolution === 'create' && <p>{t('shopping.noMatch')}</p>}
+                {activePurchaseOptions?.resolution === 'create' && <p>{t('shopping.noMatch')}</p>}
+                {purchase.item.choiceAlternatives && purchase.item.choiceAlternatives.length > 1 && (
+                  <fieldset>
+                    <legend>{t('shopping.boughtAlternative')}</legend>
+                    <p>{t('shopping.boughtAlternativeHelp')}</p>
+                    {purchase.item.choiceAlternatives.map((alternative) => (
+                      <label className="choice-card" key={ingredientIdentity(alternative)}>
+                        <input
+                          type="radio"
+                          name="purchased-alternative"
+                          checked={purchase.selectedAlternativeId === alternative.id}
+                          onChange={() => {
+                            const options = alternative.purchaseOptions ?? {
+                              resolution: 'create' as const,
+                              candidates: [],
+                            }
+                            const candidate = options.resolution === 'reuse'
+                              ? options.candidates[0]
+                              : undefined
+                            setPurchase({
+                              ...purchase,
+                              selectedAlternativeId: alternative.id,
+                              pantryItemId: candidate?.id ?? null,
+                              createUsingCurrentName: options.resolution === 'create',
+                              expiresOn: candidate?.status === 'out' ? null : candidate?.expiresOn ?? null,
+                              quantityNote: candidate?.quantityNote ?? '',
+                              autoAddToShoppingListWhenOut: candidate?.autoAddToShoppingListWhenOut ?? false,
+                            })
+                          }}
+                        />
+                        <span>{alternative.name}</span>
+                      </label>
+                    ))}
+                  </fieldset>
+                )}
                 <p><strong>{t('shopping.available')}</strong></p>
                 <ExpirationEditor value={purchase.expiresOn} onChange={(expiresOn) => setPurchase({ ...purchase, expiresOn })} />
                 <label>{t('shopping.quantityNote')}
@@ -2508,13 +2905,13 @@ export function ShoppingListPage() {
                 <button
                   type="button"
                   className="button primary"
-                  disabled={purchaseMutation.isPending || (purchase.item.purchaseOptions.resolution === 'choice' && !purchase.pantryItemId && !purchase.createUsingCurrentName)}
+                  disabled={purchaseMutation.isPending || purchaseNeedsAlternative || purchaseNeedsPantryChoice}
                   onClick={() => purchaseMutation.mutate({ disposition: 'remove' })}
                 >{t('shopping.saveRemove')}</button>
                 <button
                   type="button"
                   className="button secondary"
-                  disabled={purchaseMutation.isPending || (purchase.item.purchaseOptions.resolution === 'choice' && !purchase.pantryItemId && !purchase.createUsingCurrentName)}
+                  disabled={purchaseMutation.isPending || purchaseNeedsAlternative || purchaseNeedsPantryChoice}
                   onClick={() => purchaseMutation.mutate({ disposition: 'keep' })}
                 >{t('shopping.saveKeep')}</button>
                 <Dialog.Close asChild><button type="button" className="button ghost" disabled={purchaseMutation.isPending}>{t('common.cancel')}</button></Dialog.Close>
@@ -3023,11 +3420,11 @@ function ProfileSettings({ user }: { user: User }) {
 }
 
 export const COOK_SKILL_URL =
-  'https://github.com/vichare/Cook/tree/v0.4.2/skills/cook-recipe-import'
+  'https://github.com/vichare/Cook/tree/v0.5.0/skills/cook-recipe-import'
 export const COOK_IMPORT_SCHEMA_URL =
-  'https://raw.githubusercontent.com/vichare/Cook/v0.4.2/skills/cook-recipe-import/schema/import-draft-v1.schema.json'
+  'https://raw.githubusercontent.com/vichare/Cook/v0.5.0/skills/cook-recipe-import/schema/import-draft-v2.schema.json'
 export const COOK_AI_RECIPE_SCHEMA_URL =
-  'https://raw.githubusercontent.com/vichare/Cook/v0.4.2/skills/cook-recipe-import/schema/ai-recipe-v1.schema.json'
+  'https://raw.githubusercontent.com/vichare/Cook/v0.5.0/skills/cook-recipe-import/schema/ai-recipe-v2.schema.json'
 export type TokenPreset = 'import' | 'manage' | 'publish'
 
 function tokenPresetForScopes(scopes: string[]): TokenPreset | null {
@@ -3039,7 +3436,7 @@ function tokenPresetForScopes(scopes: string[]): TokenPreset | null {
 }
 
 export const importDraftExample = {
-  schemaVersion: '1.0',
+  schemaVersion: '2.0',
   sourceUrl: 'https://example.com/recipes/tomato-soup',
   sourceTitle: 'Tomato soup',
   sourceAuthor: 'Example author',
@@ -3049,9 +3446,27 @@ export const importDraftExample = {
   description: 'A concise description.',
   difficulty: 2,
   estimatedCalories: 900,
-  ingredients: [
-    { name: 'tomatoes', quantityNote: '800 g' },
-    { name: 'onion', quantityNote: '1' },
+  ingredientModel: 'groups-v1',
+  ingredientGroups: [
+    {
+      id: 'tomato-group',
+      optional: false,
+      note: '',
+      sortOrder: 0,
+      alternatives: [
+        { id: 'tomatoes', name: 'tomatoes', quantityNote: '800 g', sortOrder: 0 },
+      ],
+    },
+    {
+      id: 'allium-group',
+      optional: false,
+      note: 'Use either one.',
+      sortOrder: 1,
+      alternatives: [
+        { id: 'onion', name: 'onion', quantityNote: '1', sortOrder: 0 },
+        { id: 'shallots', name: 'shallots', quantityNote: '2', sortOrder: 1 },
+      ],
+    },
   ],
   steps: ['Chop the ingredients.', 'Simmer until tender, then blend.'],
   warnings: ['Cooking time was inferred from the source.'],
@@ -3070,9 +3485,27 @@ export const createRecipeExample = {
   sourceAuthor: 'Example author',
   sourceLicense: 'CC-BY-4.0',
   sourceAttribution: 'Example author — Tomato soup',
-  ingredients: [
-    { name: 'tomatoes', quantityNote: '800 g' },
-    { name: 'onion', quantityNote: '1' },
+  ingredientModel: 'groups-v1',
+  ingredientGroups: [
+    {
+      id: 'tomato-group',
+      optional: false,
+      note: '',
+      sortOrder: 0,
+      alternatives: [
+        { id: 'tomatoes', name: 'tomatoes', quantityNote: '800 g', sortOrder: 0 },
+      ],
+    },
+    {
+      id: 'allium-group',
+      optional: false,
+      note: 'Use either one.',
+      sortOrder: 1,
+      alternatives: [
+        { id: 'onion', name: 'onion', quantityNote: '1', sortOrder: 0 },
+        { id: 'shallots', name: 'shallots', quantityNote: '2', sortOrder: 1 },
+      ],
+    },
   ],
 }
 
@@ -3231,9 +3664,9 @@ export function skillInstructionsForPreset(
   const baseUrl = resolveCookBaseUrl(origin)
   return `English:
 GitHub Copilot skill installation:
-1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.4.2
+1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.5.0
 2. Install for cross-session use, pinned to this release:
-   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.2
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.5.0
 3. Restart GitHub Copilot if needed, then verify the skill in Customize → Skills.
 
 Manual fallback: download or copy the entire skills/cook-recipe-import directory, including its schema directory, to ~/.copilot/skills/cook-recipe-import or ~/.agents/skills/cook-recipe-import. Do not copy only SKILL.md.
@@ -3252,9 +3685,9 @@ Minimal first use: “${firstTaskForPreset(preset, 'en')}” The import endpoint
 
 简体中文：
 GitHub Copilot Skill 安装：
-1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.4.2
+1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.5.0
 2. 安装到用户范围并固定到此 release：
-   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.2
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.5.0
 3. 必要时重启 GitHub Copilot，然后在 Customize → Skills 中确认。
 
 手动备用：下载或复制整个 skills/cook-recipe-import 目录（必须包括 schema 目录）到 ~/.copilot/skills/cook-recipe-import 或 ~/.agents/skills/cook-recipe-import。不要只复制 SKILL.md。
@@ -3856,10 +4289,14 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
       visibility: 'private',
       difficulty: draft.difficulty,
       estimatedCalories: draft.estimatedCalories,
-      ingredients: draft.ingredients,
+      sourceUrl: '',
+      sourceTitle: '',
+      sourceAuthor: '',
+      sourceLicense: '',
+      sourceAttribution: '',
+      ingredientGroups: recipeIngredientGroups(draft),
     },
   })
-  const fields = useFieldArray({ control: form.control, name: 'ingredients' })
   const save = useMutation({
     mutationFn: (value: RecipeForm) =>
       api.saveImportDraft(draft.id, {
@@ -3868,7 +4305,8 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
         instructions: value.instructions,
         difficulty: value.difficulty,
         estimatedCalories: value.estimatedCalories,
-        ingredients: value.ingredients,
+        ingredientModel: 'groups-v1',
+        ingredientGroups: value.ingredientGroups,
       }),
     onSuccess: (value) => queryClient.setQueryData(['import-draft', draft.id], value),
   })
@@ -3892,27 +4330,7 @@ function ImportDraftEditor({ draft }: { draft: ImportDraft }) {
         maxLength={20000}
       />
       <RecipeMetadataFields form={form} />
-      <fieldset>
-        <legend>{t('recipe.ingredients')}</legend>
-        {fields.fields.map((field, index) => (
-          <div className="ingredient-row" key={field.id}>
-            <input
-              aria-label={t('recipe.ingredientNumber', { number: index + 1 })}
-              {...form.register(`ingredients.${index}.name`)}
-            />
-            <input
-              aria-label={t('import.quantityNumber', { number: index + 1 })}
-              {...form.register(`ingredients.${index}.quantityNote`)}
-            />
-            {fields.fields.length > 1 && (
-              <button type="button" className="button ghost" onClick={() => fields.remove(index)}>
-                {t('common.remove')}
-              </button>
-            )}
-          </div>
-        ))}
-        <button type="button" className="button secondary" onClick={() => fields.append({ name: '', quantityNote: '', canonicalIngredientId: null })}>{t('recipe.addIngredient')}</button>
-      </fieldset>
+      <IngredientGroupsEditor form={form} />
       <button className="button secondary" disabled={save.isPending}>{t('import.saveChanges')}</button>
       {save.isSuccess && <p role="status">{t('import.saved')}</p>}
       {save.error && <ErrorText error={save.error} />}
@@ -4090,12 +4508,27 @@ function StatePanel({ title, detail }: { title: string; detail: string }) {
   )
 }
 
-function Metric({ label, value }: { label: string; value: string | number }) {
+function Metric({
+  label,
+  value,
+  to,
+  search,
+}: {
+  label: string
+  value: string | number
+  to: '/recipes' | '/pantry'
+  search?: { scope?: 'mine'; status?: PantryStatus }
+}) {
   return (
-    <div className="metric">
-      <strong>{value}</strong>
+    <Link
+      className="metric"
+      to={to}
+      search={search ?? {}}
+      aria-label={`${label}: ${value}`}
+    >
+      <strong aria-hidden="true">{value}</strong>
       <span>{label}</span>
-    </div>
+    </Link>
   )
 }
 
@@ -4108,6 +4541,165 @@ function IngredientSummary({ label, items }: { label: string; items: string[] })
         {items.map((item) => <li key={item}>{item}</li>)}
       </ul>
     </div>
+  )
+}
+
+type RecommendationGroupRow = {
+  id: string
+  status: 'available' | 'verify' | 'missing'
+  optional: boolean
+  note: string
+  alternatives: Array<IngredientReference & { id: string; quantityNote: string }>
+  inShoppingList: boolean
+}
+
+function recommendationGroupRows(recommendation: Recommendation): RecommendationGroupRow[] {
+  const groups = recipeIngredientGroups(recommendation.recipe)
+  return groups.flatMap((group) => {
+    const reason = recommendation.ingredientGroupReasons?.find((item) => item.groupId === group.id)
+    if (reason && !reason.effective) return []
+    const names = group.alternatives.map((alternative) => normalizeIngredient(alternative.name))
+    const legacyIncludes = (values: string[]) => values.some(
+      (value) => names.includes(normalizeIngredient(value)),
+    )
+    const status = reason
+      ? (reason.code === 'AVAILABLE' ? 'available'
+        : reason.code === 'MISSING' || reason.code === 'OUT' ? 'missing'
+          : 'verify')
+      : legacyIncludes(recommendation.available) ? 'available'
+        : legacyIncludes(recommendation.verify) ? 'verify'
+          : 'missing'
+    return [{
+      id: group.id,
+      status,
+      optional: group.optional,
+      note: group.note,
+      alternatives: group.alternatives,
+      inShoppingList: legacyIncludes(recommendation.inShoppingList),
+    }]
+  })
+}
+
+function RecommendationIngredientGroups({
+  recommendation,
+  shoppingItems,
+  pendingIdentity,
+  onAdd,
+}: {
+  recommendation: Recommendation
+  shoppingItems: Array<{
+    name: string
+    canonicalIngredientId: string | null
+    choiceAlternatives?: Array<IngredientReference & { id: string }>
+  }>
+  pendingIdentity: string | null
+  onAdd: (
+    ingredient: IngredientReference,
+    groupId?: string | null,
+    alternativeId?: string | null,
+  ) => void
+}) {
+  const { t } = useI18n()
+  const rows = recommendationGroupRows(recommendation)
+  const [choices, setChoices] = useState<Record<string, string>>({})
+  return (
+    <>
+      {(['available', 'verify', 'missing'] as const).map((status) => {
+        const statusRows = rows.filter((row) => row.status === status)
+        if (statusRows.length === 0) return null
+        const label = t(`recommend.${status}`)
+        return (
+          <div className="ingredient-summary" aria-label={label} key={status}>
+            <strong>{label}</strong>
+            <ul className="ingredient-summary-list">
+              {statusRows.map((row) => {
+                const reason = recommendation.ingredientGroupReasons
+                  ?.find((item) => item.groupId === row.id)
+                const selectedId = choices[row.id] ?? reason?.selectedAlternativeId ?? ''
+                const selected = row.alternatives.find((alternative) => alternative.id === selectedId)
+                  ?? (row.alternatives.length === 1 ? row.alternatives[0] : undefined)
+                const fallback = selected ?? row.alternatives[0]
+                const activeIdentities = shoppingItems.flatMap((item) => [
+                  ingredientIdentity(item),
+                  ...(item.choiceAlternatives ?? []).map(ingredientIdentity),
+                ])
+                const inShoppingList = row.inShoppingList || row.alternatives.some(
+                  (alternative) => activeIdentities.includes(ingredientIdentity(alternative)),
+                )
+                const isStructured = recommendation.recipe.ingredientModel === 'groups-v1'
+                const pendingKey = isStructured
+                  ? `g:${row.id}:${selected?.id ?? 'any'}`
+                  : ingredientIdentity(fallback)
+                const pending = pendingIdentity === pendingKey
+                const groupName = row.alternatives.map((alternative) => alternative.name)
+                  .join(` ${t('recipe.or')} `)
+                return (
+                  <li key={row.id} className="recommendation-ingredient-group">
+                    <span>
+                      {groupName}
+                      {row.optional && <> <span className="optional-badge">{t('recipe.optional')}</span></>}
+                    </span>
+                    {row.note && <small>{row.note}</small>}
+                    {status === 'missing' && inShoppingList && (
+                      <span className="shopping-membership-status">
+                        <span className="sr-only">{t(
+                          row.alternatives.length === 1 ? 'shopping.inList' : 'shopping.groupInList',
+                          { name: groupName },
+                        )}</span>
+                        <span aria-hidden="true">{t('shopping.inListShort')}</span>
+                      </span>
+                    )}
+                    {status === 'missing' && !inShoppingList && fallback && (
+                      <div className="shopping-choice">
+                        {row.alternatives.length > 1 && (
+                          <label>
+                            <span className="sr-only">{t('shopping.chooseAlternative', { name: groupName })}</span>
+                            <select
+                              value={selected?.id ?? ''}
+                              onChange={(event) => setChoices({
+                                ...choices,
+                                [row.id]: event.target.value,
+                              })}
+                            >
+                              <option value="">{t('shopping.anyAlternative')}</option>
+                              {row.alternatives.map((alternative) => (
+                                <option key={alternative.id} value={alternative.id}>
+                                  {alternative.name}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                        <button
+                          type="button"
+                          className="button ghost"
+                          disabled={pending}
+                          aria-label={pending
+                            ? t('shopping.addingMissing', { name: selected?.name ?? groupName })
+                            : t('shopping.addMissing', { name: selected?.name ?? groupName })}
+                          onClick={() => onAdd(
+                            selected ? asIngredientReference(selected) : {
+                              name: groupName,
+                              canonicalIngredientId: null,
+                            },
+                            isStructured ? row.id : null,
+                            selected?.id ?? null,
+                          )}
+                        >
+                          {pending
+                            ? t('shopping.addingMissingShort')
+                            : t('shopping.addMissingShort')}
+                        </button>
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        )
+      })}
+    </>
   )
 }
 
@@ -4202,21 +4794,46 @@ function recommendationIngredientReasonLabel(
   return t(`recommend.ingredient.${reason.code}`, { ingredient: reason.ingredient })
 }
 
-function recommendationScoreLabel(
+function recommendationDesiredCoverage(
   recommendation: Recommendation,
-  t: Translate,
-  formatNumber: (value: number) => string,
-): string {
-  const score = recommendation.scoreBreakdown
-  return t('recommend.scoreSummary', {
-    total: formatNumber(recommendation.score),
-    status: formatNumber(score.statusBase),
-    source: formatNumber(score.source),
-    availability: formatNumber(score.availability),
-    desired: formatNumber(score.desired),
-    certainty: formatNumber(score.certainty),
-    simplicity: formatNumber(score.simplicity),
-  })
+  fallbackTotal: number,
+): { matched: number; total: number } {
+  const intent = recommendation.rankingIntent
+  const matched = typeof intent === 'object' && intent.version === 'intent-v1'
+    && typeof intent.desiredMatched === 'number'
+    ? intent.desiredMatched
+    : recommendation.desiredMatches.length
+  const total = typeof intent === 'object' && intent.version === 'intent-v1'
+    && typeof intent.desiredTotal === 'number'
+    ? intent.desiredTotal
+    : fallbackTotal
+  return {
+    matched: Math.max(0, Math.min(matched, total)),
+    total: Math.max(0, total),
+  }
+}
+
+function recommendationShoppingCoverage(
+  recommendation: Recommendation,
+  shoppingItems: ShoppingItem[],
+): { covered: number; total: number } {
+  const reasons = recommendation.ingredientGroupReasons?.filter((reason) => reason.effective) ?? []
+  if (reasons.length === 0) return { covered: 0, total: 0 }
+  const groups = recipeIngredientGroups(recommendation.recipe)
+  const activeIdentities = new Set(shoppingItems.flatMap((item) => [
+    ingredientIdentity(item),
+    ...(item.choiceAlternatives ?? []).map(ingredientIdentity),
+  ]))
+  const listedNames = new Set(recommendation.inShoppingList.map(normalizeIngredient))
+  const covered = reasons.filter((reason) => {
+    if (reason.code === 'AVAILABLE') return true
+    const group = groups.find((candidate) => candidate.id === reason.groupId)
+    return group?.alternatives.some((alternative) =>
+      activeIdentities.has(ingredientIdentity(alternative))
+      || listedNames.has(normalizeIngredient(alternative.name)),
+    ) ?? false
+  }).length
+  return { covered, total: reasons.length }
 }
 
 function importStatusLabel(status: ImportDraft['status'], t: Translate): string {

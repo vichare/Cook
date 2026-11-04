@@ -31,4 +31,31 @@ describe('recipe cover API', () => {
     expect(body.get('altText')).toBe('A blue bowl of soup')
     expect(body.get('sourceUrl')).toBe('https://example.test/owned-image')
   })
+
+  it('sends shopping deletion version in JSON with an idempotency key', async () => {
+    const response = {
+      outcome: 'removed',
+      requiresDisableAutoRestock: false,
+      shoppingItems: [],
+      undoAvailable: false,
+    }
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(response),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.deleteShoppingItem('shopping-1', 7, 'delete-operation-1'))
+      .resolves.toEqual(response)
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('/api/shopping-list/shopping-1')
+    expect(init.method).toBe('DELETE')
+    expect(init.headers).toEqual({
+      'content-type': 'application/json',
+      'Idempotency-Key': 'delete-operation-1',
+    })
+    expect(JSON.parse(String(init.body))).toEqual({ expectedVersion: 7 })
+  })
 })

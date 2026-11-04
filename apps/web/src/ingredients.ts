@@ -1,4 +1,10 @@
-import type { IngredientReference } from './types'
+import type {
+  Ingredient,
+  IngredientAlternative,
+  IngredientGroup,
+  IngredientReference,
+  Recipe,
+} from './types'
 import type { Translate } from './i18n'
 
 export function normalizeIngredient(value: string): string {
@@ -26,6 +32,66 @@ export function splitIngredientList(value: string): string[] {
 
 export function ingredientReferences(value: string): IngredientReference[] {
   return splitIngredientList(value).map((name) => ({ name, canonicalIngredientId: null }))
+}
+
+export function newIngredientId(prefix: 'group' | 'alternative'): string {
+  return `${prefix}-${crypto.randomUUID()}`
+}
+
+export function ingredientIdentity(value: IngredientReference): string {
+  return value.canonicalIngredientId
+    ? `c:${value.canonicalIngredientId}`
+    : `n:${normalizeIngredient(value.name)}`
+}
+
+export function legacyIngredientGroups(ingredients: Ingredient[]): IngredientGroup[] {
+  return ingredients.map((ingredient, index) => ({
+    id: `legacy-group-${index + 1}`,
+    optional: false,
+    note: '',
+    alternatives: [{
+      ...ingredient,
+      id: `legacy-alternative-${index + 1}`,
+    }],
+  }))
+}
+
+export function recipeIngredientGroups(
+  recipe: Pick<Recipe, 'ingredientModel' | 'ingredientGroups' | 'ingredients'>,
+): IngredientGroup[] {
+  if (recipe.ingredientModel === 'groups-v1' && recipe.ingredientGroups?.length) {
+    return recipe.ingredientGroups
+  }
+  return legacyIngredientGroups(recipe.ingredients ?? [])
+}
+
+export function primaryIngredients(groups: IngredientGroup[]): Ingredient[] {
+  return groups.flatMap((group) => group.alternatives.slice(0, 1).map((alternative) => ({
+    name: alternative.name,
+    quantityNote: alternative.quantityNote,
+    canonicalIngredientId: alternative.canonicalIngredientId,
+  })))
+}
+
+export function emptyIngredientGroup(name = ''): IngredientGroup {
+  return {
+    id: newIngredientId('group'),
+    optional: false,
+    note: '',
+    alternatives: [{
+      id: newIngredientId('alternative'),
+      name,
+      quantityNote: '',
+      canonicalIngredientId: null,
+    }],
+  }
+}
+
+export function asIngredientReference(alternative: IngredientAlternative): IngredientReference {
+  return {
+    name: alternative.name,
+    canonicalIngredientId: alternative.canonicalIngredientId,
+  }
 }
 
 export function localDateValue(date: Date): string {

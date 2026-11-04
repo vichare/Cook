@@ -33,6 +33,32 @@ pub struct IngredientInput {
     pub canonical_ingredient_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IngredientAlternativeInput {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub quantity_note: String,
+    #[serde(default)]
+    pub canonical_ingredient_id: Option<String>,
+    #[serde(default)]
+    pub sort_order: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IngredientGroupInput {
+    pub id: String,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub sort_order: i64,
+    pub alternatives: Vec<IngredientAlternativeInput>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecipeInput {
@@ -57,7 +83,12 @@ pub struct RecipeInput {
     pub source_license: Option<String>,
     #[serde(default)]
     pub source_attribution: Option<String>,
+    #[serde(default)]
     pub ingredients: Vec<IngredientInput>,
+    #[serde(default)]
+    pub ingredient_model: Option<String>,
+    #[serde(default)]
+    pub ingredient_groups: Option<Vec<IngredientGroupInput>>,
 }
 
 fn private_visibility() -> String {
@@ -80,6 +111,9 @@ pub struct Recipe {
     pub difficulty: Option<i64>,
     pub estimated_calories: Option<i64>,
     pub version: i64,
+    pub ingredient_model: String,
+    pub ingredient_groups: Vec<IngredientGroupInput>,
+    #[serde(rename = "ingredients")]
     pub ingredients: Vec<IngredientInput>,
     pub is_favorite: bool,
     pub is_favorite_author: bool,
@@ -180,11 +214,23 @@ pub struct ShoppingItem {
     pub id: String,
     pub name: String,
     pub canonical_ingredient_id: Option<String>,
+    #[serde(default)]
+    pub choice_alternatives: Vec<ShoppingChoiceAlternative>,
     pub automatic: bool,
     pub pantry_item_id: Option<String>,
     pub sources: Vec<ShoppingItemSource>,
     pub version: i64,
     pub purchase_options: ShoppingPurchaseOptions,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShoppingChoiceAlternative {
+    pub id: String,
+    pub name: String,
+    pub canonical_ingredient_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_options: Option<ShoppingPurchaseOptions>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -257,6 +303,15 @@ impl Default for RecommendationSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IngredientScope {
+    #[default]
+    Any,
+    PantryOnly,
+    PantryOrList,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendationRequest {
@@ -266,8 +321,8 @@ pub struct RecommendationRequest {
     pub required: Vec<IngredientReference>,
     #[serde(default)]
     pub excluded: Vec<IngredientReference>,
-    #[serde(default)]
-    pub pantry_only: bool,
+    pub pantry_only: Option<bool>,
+    pub ingredient_scope: Option<IngredientScope>,
     #[serde(default)]
     pub today: Option<String>,
 }

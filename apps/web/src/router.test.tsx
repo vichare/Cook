@@ -15,8 +15,10 @@ import {
   EmailOtpLogin,
   ExpirationEditor,
   GuestLanguageSelector,
+  HomePage,
   LanguageSettings,
   PantryConfirmation,
+  PantryPage,
   PrimaryNavigation,
   ProfileSetup,
   RecipeCoverFields,
@@ -55,8 +57,10 @@ function Providers({ children, locale = 'en' }: { children: React.ReactNode; loc
 
 const {
   deleteRecipeCover,
+  deleteShoppingItem,
   addRecipeIngredientToShopping,
   purchaseShoppingItem,
+  pantryApi,
   recommendationsApi,
   recipesApi,
   recipeApi,
@@ -65,6 +69,7 @@ const {
   saveLocale,
   saveProfile,
   saveRecipe,
+  savePantry,
   securitySettings,
   shoppingItems,
   updateRecipeCoverMetadata,
@@ -159,6 +164,12 @@ const {
     purchaseActionId: 'purchase-1',
     undoAvailable: true,
   }),
+  pantryApi: vi.fn().mockResolvedValue([
+    {
+      id: 'pantry-1', name: 'Milk', status: 'out', quantityNote: '', confirmedAt: null,
+      expiresOn: null, canonicalIngredientId: null, autoAddToShoppingListWhenOut: true, version: 1,
+    },
+  ]),
   recommendationsApi: vi.fn(),
   recipesApi: vi.fn(),
   addRecipeIngredientToShopping: vi.fn(),
@@ -167,6 +178,13 @@ const {
   uploadRecipeCover: vi.fn(),
   updateRecipeCoverMetadata: vi.fn(),
   deleteRecipeCover: vi.fn(),
+  deleteShoppingItem: vi.fn().mockResolvedValue({
+    outcome: 'removed',
+    requiresDisableAutoRestock: false,
+    shoppingItems: [],
+    undoAvailable: false,
+  }),
+  savePantry: vi.fn().mockResolvedValue([]),
 }))
 
 vi.mock('./api', async () => {
@@ -175,25 +193,13 @@ vi.mock('./api', async () => {
     ...actual,
     api: {
       ...actual.api,
-      savePantry: vi.fn().mockResolvedValue([]),
+      savePantry,
       purchaseShoppingItem,
-      pantry: vi.fn().mockResolvedValue([
-        {
-          id: 'pantry-1',
-          name: 'Milk',
-          status: 'out',
-          quantityNote: '',
-          confirmedAt: null,
-          expiresOn: null,
-          canonicalIngredientId: null,
-          autoAddToShoppingListWhenOut: true,
-          version: 1,
-        },
-      ]),
+      pantry: pantryApi,
       shoppingItems,
       addShoppingItem: vi.fn().mockResolvedValue([]),
       updateShoppingItem: vi.fn().mockResolvedValue([]),
-      deleteShoppingItem: vi.fn().mockResolvedValue([]),
+      deleteShoppingItem,
       recommendations: recommendationsApi,
       recipes: recipesApi,
       favorite: vi.fn().mockResolvedValue(undefined),
@@ -238,6 +244,111 @@ describe('shopping list', () => {
     await waitFor(() => expect(purchaseShoppingItem).toHaveBeenCalled())
   })
 
+  it('explains automatic-only removal, uses the disable action, and restores focus on cancel', async () => {
+    shoppingItems.mockReset().mockResolvedValue([{
+      id: 'auto:pantry-1',
+      name: 'Milk',
+      canonicalIngredientId: null,
+      automatic: true,
+      pantryItemId: 'pantry-1',
+      sources: [{ kind: 'automatic', label: '', recipeId: null }],
+      version: 3,
+      purchaseOptions: { resolution: 'reuse', candidates: [] },
+    }])
+    savePantry.mockReset().mockResolvedValue([])
+    deleteShoppingItem.mockClear()
+    render(<Providers><ShoppingListPage /></Providers>)
+    const remove = await screen.findByRole('button', { name: 'Remove Milk from shopping list' })
+    fireEvent.click(remove)
+    const dialog = screen.getByRole('dialog', { name: 'Remove from shopping list?' })
+    expect(dialog).toHaveTextContent('will remain or reappear')
+    expect(within(dialog).queryByRole('button', { name: 'Remove saved sources' })).not.toBeInTheDocument()
+    expect(deleteShoppingItem).not.toHaveBeenCalled()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(remove).toHaveFocus())
+    fireEvent.click(remove)
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Turn off automatic restock' }))
+    await waitFor(() => expect(savePantry).toHaveBeenCalled())
+    expect(await screen.findByText(/Automatic restock for Milk was turned off/)).toBeVisible()
+  })
+
+  it('removes concrete and choice items directly with accurate live feedback', async () => {
+    const choiceItem = {
+      id: 'choice-1',
+      name: 'Milk or oat milk',
+      canonicalIngredientId: null,
+      choiceAlternatives: [
+        { id: 'milk', name: 'Milk', canonicalIngredientId: 'milk-id' },
+        { id: 'oat', name: 'Oat milk', canonicalIngredientId: 'oat-id' },
+      ],
+      automatic: false,
+      pantryItemId: null,
+      sources: [{ kind: 'recipe' as const, label: 'Porridge', recipeId: 'recipe-1' }],
+      version: 4,
+      purchaseOptions: { resolution: 'create' as const, candidates: [] },
+    }
+    shoppingItems.mockReset().mockResolvedValue([choiceItem])
+    deleteShoppingItem.mockReset().mockResolvedValue({
+      outcome: 'removed',
+      requiresDisableAutoRestock: false,
+      shoppingItems: [],
+      undoAvailable: false,
+    })
+    render(<Providers><ShoppingListPage /></Providers>)
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Remove Milk or oat milk from shopping list',
+    }))
+    await waitFor(() => expect(deleteShoppingItem).toHaveBeenCalledWith(
+      'choice-1',
+      4,
+      expect.any(String),
+    ))
+    expect(screen.queryByRole('dialog', { name: 'Remove from shopping list?' })).not.toBeInTheDocument()
+    expect(await screen.findByText('Milk or oat milk was removed from the shopping list.')).toBeVisible()
+  })
+
+  it('does not claim merged automatic items disappeared and refreshes after a conflict', async () => {
+    const merged = {
+      id: 'merged-1',
+      name: 'Milk',
+      canonicalIngredientId: 'milk-id',
+      automatic: true,
+      pantryItemId: 'pantry-1',
+      sources: [
+        { kind: 'automatic' as const, label: '', recipeId: null },
+        { kind: 'recipe' as const, label: 'Soup', recipeId: 'recipe-1' },
+      ],
+      version: 7,
+      purchaseOptions: { resolution: 'reuse' as const, candidates: [] },
+    }
+    shoppingItems.mockReset().mockResolvedValue([merged])
+    deleteShoppingItem.mockReset().mockResolvedValue({
+      outcome: 'automaticRemains',
+      requiresDisableAutoRestock: true,
+      shoppingItems: [{
+        ...merged,
+        sources: [{ kind: 'automatic', label: '', recipeId: null }],
+        version: 8,
+      }],
+      undoAvailable: false,
+    })
+    render(<Providers><ShoppingListPage /></Providers>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove Milk from shopping list' }))
+    expect(screen.getByRole('dialog')).toHaveTextContent('automatic item active')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove saved sources' }))
+    expect(await screen.findByRole('status')).toHaveTextContent('automatic item remains')
+    cleanup()
+
+    const { ApiError } = await import('./api')
+    shoppingItems.mockReset().mockResolvedValue([merged])
+    deleteShoppingItem.mockReset().mockRejectedValue(new ApiError('stale', 409, 'conflict'))
+    render(<Providers><ShoppingListPage /></Providers>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove Milk from shopping list' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove saved sources' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('refreshed the latest version')
+    await waitFor(() => expect(shoppingItems.mock.calls.length).toBeGreaterThan(1))
+  })
+
   describe('recipe concurrency', () => {
     const originalRecipe: Recipe = {
       id: 'recipe-1',
@@ -252,6 +363,13 @@ describe('shopping list', () => {
       difficulty: null,
       estimatedCalories: null,
       ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
+      ingredientModel: 'groups-v1',
+      ingredientGroups: [{
+        id: 'group-1',
+        optional: false,
+        note: '',
+        alternatives: [{ id: 'alternative-1', name: 'water', quantityNote: '', canonicalIngredientId: null }],
+      }],
       isFavorite: false,
       isFavoriteAuthor: false,
       coverImage: {
@@ -279,7 +397,12 @@ describe('shopping list', () => {
       sourceAuthor: '',
       sourceLicense: '',
       sourceAttribution: '',
-      ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
+      ingredientGroups: [{
+        id: 'group-1',
+        optional: false,
+        note: '',
+        alternatives: [{ id: 'alternative-1', name: 'water', quantityNote: '', canonicalIngredientId: null }],
+      }],
     }
     const coverMetadata = {
       altText: 'Updated cover',
@@ -673,7 +796,12 @@ describe('shopping list', () => {
         sourceAuthor: '',
         sourceLicense: '',
         sourceAttribution: '',
-        ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
+        ingredientGroups: [{
+          id: 'group-1',
+          optional: false,
+          note: '',
+          alternatives: [{ id: 'alternative-1', name: 'water', quantityNote: '', canonicalIngredientId: null }],
+        }],
       },
     })
     return (
@@ -687,9 +815,11 @@ describe('shopping list', () => {
         <input type="hidden" {...form.register('sourceAuthor')} />
         <input type="hidden" {...form.register('sourceLicense')} />
         <input type="hidden" {...form.register('sourceAttribution')} />
-        <input type="hidden" {...form.register('ingredients.0.name')} />
-        <input type="hidden" {...form.register('ingredients.0.quantityNote')} />
-        <input type="hidden" {...form.register('ingredients.0.canonicalIngredientId')} />
+        <input type="hidden" {...form.register('ingredientGroups.0.id')} />
+        <input type="hidden" {...form.register('ingredientGroups.0.alternatives.0.id')} />
+        <input type="hidden" {...form.register('ingredientGroups.0.alternatives.0.name')} />
+        <input type="hidden" {...form.register('ingredientGroups.0.alternatives.0.quantityNote')} />
+        <input type="hidden" {...form.register('ingredientGroups.0.alternatives.0.canonicalIngredientId')} />
         <RecipeMetadataFields form={form} />
         <button type="submit">Submit metadata</button>
       </form>
@@ -892,7 +1022,12 @@ describe('shopping list', () => {
           sourceAuthor: '',
           sourceLicense: '',
           sourceAttribution: '',
-          ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
+          ingredientGroups: [{
+            id: 'group-1',
+            optional: false,
+            note: '',
+            alternatives: [{ id: 'alternative-1', name: 'water', quantityNote: '', canonicalIngredientId: null }],
+          }],
         },
       })
       return <RecipeProvenanceFields form={form} />
@@ -916,6 +1051,7 @@ describe('shopping list', () => {
     )
     expect(screen.getByRole('heading', { name: '购物清单' })).toBeVisible()
     expect(await screen.findByRole('button', { name: 'Milk 已买到' })).toBeVisible()
+    expect(screen.getByRole('button', { name: '从购物清单删除 Milk' })).toBeVisible()
     expect(screen.getByText('这里只显示仍需购买的食材。买到后可直接更新库存。')).toBeVisible()
   })
 })
@@ -1068,7 +1204,102 @@ describe('recommendation shopping membership', () => {
     recommendationsApi.mockReset().mockResolvedValue([recommendation(['Saffron'])])
     renderRecommendations()
     expect(await screen.findByText('Saffron: In shopping list')).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Add Saffron' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Add Saffron to shopping list' })).not.toBeInTheDocument()
+  })
+
+  it('sends only the selected ingredient scope and exposes all radio choices accessibly', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations()
+    const any = await screen.findByRole('radio', { name: /Any ingredients/ })
+    const pantry = screen.getByRole('radio', { name: /Pantry only/ })
+    const pantryOrList = screen.getByRole('radio', { name: /Pantry or shopping list/ })
+    expect(any).toBeChecked()
+    expect(pantry).not.toBeChecked()
+    expect(pantryOrList).not.toBeChecked()
+    expect(any.closest('label')).toHaveClass('choice-card')
+    pantryOrList.focus()
+    expect(pantryOrList).toHaveFocus()
+    fireEvent.click(pantryOrList)
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh recommendations' }))
+    await waitFor(() => {
+      const request = recommendationsApi.mock.calls.at(-1)![0]
+      expect(request).toEqual(expect.objectContaining({ ingredientScope: 'PANTRY_OR_LIST' }))
+      expect(request).not.toHaveProperty('pantryOnly')
+    })
+  })
+
+  it('partitions desired results above readiness and shows intent-v1 coverage without scores', async () => {
+    const ready = recommendation()
+    ready.recipe = { ...ready.recipe, id: 'ready', title: 'Ready plain meal' }
+    ready.status = 'READY'
+    ready.desiredMatches = []
+    ready.score = 999
+
+    const full = recommendation()
+    full.recipe = { ...full.recipe, id: 'desired-full', title: 'Desired shopping meal' }
+    full.desiredMatches = ['Rice', 'Egg']
+    full.rankingIntent = { version: 'intent-v1', desiredMatched: 2, desiredTotal: 2 }
+    full.score = 999
+
+    const partial = recommendation()
+    partial.recipe = { ...partial.recipe, id: 'desired-partial', title: 'Partial preferred meal' }
+    partial.desiredMatches = ['Rice']
+    partial.rankingIntent = { version: 'intent-v1', desiredMatched: 1, desiredTotal: 2 }
+    partial.score = 999
+
+    recommendationsApi.mockReset().mockResolvedValue([ready, full, partial])
+    renderRecommendations()
+    const preferredHeading = await screen.findByRole('heading', { name: 'Uses your preferred ingredients' })
+    const otherHeading = screen.getByRole('heading', { name: 'Other recommendations' })
+    expect(preferredHeading.compareDocumentPosition(otherHeading) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+    expect(screen.getByText('2/2 preferred ingredients')).toBeVisible()
+    expect(screen.getByText('1/2 preferred ingredients')).toBeVisible()
+    const desiredCard = screen.getByRole('link', { name: 'Desired shopping meal' }).closest('article')
+    const readyCard = screen.getByRole('link', { name: 'Ready plain meal' }).closest('article')
+    expect(desiredCard).not.toBeNull()
+    expect(readyCard).not.toBeNull()
+    expect(desiredCard!.compareDocumentPosition(readyCard!) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+    fireEvent.click(within(desiredCard as HTMLElement).getByText('Why recommended'))
+    expect(within(desiredCard as HTMLElement).getByText('Uses 2 of 2 preferred ingredients.')).toBeVisible()
+    expect(within(desiredCard as HTMLElement).queryByText(/Total 999/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Total 999/)).not.toBeInTheDocument()
+  })
+
+  it('keeps no-desired results in one backend-ordered section and collapses blocked results last', async () => {
+    const shop = recommendation()
+    shop.recipe = { ...shop.recipe, id: 'shop-first', title: 'Shop first from backend' }
+    const ready = recommendation()
+    ready.recipe = { ...ready.recipe, id: 'ready-second', title: 'Ready second from backend' }
+    ready.status = 'READY'
+    const blocked = recommendation()
+    blocked.recipe = { ...blocked.recipe, id: 'blocked', title: 'Scope blocked meal' }
+    blocked.status = 'BLOCKED'
+    recommendationsApi.mockReset().mockResolvedValue([shop, ready, blocked])
+    renderRecommendations()
+    expect(await screen.findByRole('heading', { name: 'Recommendations' })).toBeVisible()
+    expect(screen.queryByRole('heading', { name: 'Uses your preferred ingredients' })).not.toBeInTheDocument()
+    const shopLink = screen.getByRole('link', { name: 'Shop first from backend' })
+    const readyLink = screen.getByRole('link', { name: 'Ready second from backend' })
+    expect(shopLink.compareDocumentPosition(readyLink) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    const blockedSummary = screen.getByText('Unavailable for this ingredient scope (1)')
+    expect(screen.getByRole('link', { name: 'Scope blocked meal' })).not.toBeVisible()
+    fireEvent.click(blockedSummary)
+    expect(screen.getByRole('link', { name: 'Scope blocked meal' })).toBeVisible()
+    const details = blockedSummary.closest('details')
+    expect(readyLink.compareDocumentPosition(details as Node) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+  })
+
+  it('localizes ingredient scope choices at narrow viewport width', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('zh-CN')
+    expect(await screen.findByRole('radio', { name: /不限食材来源/ })).toBeChecked()
+    expect(screen.getByRole('radio', { name: /仅限库存/ })).toBeVisible()
+    expect(screen.getByRole('radio', { name: /库存或购物清单/ })).toBeVisible()
+    expect(screen.getByRole('group', { name: '食材范围' })).toBeVisible()
   })
 
   it('uses compact preview and ingredient groups with details collapsed by default', async () => {
@@ -1141,6 +1372,7 @@ describe('recommendation shopping membership', () => {
     renderRecommendations('zh-CN')
     expect(await screen.findByText('主要来源：已收藏用户')).toBeVisible()
     expect(screen.queryByText('主要来源：已收藏作者')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '将 Saffron 加入购物清单' })).toHaveTextContent('加入购物清单')
   })
 
   it('prevents duplicate submits and transitions immediately after a successful add', async () => {
@@ -1152,25 +1384,308 @@ describe('recommendation shopping membership', () => {
       }),
     )
     renderRecommendations()
-    const add = await screen.findByRole('button', { name: 'Add Saffron' })
+    const add = await screen.findByRole('button', { name: 'Add Saffron to shopping list' })
     fireEvent.click(add)
     fireEvent.click(add)
     await waitFor(() => expect(addRecipeIngredientToShopping).toHaveBeenCalledTimes(1))
-    expect(screen.getByRole('button', { name: 'Adding Saffron…' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Adding Saffron to shopping list…' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Adding Saffron to shopping list…' }))
+      .toHaveTextContent('Adding to shopping list…')
     resolveAdd([])
     expect(await screen.findByText('Saffron: In shopping list')).toBeVisible()
     expect(screen.getByRole('status')).toHaveTextContent('Saffron added to the shopping list.')
+  })
+
+  it('renders one structured group row and lets the user choose the concrete shopping alternative', async () => {
+    const result = recommendation()
+    result.recipe.ingredientModel = 'groups-v1'
+    result.recipe.ingredientGroups = [{
+      id: 'group-fat',
+      optional: false,
+      note: 'Use either',
+      alternatives: [
+        { id: 'butter', name: 'Butter', quantityNote: '1 tbsp', canonicalIngredientId: 'butter-id' },
+        { id: 'oil', name: 'Oil', quantityNote: '1 tbsp', canonicalIngredientId: 'oil-id' },
+      ],
+    }]
+    result.missing = ['Butter', 'Oil']
+    result.ingredientGroupReasons = [{
+      groupId: 'group-fat',
+      label: 'Butter / Oil',
+      optional: false,
+      effective: true,
+      code: 'MISSING',
+      selectedAlternativeId: null,
+      alternatives: [
+        { ingredient: 'Butter', code: 'MISSING', expiresOn: null },
+        { ingredient: 'Oil', code: 'MISSING', expiresOn: null },
+      ],
+    }]
+    recommendationsApi.mockReset().mockResolvedValue([result])
+    addRecipeIngredientToShopping.mockReset().mockResolvedValue([])
+    renderRecommendations()
+    expect(await screen.findAllByText('Butter or Oil')).toHaveLength(1)
+    fireEvent.click(screen.getByText('Why recommended'))
+    expect(screen.getByText('0 of 1 ingredient groups are covered by pantry or shopping-list availability.')).toBeVisible()
+    fireEvent.change(screen.getByLabelText('Choose an alternative for Butter or Oil'), {
+      target: { value: 'oil' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add Oil to shopping list' }))
+    await waitFor(() => expect(addRecipeIngredientToShopping).toHaveBeenCalledWith(
+      'recipe-shop',
+      {
+        name: 'Oil',
+        canonicalIngredientId: 'oil-id',
+        groupId: 'group-fat',
+        alternativeId: 'oil',
+      },
+    ))
+    expect(await screen.findByText('Butter or Oil: an alternative is in the shopping list')).toBeVisible()
+    expect(screen.getByText('1 of 1 ingredient groups are covered by pantry or shopping-list availability.')).toBeVisible()
   })
 
   it('restores the add action after failure and never claims success', async () => {
     recommendationsApi.mockReset().mockResolvedValue([recommendation()])
     addRecipeIngredientToShopping.mockReset().mockRejectedValue(new Error('network failed'))
     renderRecommendations()
-    fireEvent.click(await screen.findByRole('button', { name: 'Add Saffron' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Add Saffron to shopping list' }))
     expect(await screen.findByText('network failed')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Add Saffron' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Add Saffron to shopping list' })).toBeEnabled()
     expect(screen.queryByText('Saffron: In shopping list')).not.toBeInTheDocument()
     expect(screen.queryByText('Saffron added to the shopping list.')).not.toBeInTheDocument()
+  })
+})
+
+describe('ingredient groups and homepage navigation', () => {
+  it('projects alternatives as one group with localized OR, optional note, and one pantry badge', async () => {
+    render(
+      <Providers>
+        <RecipeIngredientList
+          ingredients={[]}
+          ingredientModel="groups-v1"
+          ingredientGroups={[{
+            id: 'group-dairy',
+            optional: true,
+            note: 'Use what is open',
+            alternatives: [
+              { id: 'alt-milk', name: 'Milk', quantityNote: '1 cup', canonicalIngredientId: null },
+              { id: 'alt-oat', name: 'Oat milk', quantityNote: '1 cup', canonicalIngredientId: null },
+            ],
+          }]}
+        />
+      </Providers>,
+    )
+    expect(await screen.findByText('or')).toBeVisible()
+    expect(screen.getByText('Optional')).toBeVisible()
+    expect(screen.getByText('Use what is open')).toBeVisible()
+    expect(screen.getAllByLabelText(/pantry status/)).toHaveLength(1)
+  })
+
+  it('adds AND groups and OR alternatives and rejects duplicate ingredient identities', () => {
+    render(
+      <Providers>
+        <RecipeEditorForm onSaved={vi.fn()} />
+      </Providers>,
+    )
+    expect(screen.getByRole('group', { name: 'Ingredient group 1' })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Add alternative' }))
+    expect(screen.getByLabelText('Group 1, alternative 2')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Add ingredient' }))
+    expect(screen.getByRole('group', { name: 'Ingredient group 2' })).toBeVisible()
+
+    const result = recipeSchema((key) => key).safeParse({
+      title: 'Duplicate',
+      description: '',
+      instructions: '',
+      visibility: 'private',
+      difficulty: null,
+      estimatedCalories: null,
+      sourceUrl: '',
+      sourceTitle: '',
+      sourceAuthor: '',
+      sourceLicense: '',
+      sourceAttribution: '',
+      ingredientGroups: [
+        {
+          id: 'g1',
+          optional: false,
+          note: '',
+          alternatives: [
+            { id: 'a1', name: ' Milk ', quantityNote: '', canonicalIngredientId: null },
+            { id: 'a2', name: 'milk', quantityNote: '', canonicalIngredientId: null },
+          ],
+        },
+      ],
+    })
+    expect(result.success).toBe(false)
+  })
+
+  it('makes each homepage metric a whole-card link with owner-only recipe count and filters', async () => {
+    recipesApi.mockReset().mockResolvedValue([
+      {
+        id: 'owned', version: 1, isOwner: true, authorHandle: '', authorNickname: null,
+        title: 'Mine', description: '', instructions: '', visibility: 'private',
+        difficulty: null, estimatedCalories: null, ingredients: [], isFavorite: false,
+        isFavoriteAuthor: false, coverImage: null, source: null,
+      },
+      {
+        id: 'visible', version: 1, isOwner: false, authorHandle: '', authorNickname: null,
+        title: 'Shared', description: '', instructions: '', visibility: 'public',
+        difficulty: null, estimatedCalories: null, ingredients: [], isFavorite: false,
+        isFavoriteAuthor: false, coverImage: null, source: null,
+      },
+    ])
+    const root = createRootRoute()
+    const home = createRoute({ getParentRoute: () => root, path: '/', component: HomePage })
+    const recipes = createRoute({ getParentRoute: () => root, path: '/recipes', component: () => null })
+    const pantry = createRoute({ getParentRoute: () => root, path: '/pantry', component: () => null })
+    const recommendations = createRoute({ getParentRoute: () => root, path: '/recommendations', component: () => null })
+    const newRecipe = createRoute({ getParentRoute: () => root, path: '/recipes/new', component: () => null })
+    const testRouter = createRouter({
+      routeTree: root.addChildren([home, recipes, pantry, recommendations, newRecipe]),
+      history: createMemoryHistory({ initialEntries: ['/'] }),
+    })
+
+    render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <RouterProvider router={testRouter} />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+    expect(await screen.findByRole('link', { name: 'My recipes: 1' }))
+      .toHaveAttribute('href', '/recipes?scope=mine')
+    expect(screen.getByRole('link', { name: 'Pantry items: 1' })).toHaveAttribute('href', '/pantry')
+    expect(screen.getByRole('link', { name: 'Confirmed available: 0' }))
+      .toHaveAttribute('href', '/pantry?status=have')
+  })
+
+  it('applies and clears the owner-only recipes filter', async () => {
+    recipesApi.mockReset().mockResolvedValue([
+      {
+        id: 'owned', version: 1, isOwner: true, authorHandle: '', authorNickname: null,
+        title: 'Owned recipe', description: '', instructions: '', visibility: 'private',
+        difficulty: null, estimatedCalories: null, ingredients: [], isFavorite: false,
+        isFavoriteAuthor: false, coverImage: null, source: null,
+      },
+      {
+        id: 'shared', version: 1, isOwner: false, authorHandle: '', authorNickname: null,
+        title: 'Shared recipe', description: '', instructions: '', visibility: 'public',
+        difficulty: null, estimatedCalories: null, ingredients: [], isFavorite: false,
+        isFavoriteAuthor: false, coverImage: null, source: null,
+      },
+    ])
+    const root = createRootRoute({ component: RecipesPage })
+    const testRouter = createRouter({
+      routeTree: root,
+      history: createMemoryHistory({ initialEntries: ['/?scope=mine'] }),
+    })
+
+    render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <RouterProvider router={testRouter} />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+    expect(await screen.findByRole('link', { name: 'Owned recipe' })).toBeVisible()
+    expect(screen.queryByRole('link', { name: 'Shared recipe' })).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Clear filter' })).toHaveAttribute('href', '/recipes')
+  })
+
+  it('applies and clears the pantry status filter', async () => {
+    pantryApi.mockReset().mockResolvedValue([
+      {
+        id: 'have', name: 'Egg', status: 'have', quantityNote: '', confirmedAt: null,
+        expiresOn: null, canonicalIngredientId: null, autoAddToShoppingListWhenOut: false, version: 1,
+      },
+      {
+        id: 'out', name: 'Milk', status: 'out', quantityNote: '', confirmedAt: null,
+        expiresOn: null, canonicalIngredientId: null, autoAddToShoppingListWhenOut: false, version: 1,
+      },
+    ])
+    const root = createRootRoute({ component: PantryPage })
+    const testRouter = createRouter({
+      routeTree: root,
+      history: createMemoryHistory({ initialEntries: ['/?status=have'] }),
+    })
+    render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <RouterProvider router={testRouter} />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+    const table = await screen.findByRole('table', { name: 'Pantry items' })
+    expect(within(table).getByText('Egg')).toBeVisible()
+    expect(within(table).queryByText('Milk')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Clear filter' })).toHaveAttribute('href', '/pantry')
+  })
+
+  it('passes the actual bought alternative through the purchase contract', async () => {
+    shoppingItems.mockReset().mockResolvedValue([{
+      id: 'recipe-choice',
+      name: 'Milk or oat milk',
+      canonicalIngredientId: null,
+      choiceAlternatives: [
+        {
+          id: 'milk-alt',
+          name: 'Milk',
+          canonicalIngredientId: 'milk',
+          purchaseOptions: {
+            resolution: 'reuse',
+            candidates: [{
+              id: 'pantry-milk', name: 'Milk', status: 'out', quantityNote: '',
+              expiresOn: null, canonicalIngredientId: 'milk',
+              autoAddToShoppingListWhenOut: false, version: 5,
+            }],
+          },
+        },
+        {
+          id: 'oat-alt',
+          name: 'Oat milk',
+          canonicalIngredientId: 'oat-milk',
+          purchaseOptions: {
+            resolution: 'choice',
+            candidates: [{
+              id: 'pantry-oat', name: 'Oat carton', status: 'unknown', quantityNote: 'half carton',
+              expiresOn: '2026-11-12', canonicalIngredientId: 'oat-milk',
+              autoAddToShoppingListWhenOut: true, version: 7,
+            }],
+          },
+        },
+      ],
+      automatic: false,
+      pantryItemId: null,
+      sources: [{ kind: 'recipe', label: 'Porridge', recipeId: 'recipe-1' }],
+      version: 1,
+      purchaseOptions: { resolution: 'selectAlternative', candidates: [] },
+    }])
+    render(
+      <Providers>
+        <ShoppingListPage />
+      </Providers>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Bought Milk or oat milk' }))
+    expect(screen.getByRole('button', { name: 'Save to pantry and remove from list' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('radio', { name: 'Milk' }))
+    expect(screen.getByRole('button', { name: 'Save to pantry and remove from list' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('radio', { name: 'Oat milk' }))
+    expect(screen.getByRole('button', { name: 'Save to pantry and remove from list' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('radio', { name: /Use existing pantry item: Oat carton/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save to pantry and remove from list' }))
+    await waitFor(() => expect(purchaseShoppingItem).toHaveBeenCalledWith(
+      'recipe-choice',
+      expect.objectContaining({
+        selectedAlternativeId: 'oat-alt',
+        pantryItemId: 'pantry-oat',
+        pantryExpectedVersion: 7,
+        createUsingCurrentName: false,
+        quantityNote: 'half carton',
+        autoAddToShoppingListWhenOut: true,
+      }),
+      expect.any(String),
+    ))
   })
 })
 

@@ -9,7 +9,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -19,10 +19,11 @@ use crate::{
         authenticate_token, record_token_audit, TokenPrincipal, SCOPE_IMAGES_WRITE,
         SCOPE_RECIPES_PUBLISH, SCOPE_RECIPES_READ, SCOPE_RECIPES_WRITE,
     },
-    models::{IngredientInput, Recipe, RecipeInput},
+    models::{IngredientGroupInput, IngredientInput, Recipe, RecipeInput},
     routes::{
-        expand_ingredient_inputs, load_visible_recipes, replace_ingredients,
-        validate_ingredient_selections, validate_recipe, CurrentUser,
+        effective_ingredient_groups, expand_ingredient_inputs, load_visible_recipes,
+        replace_ingredient_groups, validate_group_selections, validate_ingredient_selections,
+        validate_recipe, CurrentUser,
     },
     AppState,
 };
@@ -52,7 +53,12 @@ pub struct AiRecipeInput {
     source_license: Option<String>,
     #[serde(default)]
     source_attribution: Option<String>,
+    #[serde(default)]
     ingredients: Vec<IngredientInput>,
+    #[serde(default)]
+    ingredient_model: Option<String>,
+    #[serde(default)]
+    ingredient_groups: Option<Vec<IngredientGroupInput>>,
     expected_version: Option<i64>,
     visibility: Option<String>,
 }
@@ -73,6 +79,8 @@ pub struct RecipeRevision {
     source_author: Option<String>,
     source_license: Option<String>,
     source_attribution: Option<String>,
+    ingredient_model: String,
+    ingredient_groups: Vec<IngredientGroupInput>,
     ingredients: Vec<IngredientInput>,
     image_action: String,
     image_alt_text: Option<String>,
@@ -190,11 +198,12 @@ pub async fn create_ai_recipe(
     ))
     .execute(&mut *transaction)
     .await?;
-    crate::routes::insert_ingredients(
+    let groups = effective_ingredient_groups(&recipe_input)?;
+    crate::routes::insert_ingredient_groups(
         &mut transaction,
         &recipe_id,
         &principal.owner_id,
-        &recipe_input.ingredients,
+        &groups,
     )
     .await?;
     sqlx::query(
@@ -246,6 +255,25 @@ pub async fn update_ai_recipe(
         expected_version,
     )
     .await?;
+    if input.ingredient_groups.is_none() {
+        let requires_groups: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+               SELECT 1 FROM recipe_ingredient_groups g
+               WHERE g.recipe_id = ? AND (
+                 g.optional = 1 OR
+                 g.note <> '' OR
+                 (SELECT COUNT(*) FROM recipe_ingredient_alternatives a
+                  WHERE a.group_id = g.id) > 1
+               )
+             )",
+        )
+        .bind(&recipe_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if requires_groups != 0 {
+            return Err(AppError::Validation("ingredient_groups_required".into()));
+        }
+    }
     let target_visibility = validate_ai_visibility(
         input
             .visibility
@@ -514,8 +542,8 @@ pub(crate) async fn accept_revision(
             "live recipe changed after this revision was created".into(),
         ));
     }
-    let ingredients = load_revision_ingredients_tx(&mut transaction, &revision_id).await?;
-    replace_ingredients(&mut transaction, &recipe_id, &user.id, &ingredients).await?;
+    let groups = load_revision_ingredient_groups_tx(&mut transaction, &revision_id).await?;
+    replace_ingredient_groups(&mut transaction, &recipe_id, &user.id, &groups).await?;
     match row.get::<String, _>("image_action").as_str() {
         "keep" => {}
         "delete" => delete_image(&mut transaction, &recipe_id).await?,
@@ -659,13 +687,8 @@ async fn update_recipe_direct(
             "recipe changed; reload and retry".into(),
         ));
     }
-    replace_ingredients(
-        transaction,
-        recipe_id,
-        &principal.owner_id,
-        &input.ingredients,
-    )
-    .await?;
+    let groups = effective_ingredient_groups(input)?;
+    replace_ingredient_groups(transaction, recipe_id, &principal.owner_id, &groups).await?;
     record_token_audit(
         transaction,
         principal,
@@ -707,6 +730,8 @@ async fn create_revision(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     validate_ingredient_selections(transaction, &principal.owner_id, &input.ingredients).await?;
+    let groups = effective_ingredient_groups(input)?;
+    validate_group_selections(transaction, &principal.owner_id, &groups).await?;
     sqlx::query(
         "INSERT INTO recipe_revisions
          (id, recipe_id, owner_id, token_id, expected_version, title, description,
@@ -745,7 +770,7 @@ async fn create_revision(
     .bind(now)
     .execute(&mut **transaction)
     .await?;
-    insert_revision_ingredients(transaction, &id, &input.ingredients).await?;
+    insert_revision_ingredient_groups(transaction, &id, &groups).await?;
     record_token_audit(
         transaction,
         principal,
@@ -815,6 +840,8 @@ async fn load_recipe_input_tx(
         source_license: row.get("source_license"),
         source_attribution: row.get("source_attribution"),
         ingredients,
+        ingredient_model: None,
+        ingredient_groups: None,
     })
 }
 
@@ -832,6 +859,8 @@ fn recipe_input(input: &AiRecipeInput, visibility: &str) -> RecipeInput {
         source_license: input.source_license.clone(),
         source_attribution: input.source_attribution.clone(),
         ingredients: input.ingredients.clone(),
+        ingredient_model: input.ingredient_model.clone(),
+        ingredient_groups: input.ingredient_groups.clone(),
     }
 }
 
@@ -854,12 +883,53 @@ fn principal_can_publish(principal: &TokenPrincipal) -> bool {
         && principal_has_scope(principal, SCOPE_RECIPES_PUBLISH)
 }
 
-async fn insert_revision_ingredients(
+async fn insert_revision_ingredient_groups(
     transaction: &mut Transaction<'_, Sqlite>,
     revision_id: &str,
-    ingredients: &[IngredientInput],
+    groups: &[IngredientGroupInput],
 ) -> AppResult<()> {
-    for (index, ingredient) in ingredients.iter().enumerate() {
+    let mut groups = groups.iter().collect::<Vec<_>>();
+    groups.sort_by_key(|group| group.sort_order);
+    for group in groups {
+        let persisted_group_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO recipe_revision_ingredient_groups
+             (id, revision_id, external_id, optional, note, sort_order)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&persisted_group_id)
+        .bind(revision_id)
+        .bind(&group.id)
+        .bind(group.optional)
+        .bind(group.note.trim())
+        .bind(group.sort_order)
+        .execute(&mut **transaction)
+        .await?;
+        let mut alternatives = group.alternatives.iter().collect::<Vec<_>>();
+        alternatives.sort_by_key(|alternative| alternative.sort_order);
+        for alternative in alternatives {
+            sqlx::query(
+                "INSERT INTO recipe_revision_ingredient_alternatives
+                 (id, group_id, external_id, name, quantity_note,
+                  canonical_ingredient_id, sort_order)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&persisted_group_id)
+            .bind(&alternative.id)
+            .bind(alternative.name.trim())
+            .bind(alternative.quantity_note.trim())
+            .bind(&alternative.canonical_ingredient_id)
+            .bind(alternative.sort_order)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        let display = group
+            .alternatives
+            .iter()
+            .map(|alternative| alternative.name.trim())
+            .collect::<Vec<_>>()
+            .join(" / ");
         sqlx::query(
             "INSERT INTO recipe_revision_ingredients
              (id, revision_id, name, quantity_note, canonical_ingredient_id, sort_order)
@@ -867,40 +937,68 @@ async fn insert_revision_ingredients(
         )
         .bind(Uuid::new_v4().to_string())
         .bind(revision_id)
-        .bind(ingredient.name.trim())
-        .bind(ingredient.quantity_note.trim())
-        .bind(&ingredient.canonical_ingredient_id)
+        .bind(display)
+        .bind(if group.alternatives.len() == 1 {
+            group.alternatives[0].quantity_note.trim()
+        } else {
+            group.note.trim()
+        })
         .bind(
-            i64::try_from(index)
-                .map_err(|_| AppError::Validation("too many ingredients".into()))?,
+            (group.alternatives.len() == 1)
+                .then(|| group.alternatives[0].canonical_ingredient_id.clone())
+                .flatten(),
         )
+        .bind(group.sort_order)
         .execute(&mut **transaction)
         .await?;
     }
     Ok(())
 }
 
-async fn load_revision_ingredients_tx(
+async fn load_revision_ingredient_groups_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     revision_id: &str,
-) -> AppResult<Vec<IngredientInput>> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT name, quantity_note, canonical_ingredient_id
-         FROM recipe_revision_ingredients WHERE revision_id = ? ORDER BY sort_order",
+) -> AppResult<Vec<IngredientGroupInput>> {
+    let rows = sqlx::query(
+        "SELECT g.external_id AS group_id, g.optional, g.note, g.sort_order AS group_sort,
+                a.external_id AS alternative_id, a.name, a.quantity_note,
+                a.canonical_ingredient_id, a.sort_order AS alternative_sort
+         FROM recipe_revision_ingredient_groups g
+         JOIN recipe_revision_ingredient_alternatives a ON a.group_id = g.id
+         WHERE g.revision_id = ? ORDER BY g.sort_order, a.sort_order",
     )
     .bind(revision_id)
     .fetch_all(&mut **transaction)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(name, quantity_note, canonical_ingredient_id)| IngredientInput {
-                name,
-                quantity_note,
-                canonical_ingredient_id,
-            },
-        )
-        .collect())
+    Ok(revision_groups_from_rows(rows))
+}
+
+fn revision_groups_from_rows(rows: Vec<SqliteRow>) -> Vec<IngredientGroupInput> {
+    let mut groups = Vec::<IngredientGroupInput>::new();
+    for row in rows {
+        let group_id: String = row.get("group_id");
+        if groups.last().is_none_or(|group| group.id != group_id) {
+            groups.push(IngredientGroupInput {
+                id: group_id,
+                optional: row.get("optional"),
+                note: row.get("note"),
+                sort_order: row.get("group_sort"),
+                alternatives: Vec::new(),
+            });
+        }
+        groups
+            .last_mut()
+            .expect("group was inserted")
+            .alternatives
+            .push(crate::models::IngredientAlternativeInput {
+                id: row.get("alternative_id"),
+                name: row.get("name"),
+                quantity_note: row.get("quantity_note"),
+                canonical_ingredient_id: row.get("canonical_ingredient_id"),
+                sort_order: row.get("alternative_sort"),
+            });
+    }
+    groups
 }
 
 async fn load_revision(
@@ -928,6 +1026,17 @@ async fn load_revision(
     .bind(revision_id)
     .fetch_all(pool)
     .await?;
+    let group_rows = sqlx::query(
+        "SELECT g.external_id AS group_id, g.optional, g.note, g.sort_order AS group_sort,
+                a.external_id AS alternative_id, a.name, a.quantity_note,
+                a.canonical_ingredient_id, a.sort_order AS alternative_sort
+         FROM recipe_revision_ingredient_groups g
+         JOIN recipe_revision_ingredient_alternatives a ON a.group_id = g.id
+         WHERE g.revision_id = ? ORDER BY g.sort_order, a.sort_order",
+    )
+    .bind(revision_id)
+    .fetch_all(pool)
+    .await?;
     Ok(RecipeRevision {
         id: row.get("id"),
         recipe_id: row.get("recipe_id"),
@@ -942,6 +1051,8 @@ async fn load_revision(
         source_author: row.get("source_author"),
         source_license: row.get("source_license"),
         source_attribution: row.get("source_attribution"),
+        ingredient_model: "groups-v1".into(),
+        ingredient_groups: revision_groups_from_rows(group_rows),
         ingredients: ingredients
             .into_iter()
             .map(

@@ -12,8 +12,10 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{IngredientInput, Recipe},
-    routes::{insert_ingredients, load_visible_recipes, CurrentUser},
+    models::{IngredientAlternativeInput, IngredientGroupInput, IngredientInput, Recipe},
+    routes::{
+        insert_ingredient_groups, load_visible_recipes, validate_ingredient_groups, CurrentUser,
+    },
     AppState,
 };
 
@@ -86,7 +88,12 @@ pub struct ImportDraftSubmission {
     difficulty: Option<i64>,
     #[serde(default)]
     estimated_calories: Option<i64>,
+    #[serde(default)]
     ingredients: Vec<IngredientInput>,
+    #[serde(default)]
+    ingredient_model: Option<String>,
+    #[serde(default)]
+    ingredient_groups: Option<Vec<IngredientGroupInput>>,
     steps: Vec<String>,
     #[serde(default)]
     warnings: Vec<String>,
@@ -105,7 +112,12 @@ pub struct ImportDraftUpdate {
     difficulty: Option<i64>,
     #[serde(default)]
     estimated_calories: Option<i64>,
+    #[serde(default)]
     ingredients: Vec<IngredientInput>,
+    #[serde(default)]
+    ingredient_model: Option<String>,
+    #[serde(default)]
+    ingredient_groups: Option<Vec<IngredientGroupInput>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -122,6 +134,8 @@ pub struct ImportDraft {
     instructions: String,
     difficulty: Option<i64>,
     estimated_calories: Option<i64>,
+    ingredient_model: String,
+    ingredient_groups: Vec<IngredientGroupInput>,
     ingredients: Vec<IngredientInput>,
     warnings: Vec<String>,
     confidence: Option<f64>,
@@ -333,7 +347,7 @@ pub(crate) async fn create_import_draft(
     .bind(now.timestamp())
     .execute(&mut *transaction)
     .await?;
-    insert_draft_ingredients(&mut transaction, &id, &input.ingredients).await?;
+    insert_draft_groups(&mut transaction, &id, &submission_groups(&input)?).await?;
     record_token_audit(
         &mut transaction,
         &principal,
@@ -383,6 +397,25 @@ pub(crate) async fn update_import_draft(
 ) -> AppResult<Json<ImportDraft>> {
     validate_draft_update(&input)?;
     let mut transaction = state.pool.begin().await?;
+    if input.ingredient_groups.is_none() {
+        let requires_groups: Option<i64> = sqlx::query_scalar(
+            "SELECT 1
+             FROM import_draft_ingredient_groups g
+             JOIN import_drafts d ON d.id = g.draft_id
+             WHERE d.id = ? AND d.owner_id = ? AND d.status = 'draft'
+               AND (g.optional = 1 OR g.note <> '' OR
+                    (SELECT COUNT(*) FROM import_draft_ingredient_alternatives a
+                     WHERE a.group_id = g.id) > 1)
+             LIMIT 1",
+        )
+        .bind(&id)
+        .bind(&user.id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if requires_groups.is_some() {
+            return Err(AppError::Validation("ingredient_groups_required".into()));
+        }
+    }
     let result = sqlx::query(
         "UPDATE import_drafts
          SET title = ?, description = ?, instructions = ?, difficulty = ?,
@@ -406,7 +439,11 @@ pub(crate) async fn update_import_draft(
         .bind(&id)
         .execute(&mut *transaction)
         .await?;
-    insert_draft_ingredients(&mut transaction, &id, &input.ingredients).await?;
+    sqlx::query("DELETE FROM import_draft_ingredient_groups WHERE draft_id = ?")
+        .bind(&id)
+        .execute(&mut *transaction)
+        .await?;
+    insert_draft_groups(&mut transaction, &id, &update_groups(&input)?).await?;
     transaction.commit().await?;
     Ok(Json(load_import_draft(&state.pool, &user.id, &id).await?))
 }
@@ -455,7 +492,7 @@ pub(crate) async fn accept_import_draft(
             "import draft has already been consumed or discarded".into(),
         ));
     }
-    let ingredients = load_draft_ingredients_tx(&mut transaction, &id).await?;
+    let groups = load_draft_groups_tx(&mut transaction, &id).await?;
     let recipe_id = Uuid::new_v4().to_string();
     let source_title: Option<String> = row.get("source_title");
     let source_author: Option<String> = row.get("source_author");
@@ -490,7 +527,7 @@ pub(crate) async fn accept_import_draft(
     .bind(row.get::<Option<f64>, _>("confidence"))
     .execute(&mut *transaction)
     .await?;
-    insert_ingredients(&mut transaction, &recipe_id, &user.id, &ingredients).await?;
+    insert_ingredient_groups(&mut transaction, &recipe_id, &user.id, &groups).await?;
     let result = sqlx::query(
         "UPDATE import_drafts
          SET status = 'consumed', accepted_recipe_id = ?, consumed_at = ?, updated_at = ?
@@ -707,9 +744,9 @@ fn timestamp(value: i64) -> String {
 }
 
 fn validate_submission(input: &ImportDraftSubmission) -> AppResult<()> {
-    if input.schema_version != "1.0" {
+    if input.schema_version != "1.0" && input.schema_version != "2.0" {
         return Err(AppError::Validation(
-            "schemaVersion must be exactly 1.0".into(),
+            "schemaVersion must be 1.0 or 2.0".into(),
         ));
     }
     let url = Url::parse(input.source_url.trim())
@@ -731,7 +768,7 @@ fn validate_submission(input: &ImportDraftSubmission) -> AppResult<()> {
     validate_short_text("title", &input.title, 120, false)?;
     validate_short_text("description", &input.description, 2000, true)?;
     validate_recipe_metadata(input.difficulty, input.estimated_calories)?;
-    validate_ingredients(&input.ingredients)?;
+    validate_ingredient_groups(&submission_groups(input)?)?;
     if input.steps.is_empty() || input.steps.len() > 50 {
         return Err(AppError::Validation(
             "steps must contain between 1 and 50 items".into(),
@@ -772,7 +809,70 @@ fn validate_draft_update(input: &ImportDraftUpdate) -> AppResult<()> {
     validate_short_text("description", &input.description, 2000, true)?;
     validate_short_text("instructions", &input.instructions, 20_000, false)?;
     validate_recipe_metadata(input.difficulty, input.estimated_calories)?;
-    validate_ingredients(&input.ingredients)
+    validate_ingredient_groups(&update_groups(input)?)
+}
+
+fn legacy_groups(ingredients: &[IngredientInput]) -> Vec<IngredientGroupInput> {
+    ingredients
+        .iter()
+        .enumerate()
+        .map(|(index, ingredient)| IngredientGroupInput {
+            id: Uuid::new_v4().to_string(),
+            optional: false,
+            note: String::new(),
+            sort_order: index as i64,
+            alternatives: vec![IngredientAlternativeInput {
+                id: Uuid::new_v4().to_string(),
+                name: ingredient.name.clone(),
+                quantity_note: ingredient.quantity_note.clone(),
+                canonical_ingredient_id: ingredient.canonical_ingredient_id.clone(),
+                sort_order: 0,
+            }],
+        })
+        .collect()
+}
+
+fn groups_contract(
+    ingredients: &[IngredientInput],
+    ingredient_model: Option<&str>,
+    ingredient_groups: Option<&[IngredientGroupInput]>,
+) -> AppResult<Vec<IngredientGroupInput>> {
+    if ingredient_groups.is_some() && !ingredients.is_empty() {
+        return Err(AppError::Validation(
+            "ingredients and ingredientGroups cannot both be provided".into(),
+        ));
+    }
+    if let Some(groups) = ingredient_groups {
+        if ingredient_model != Some("groups-v1") {
+            return Err(AppError::Validation(
+                "ingredientModel must be groups-v1 when ingredientGroups is provided".into(),
+            ));
+        }
+        Ok(groups.to_vec())
+    } else {
+        if ingredient_model.is_some() {
+            return Err(AppError::Validation(
+                "ingredientModel is only valid with ingredientGroups".into(),
+            ));
+        }
+        Ok(legacy_groups(ingredients))
+    }
+}
+
+fn submission_groups(input: &ImportDraftSubmission) -> AppResult<Vec<IngredientGroupInput>> {
+    groups_contract(
+        &input.ingredients,
+        input.ingredient_model.as_deref(),
+        input.ingredient_groups.as_deref(),
+    )
+}
+
+fn update_groups(input: &ImportDraftUpdate) -> AppResult<Vec<IngredientGroupInput>> {
+    groups_contract(
+        &input.ingredients,
+        input.ingredient_model.as_deref(),
+        input.ingredient_groups.as_deref(),
+    )
 }
 
 fn validate_recipe_metadata(
@@ -788,24 +888,6 @@ fn validate_recipe_metadata(
         return Err(AppError::Validation(
             "estimatedCalories must be an integer from 1 to 100000".into(),
         ));
-    }
-    Ok(())
-}
-
-fn validate_ingredients(ingredients: &[IngredientInput]) -> AppResult<()> {
-    if ingredients.is_empty() || ingredients.len() > 100 {
-        return Err(AppError::Validation(
-            "ingredients must contain between 1 and 100 items".into(),
-        ));
-    }
-    for ingredient in ingredients {
-        validate_short_text("ingredient name", &ingredient.name, 120, false)?;
-        validate_short_text(
-            "ingredient quantityNote",
-            &ingredient.quantity_note,
-            120,
-            true,
-        )?;
     }
     Ok(())
 }
@@ -865,6 +947,8 @@ async fn load_import_draft(pool: &SqlitePool, owner_id: &str, id: &str) -> AppRe
         instructions: row.get("instructions"),
         difficulty: row.get("difficulty"),
         estimated_calories: row.get("estimated_calories"),
+        ingredient_model: "groups-v1".into(),
+        ingredient_groups: load_draft_groups(pool, id).await?,
         ingredients: load_draft_ingredients(pool, id).await?,
         warnings: serde_json::from_str(&row.get::<String, _>("warnings_json"))
             .map_err(|error| AppError::Data(format!("invalid stored import warnings: {error}")))?,
@@ -895,42 +979,127 @@ async fn load_draft_ingredients(pool: &SqlitePool, id: &str) -> AppResult<Vec<In
         .collect())
 }
 
-async fn load_draft_ingredients_tx(
+async fn load_draft_groups(pool: &SqlitePool, id: &str) -> AppResult<Vec<IngredientGroupInput>> {
+    let rows = sqlx::query(
+        "SELECT g.external_id AS group_id, g.optional, g.note, g.sort_order AS group_sort,
+                a.external_id AS alternative_id, a.name, a.quantity_note,
+                a.canonical_ingredient_id, a.sort_order AS alternative_sort
+         FROM import_draft_ingredient_groups g
+         JOIN import_draft_ingredient_alternatives a ON a.group_id = g.id
+         WHERE g.draft_id = ? ORDER BY g.sort_order, a.sort_order",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    Ok(draft_groups_from_rows(rows))
+}
+
+async fn load_draft_groups_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     id: &str,
-) -> AppResult<Vec<IngredientInput>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT name, quantity_note FROM import_draft_ingredients
-         WHERE draft_id = ? ORDER BY sort_order",
+) -> AppResult<Vec<IngredientGroupInput>> {
+    let rows = sqlx::query(
+        "SELECT g.external_id AS group_id, g.optional, g.note, g.sort_order AS group_sort,
+                a.external_id AS alternative_id, a.name, a.quantity_note,
+                a.canonical_ingredient_id, a.sort_order AS alternative_sort
+         FROM import_draft_ingredient_groups g
+         JOIN import_draft_ingredient_alternatives a ON a.group_id = g.id
+         WHERE g.draft_id = ? ORDER BY g.sort_order, a.sort_order",
     )
     .bind(id)
     .fetch_all(&mut **transaction)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(name, quantity_note)| IngredientInput {
-            name,
-            quantity_note,
-            canonical_ingredient_id: None,
-        })
-        .collect())
+    Ok(draft_groups_from_rows(rows))
 }
 
-async fn insert_draft_ingredients(
+fn draft_groups_from_rows(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<IngredientGroupInput> {
+    let mut groups = Vec::<IngredientGroupInput>::new();
+    for row in rows {
+        let group_id: String = row.get("group_id");
+        if groups.last().is_none_or(|group| group.id != group_id) {
+            groups.push(IngredientGroupInput {
+                id: group_id,
+                optional: row.get("optional"),
+                note: row.get("note"),
+                sort_order: row.get("group_sort"),
+                alternatives: Vec::new(),
+            });
+        }
+        groups
+            .last_mut()
+            .expect("group was inserted")
+            .alternatives
+            .push(IngredientAlternativeInput {
+                id: row.get("alternative_id"),
+                name: row.get("name"),
+                quantity_note: row.get("quantity_note"),
+                canonical_ingredient_id: row.get("canonical_ingredient_id"),
+                sort_order: row.get("alternative_sort"),
+            });
+    }
+    groups
+}
+
+async fn insert_draft_groups(
     transaction: &mut Transaction<'_, Sqlite>,
     draft_id: &str,
-    ingredients: &[IngredientInput],
+    groups: &[IngredientGroupInput],
 ) -> AppResult<()> {
-    for (index, ingredient) in ingredients.iter().enumerate() {
+    let mut groups = groups.iter().collect::<Vec<_>>();
+    groups.sort_by_key(|group| group.sort_order);
+    for group in groups {
+        let persisted_group_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO import_draft_ingredient_groups
+             (id, draft_id, external_id, optional, note, sort_order)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&persisted_group_id)
+        .bind(draft_id)
+        .bind(&group.id)
+        .bind(group.optional)
+        .bind(group.note.trim())
+        .bind(group.sort_order)
+        .execute(&mut **transaction)
+        .await?;
+        let mut alternatives = group.alternatives.iter().collect::<Vec<_>>();
+        alternatives.sort_by_key(|alternative| alternative.sort_order);
+        for alternative in alternatives {
+            sqlx::query(
+                "INSERT INTO import_draft_ingredient_alternatives
+                 (id, group_id, external_id, name, quantity_note,
+                  canonical_ingredient_id, sort_order)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&persisted_group_id)
+            .bind(&alternative.id)
+            .bind(alternative.name.trim())
+            .bind(alternative.quantity_note.trim())
+            .bind(&alternative.canonical_ingredient_id)
+            .bind(alternative.sort_order)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        let display = group
+            .alternatives
+            .iter()
+            .map(|alternative| alternative.name.trim())
+            .collect::<Vec<_>>()
+            .join(" / ");
         sqlx::query(
             "INSERT INTO import_draft_ingredients
              (id, draft_id, name, quantity_note, sort_order) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(draft_id)
-        .bind(ingredient.name.trim())
-        .bind(ingredient.quantity_note.trim())
-        .bind(index as i64)
+        .bind(display)
+        .bind(if group.alternatives.len() == 1 {
+            group.alternatives[0].quantity_note.trim()
+        } else {
+            group.note.trim()
+        })
+        .bind(group.sort_order)
         .execute(&mut **transaction)
         .await?;
     }
@@ -1028,6 +1197,8 @@ mod tests {
                 quantity_note: String::new(),
                 canonical_ingredient_id: None,
             }],
+            ingredient_model: None,
+            ingredient_groups: None,
             steps: vec!["Stir.".into()],
             warnings: vec![],
             confidence: Some(0.8),
@@ -1041,6 +1212,57 @@ mod tests {
                 canonical_ingredient_id: None,
             })
             .collect();
+        assert!(validate_submission(&input).is_err());
+    }
+
+    #[test]
+    fn v2_import_preserves_optional_or_groups_and_rejects_legacy_mix() {
+        let group = IngredientGroupInput {
+            id: "fat".into(),
+            optional: true,
+            note: "for frying".into(),
+            sort_order: 0,
+            alternatives: vec![
+                IngredientAlternativeInput {
+                    id: "butter".into(),
+                    name: "butter".into(),
+                    quantity_note: "1 tbsp".into(),
+                    canonical_ingredient_id: None,
+                    sort_order: 0,
+                },
+                IngredientAlternativeInput {
+                    id: "oil".into(),
+                    name: "oil".into(),
+                    quantity_note: "1 tbsp".into(),
+                    canonical_ingredient_id: None,
+                    sort_order: 1,
+                },
+            ],
+        };
+        let mut input = ImportDraftSubmission {
+            schema_version: "2.0".into(),
+            source_url: "https://example.test/recipe".into(),
+            source_title: None,
+            source_author: None,
+            source_license: None,
+            source_attribution: None,
+            title: "Soup".into(),
+            description: String::new(),
+            difficulty: None,
+            estimated_calories: None,
+            ingredients: Vec::new(),
+            ingredient_model: Some("groups-v1".into()),
+            ingredient_groups: Some(vec![group]),
+            steps: vec!["Cook.".into()],
+            warnings: Vec::new(),
+            confidence: None,
+        };
+        assert!(validate_submission(&input).is_ok());
+        input.ingredients.push(IngredientInput {
+            name: "salt".into(),
+            quantity_note: String::new(),
+            canonical_ingredient_id: None,
+        });
         assert!(validate_submission(&input).is_err());
     }
 }
