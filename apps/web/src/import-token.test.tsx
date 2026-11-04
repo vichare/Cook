@@ -4,13 +4,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LocaleProvider } from './i18n'
 import {
   COOK_SKILL_URL,
+  createRecipeExample,
+  importDraftExample,
   ImportTokenSettings,
   promptForPreset,
   resolveCookBaseUrl,
   skillInstructionsForPreset,
 } from './router'
 
-const { createImportToken, importTokens } = vi.hoisted(() => ({
+const { aiCapabilities, createImportToken, importTokens } = vi.hoisted(() => ({
   importTokens: vi.fn().mockResolvedValue([]),
   createImportToken: vi.fn().mockResolvedValue({
     token: {
@@ -25,6 +27,12 @@ const { createImportToken, importTokens } = vi.hoisted(() => ({
     },
     secret: 'cook_import_real_secret_must_not_leak',
   }),
+  aiCapabilities: vi.fn().mockResolvedValue({
+    prefix: 'cook_imp',
+    scopes: ['recipes:import'],
+    expiresAt: '2027-02-02T00:00:00Z',
+    preset: 'import',
+  }),
 }))
 const secret = 'cook_import_real_secret_must_not_leak'
 
@@ -36,6 +44,7 @@ vi.mock('./api', async () => {
       ...actual.api,
       importTokens,
       createImportToken,
+      aiCapabilities,
       revokeImportToken: vi.fn(),
     },
   }
@@ -47,6 +56,7 @@ describe('import token reveal', () => {
   beforeEach(() => {
     writeText.mockClear()
     createImportToken.mockClear()
+    aiCapabilities.mockClear()
     Object.defineProperty(window, 'confirm', {
       configurable: true,
       value: vi.fn().mockReturnValue(true),
@@ -84,12 +94,20 @@ describe('import token reveal', () => {
     expect(prompt).toContain('COOK_IMPORT_TOKEN')
     expect(prompt).toContain(`${baseUrl}/api/import/drafts`)
     expect(prompt).not.toContain(secret)
-    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/blob/main/skills/')
+    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.4.0/skills/')
+    expect(installInstructions).toContain(
+      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.0',
+    )
+    expect(installInstructions).toContain(
+      'gh skill preview vichare/Cook cook-recipe-import@v0.4.0',
+    )
+    expect(installInstructions).toContain('Do not copy only SKILL.md')
+    expect(installInstructions).not.toContain('install skill from GitHub URL')
 
     fireEvent.click(screen.getByRole('button', { name: 'Copy token' }))
     await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(secret))
     const successMessage =
-      'Token copied. Store it in your AI client secret store or COOK_IMPORT_TOKEN environment variable.'
+      'Token copied. Store it as the COOK_IMPORT_TOKEN environment variable; the app may need a restart to inherit it.'
     const firstAnnouncement = screen.getByText(successMessage)
     expect(firstAnnouncement).toHaveTextContent(
       successMessage,
@@ -172,7 +190,7 @@ describe('import token reveal', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Copy prompt template' }))
     const prompt = promptForPreset('publish', baseUrl)
     await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(prompt))
-    expect(prompt).toContain('created, updated, skipped, and failed')
+    expect(prompt).toContain('created, updated, skipped, failed, and needs_review')
     expect(prompt).toContain('recipe ID or URL')
     expect(prompt).not.toContain(secret)
   })
@@ -189,8 +207,54 @@ describe('import token reveal', () => {
         expect(output).not.toContain('{COOK_BASE_URL}')
         expect(output).not.toContain('COOK_BASE_URL=https://cook.vichare.net')
         expect(output).not.toContain(secret)
+        expect(output).toContain('/api/ai/capabilities')
+        expect(output).toContain(JSON.stringify(importDraftExample, null, 2))
+        expect(output).toContain(JSON.stringify(createRecipeExample, null, 2))
+        expect(output).toContain('Cover upload is multipart, not JSON')
+        expect(output).toContain('Stop the batch on 401/403')
       }
     }
+  })
+
+  it('shows self-contained request examples and tests capabilities without leaking the token', async () => {
+    render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <ImportTokenSettings />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+
+    fireEvent.click(screen.getByText('Request format'))
+    expect(screen.getByText(/"schemaVersion": "1.0"/)).toBeVisible()
+    expect(screen.getByText(/"expectedVersion": 3/)).toBeVisible()
+    expect(screen.getByRole('link', { name: 'Open authoritative import-draft schema' }))
+      .toHaveAttribute('href', expect.stringContaining('import-draft-v1.schema.json'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
+    expect(await screen.findByText(secret)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }))
+    expect(await screen.findByText('Connection succeeded.')).toBeVisible()
+    expect(screen.getByText('Capabilities: recipes:import')).toBeVisible()
+    expect(aiCapabilities).toHaveBeenCalledWith(secret)
+    expect(screen.getByText('Connection succeeded.').closest('.notice')).not.toHaveTextContent(secret)
+  })
+
+  it('shows an accessible localized connection failure without exposing the token', async () => {
+    aiCapabilities.mockRejectedValueOnce(new Error('invalid token'))
+    render(
+      <LocaleProvider initialLocale="zh-CN" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <ImportTokenSettings />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '创建 token' }))
+    expect(await screen.findByText(secret)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: '测试连接' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('连接测试失败')
+    expect(screen.getByRole('alert')).not.toHaveTextContent(secret)
   })
 
   it('re-announces repeated successful token copies in Chinese', async () => {
@@ -207,12 +271,12 @@ describe('import token reveal', () => {
     const copyButton = screen.getByRole('button', { name: '复制 token' })
     fireEvent.click(copyButton)
     const firstAnnouncement = await screen.findByText(
-      'Token 已复制。请保存到 AI 客户端 secret store 或 COOK_IMPORT_TOKEN 环境变量。',
+      'Token 已复制。请保存为 COOK_IMPORT_TOKEN 环境变量；应用可能需要重启才能读取新变量。',
     )
     fireEvent.click(copyButton)
     await waitFor(() => expect(writeText.mock.calls.filter(([value]) => value === secret)).toHaveLength(2))
     expect(screen.getByText(
-      'Token 已复制。请保存到 AI 客户端 secret store 或 COOK_IMPORT_TOKEN 环境变量。',
+      'Token 已复制。请保存为 COOK_IMPORT_TOKEN 环境变量；应用可能需要重启才能读取新变量。',
     )).not.toBe(firstAnnouncement)
   })
 

@@ -26,6 +26,7 @@ const IMPORT_RATE_WINDOW_SECONDS: i64 = 60 * 60;
 const IMPORT_RATE_LIMIT: i64 = 20;
 const READ_RATE_LIMIT: i64 = 240;
 const WRITE_RATE_LIMIT: i64 = 60;
+const CAPABILITIES_RATE_LIMIT: i64 = 120;
 const ACTIVE_DRAFT_QUOTA: i64 = 50;
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +59,15 @@ pub struct CreatedImportToken {
     secret: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiCapabilities {
+    prefix: String,
+    scopes: Vec<String>,
+    expires_at: Option<String>,
+    preset: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImportDraftSubmission {
@@ -65,6 +75,8 @@ pub struct ImportDraftSubmission {
     source_url: String,
     source_title: Option<String>,
     source_author: Option<String>,
+    source_license: Option<String>,
+    source_attribution: Option<String>,
     title: String,
     #[serde(default)]
     description: String,
@@ -101,6 +113,8 @@ pub struct ImportDraft {
     source_url: String,
     source_title: Option<String>,
     source_author: Option<String>,
+    source_license: Option<String>,
+    source_attribution: Option<String>,
     title: String,
     description: String,
     instructions: String,
@@ -231,6 +245,38 @@ pub(crate) async fn revoke_import_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(crate) async fn inspect_ai_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AiCapabilities>> {
+    let principal = authenticate_token_inner(
+        &state.pool,
+        &headers,
+        None,
+        "capabilities",
+        CAPABILITIES_RATE_LIMIT,
+    )
+    .await?;
+    let preset = token_preset(&principal.scopes).map(str::to_string);
+    let capabilities = AiCapabilities {
+        prefix: principal.prefix.clone(),
+        scopes: principal.scopes.clone(),
+        expires_at: principal.expires_at.map(timestamp),
+        preset,
+    };
+    let mut transaction = state.pool.begin().await?;
+    record_token_audit(
+        &mut transaction,
+        &principal,
+        "token.capabilities",
+        None,
+        Utc::now().timestamp(),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(capabilities))
+}
+
 pub(crate) async fn create_import_draft(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -262,15 +308,18 @@ pub(crate) async fn create_import_draft(
     }
     sqlx::query(
         "INSERT INTO import_drafts
-         (id, owner_id, source_url, source_title, source_author, title, description,
+         (id, owner_id, source_url, source_title, source_author, source_license,
+          source_attribution, title, description,
           instructions, difficulty, estimated_calories, warnings_json, confidence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&owner_id)
     .bind(input.source_url.trim())
     .bind(trim_optional(input.source_title.as_deref()))
     .bind(trim_optional(input.source_author.as_deref()))
+    .bind(trim_optional(input.source_license.as_deref()))
+    .bind(trim_optional(input.source_attribution.as_deref()))
     .bind(input.title.trim())
     .bind(input.description.trim())
     .bind(&instructions)
@@ -387,7 +436,8 @@ pub(crate) async fn accept_import_draft(
 ) -> AppResult<(StatusCode, Json<Recipe>)> {
     let mut transaction = state.pool.begin().await?;
     let row = sqlx::query(
-        "SELECT source_url, source_title, source_author, title, description, instructions,
+        "SELECT source_url, source_title, source_author, source_license, source_attribution,
+           title, description, instructions,
            difficulty, estimated_calories,
            warnings_json, confidence, status
          FROM import_drafts WHERE id = ? AND owner_id = ?",
@@ -407,18 +457,20 @@ pub(crate) async fn accept_import_draft(
     let recipe_id = Uuid::new_v4().to_string();
     let source_title: Option<String> = row.get("source_title");
     let source_author: Option<String> = row.get("source_author");
-    let attribution = match (&source_title, &source_author) {
-        (Some(title), Some(author)) => Some(format!("{title} — {author}")),
-        (Some(title), None) => Some(title.clone()),
-        (None, Some(author)) => Some(author.clone()),
-        (None, None) => None,
-    };
+    let attribution = row
+        .get::<Option<String>, _>("source_attribution")
+        .or_else(|| match (&source_title, &source_author) {
+            (Some(title), Some(author)) => Some(format!("{title} — {author}")),
+            (Some(title), None) => Some(title.clone()),
+            (None, Some(author)) => Some(author.clone()),
+            (None, None) => None,
+        });
     sqlx::query(
         "INSERT INTO recipes
          (id, owner_id, title, description, instructions, visibility, source_url,
-          difficulty, estimated_calories, source_attribution, source_title, source_author,
+          difficulty, estimated_calories, source_license, source_attribution, source_title, source_author,
           source_warnings, source_confidence)
-         VALUES (?, ?, ?, ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&recipe_id)
     .bind(&user.id)
@@ -428,6 +480,7 @@ pub(crate) async fn accept_import_draft(
     .bind(row.get::<String, _>("source_url"))
     .bind(row.get::<Option<i64>, _>("difficulty"))
     .bind(row.get::<Option<i64>, _>("estimated_calories"))
+    .bind(row.get::<Option<String>, _>("source_license"))
     .bind(attribution)
     .bind(source_title)
     .bind(source_author)
@@ -468,12 +521,30 @@ pub struct TokenPrincipal {
     pub owner_id: String,
     pub prefix: String,
     pub scopes: Vec<String>,
+    pub expires_at: Option<i64>,
 }
 
 pub async fn authenticate_token(
     pool: &SqlitePool,
     headers: &HeaderMap,
     required_scope: &str,
+) -> AppResult<TokenPrincipal> {
+    authenticate_token_inner(
+        pool,
+        headers,
+        Some(required_scope),
+        required_scope,
+        rate_limit_for_scope(required_scope),
+    )
+    .await
+}
+
+async fn authenticate_token_inner(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+    required_scope: Option<&str>,
+    rate_limit_bucket: &str,
+    rate_limit: i64,
 ) -> AppResult<TokenPrincipal> {
     let secret = headers
         .get(AUTHORIZATION)
@@ -503,15 +574,15 @@ pub async fn authenticate_token(
         .split_whitespace()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if !scopes.iter().any(|scope| scope == required_scope) {
+    if required_scope.is_some_and(|required| !scopes.iter().any(|scope| scope == required)) {
         return Err(AppError::Forbidden);
     }
     let token_id: String = row.get("id");
     enforce_token_rate_limit(
         &mut transaction,
         &token_id,
-        required_scope,
-        rate_limit_for_scope(required_scope),
+        rate_limit_bucket,
+        rate_limit,
         now,
     )
     .await?;
@@ -526,7 +597,25 @@ pub async fn authenticate_token(
         owner_id: row.get("owner_id"),
         prefix: row.get("token_prefix"),
         scopes,
+        expires_at: row.get("expires_at"),
     })
+}
+
+fn token_preset(scopes: &[String]) -> Option<&'static str> {
+    let has = |scope: &str| scopes.iter().any(|candidate| candidate == scope);
+    if has(SCOPE_RECIPES_READ)
+        && has(SCOPE_RECIPES_WRITE)
+        && has(SCOPE_IMAGES_WRITE)
+        && has(SCOPE_RECIPES_PUBLISH)
+    {
+        Some("publish")
+    } else if has(SCOPE_RECIPES_READ) && has(SCOPE_RECIPES_WRITE) && has(SCOPE_IMAGES_WRITE) {
+        Some("manage")
+    } else if scopes.len() == 1 && has(SCOPE_IMPORT) {
+        Some("import")
+    } else {
+        None
+    }
 }
 
 pub async fn record_token_audit(
@@ -607,6 +696,12 @@ fn rate_limit_for_scope(scope: &str) -> i64 {
     }
 }
 
+fn timestamp(value: i64) -> String {
+    DateTime::from_timestamp(value, 0)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .to_rfc3339()
+}
+
 fn validate_submission(input: &ImportDraftSubmission) -> AppResult<()> {
     if input.schema_version != "1.0" {
         return Err(AppError::Validation(
@@ -623,6 +718,12 @@ fn validate_submission(input: &ImportDraftSubmission) -> AppResult<()> {
     validate_short_text("sourceUrl", &input.source_url, 2048, false)?;
     validate_optional_text("sourceTitle", input.source_title.as_deref(), 200)?;
     validate_optional_text("sourceAuthor", input.source_author.as_deref(), 200)?;
+    validate_optional_text("sourceLicense", input.source_license.as_deref(), 200)?;
+    validate_optional_text(
+        "sourceAttribution",
+        input.source_attribution.as_deref(),
+        1000,
+    )?;
     validate_short_text("title", &input.title, 120, false)?;
     validate_short_text("description", &input.description, 2000, true)?;
     validate_recipe_metadata(input.difficulty, input.estimated_calories)?;
@@ -737,7 +838,8 @@ fn validate_short_text(
 
 async fn load_import_draft(pool: &SqlitePool, owner_id: &str, id: &str) -> AppResult<ImportDraft> {
     let row = sqlx::query(
-        "SELECT id, source_url, source_title, source_author, title, description, instructions,
+        "SELECT id, source_url, source_title, source_author, source_license, source_attribution,
+           title, description, instructions,
            difficulty, estimated_calories,
            warnings_json, confidence, status, accepted_recipe_id, created_at, updated_at
          FROM import_drafts WHERE id = ? AND owner_id = ?",
@@ -752,6 +854,8 @@ async fn load_import_draft(pool: &SqlitePool, owner_id: &str, id: &str) -> AppRe
         source_url: row.get("source_url"),
         source_title: row.get("source_title"),
         source_author: row.get("source_author"),
+        source_license: row.get("source_license"),
+        source_attribution: row.get("source_attribution"),
         title: row.get("title"),
         description: row.get("description"),
         instructions: row.get("instructions"),
@@ -899,6 +1003,8 @@ mod tests {
             source_url: "file:///etc/passwd".into(),
             source_title: None,
             source_author: None,
+            source_license: None,
+            source_attribution: None,
             title: "Soup".into(),
             description: String::new(),
             difficulty: None,

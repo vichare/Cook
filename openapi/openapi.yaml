@@ -358,7 +358,7 @@ paths:
     get:
       responses:
         "200":
-          description: Current account shopping list, including derived automatic restock items
+          description: Current account ingredients still needed, including derived automatic restock items. Completed state is never returned.
           content:
             application/json:
               schema:
@@ -394,29 +394,43 @@ paths:
       responses:
         "200": { description: Updated private shopping list }
         "404": { description: Missing, cross-account, or no manual source }
-  /api/shopping-list/{id}/complete:
+  /api/shopping-list/{id}/purchase:
     parameters:
       - in: path
         name: id
         required: true
         schema: { type: string }
     post:
-      description: Complete a manual item. Active automatic restock items must use the purchased action instead.
+      description: Atomically resolve or create pantry state, mark it available, and remove all persistent shopping sources or keep them. Retries with the same key execute once.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ShoppingPurchaseInput" }
       responses:
-        "200": { description: Updated private shopping list }
-        "400": { description: Item is still derived from an out-of-stock opted-in pantry item }
-        "404": { description: Missing, cross-account, or no manual source }
-  /api/shopping-list/automatic/{pantryItemId}/purchased:
+        "200":
+          description: Latest pantry and shopping state plus reversible purchase action
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShoppingPurchaseResponse" }
+        "409": { description: Optimistic version, pantry resolution, or idempotency conflict }
+        "429": { description: Purchase rate or retained-action limit reached }
+  /api/shopping-list/purchases/{id}/undo:
     parameters:
       - in: path
-        name: pantryItemId
+        name: id
         required: true
         schema: { type: string, format: uuid }
     post:
-      description: Transactionally mark the owned pantry item available, refresh confirmation time, complete a merged persisted shopping item, and remove the derived automatic item.
+      description: Restore the pre-purchase pantry snapshot and source set only when neither affected state changed afterward.
       responses:
         "200": { description: Updated private shopping list }
-        "404": { description: Pantry item is missing, cross-account, not out, or not opted into automatic restock }
+        "409": { description: Safe automatic undo is unavailable because state changed }
   /api/recipes/{id}/shopping-list-items:
     parameters:
       - $ref: "#/components/parameters/RecipeId"
@@ -673,6 +687,19 @@ paths:
         "304": { description: ETag matched }
         "401": { description: A supplied Bearer token is invalid, expired, or revoked }
         "404": { description: Image missing or private image not owned }
+  /api/ai/capabilities:
+    get:
+      description: Inspects safe metadata for any valid non-revoked, non-expired Cook AI bearer token. No business scope is required; every business endpoint still enforces its own scopes.
+      security:
+        - importBearer: []
+      responses:
+        "200":
+          description: Safe token capability metadata; never includes owner/account data, internal token ID, or the full token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AiCapabilities" }
+        "401": { description: Invalid, expired, or revoked token }
+        "429": { description: Capability inspection rate limit exceeded }
   /api/ai/recipes:
     get:
       description: Lists only recipes owned by the token principal. Requires recipes:read.
@@ -703,6 +730,12 @@ paths:
               title: Tomato noodles
               description: A private weeknight recipe.
               instructions: Boil the noodles, cook the tomatoes, and combine.
+              visibility: private
+              sourceUrl: https://example.com/recipes/tomato-noodles
+              sourceTitle: Tomato noodles
+              sourceAuthor: Example author
+              sourceLicense: CC-BY-4.0
+              sourceAttribution: Example author — Tomato noodles
               ingredients:
                 - name: noodles
                   quantityNote: 200 g
@@ -1155,6 +1188,18 @@ components:
           minimum: 1
           maximum: 100000
           description: Optional estimated total kcal for the whole recipe, not per serving or medical nutrition data.
+        sourceUrl:
+          type: [string, "null"]
+          format: uri
+          maxLength: 2048
+          description: Optional HTTP or HTTPS recipe source URL.
+        sourceTitle: { type: [string, "null"], maxLength: 200 }
+        sourceAuthor: { type: [string, "null"], maxLength: 200 }
+        sourceLicense:
+          type: [string, "null"]
+          maxLength: 200
+          description: License text supplied by the user/source; Cook does not independently verify it.
+        sourceAttribution: { type: [string, "null"], maxLength: 1000 }
         ingredients:
           type: array
           minItems: 1
@@ -1229,11 +1274,13 @@ components:
         sourceAttribution: { type: string, maxLength: 500 }
     RecipeSource:
       type: object
-      required: [url, title, author, warnings, confidence]
+      required: [url, title, author, license, attribution, warnings, confidence]
       properties:
-        url: { type: string, format: uri }
+        url: { type: [string, "null"], format: uri }
         title: { type: [string, "null"] }
         author: { type: [string, "null"] }
+        license: { type: [string, "null"] }
+        attribution: { type: [string, "null"] }
         warnings:
           type: array
           items: { type: string }
@@ -1264,10 +1311,15 @@ components:
       allOf:
         - $ref: "#/components/schemas/PantryItemInput"
         - type: object
-          required: [id, expiresOn, canonicalIngredientId, autoAddToShoppingListWhenOut]
+          required: [id, expiresOn, canonicalIngredientId, aliases, autoAddToShoppingListWhenOut, version]
           properties:
             id: { type: string, format: uuid }
             confirmedAt: { type: [string, "null"], format: date-time }
+            aliases:
+              type: array
+              items: { type: string }
+              description: Owner-confirmed normalized aliases for this canonical pantry ingredient.
+            version: { type: integer, minimum: 1 }
     ShoppingItemInput:
       type: object
       required: [name]
@@ -1285,7 +1337,7 @@ components:
         recipeId: { type: [string, "null"], format: uuid }
     ShoppingItem:
       type: object
-      required: [id, name, canonicalIngredientId, automatic, completedAt, pantryItemId, sources]
+      required: [id, name, canonicalIngredientId, automatic, pantryItemId, sources, version, purchaseOptions]
       properties:
         id:
           type: string
@@ -1293,11 +1345,55 @@ components:
         name: { type: string }
         canonicalIngredientId: { type: [string, "null"] }
         automatic: { type: boolean }
-        completedAt: { type: [string, "null"], format: date-time }
         pantryItemId: { type: [string, "null"], format: uuid }
+        version: { type: integer, minimum: 1 }
         sources:
           type: array
           items: { $ref: "#/components/schemas/ShoppingItemSource" }
+        purchaseOptions:
+          $ref: "#/components/schemas/ShoppingPurchaseOptions"
+    ShoppingPurchaseOptions:
+      type: object
+      required: [resolution, candidates]
+      properties:
+        resolution: { type: string, enum: [reuse, create, choice] }
+        candidates:
+          type: array
+          items: { $ref: "#/components/schemas/PantryPurchaseCandidate" }
+    PantryPurchaseCandidate:
+      type: object
+      required: [id, name, status, quantityNote, expiresOn, canonicalIngredientId, autoAddToShoppingListWhenOut, version]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        status: { type: string, enum: [have, out, unknown] }
+        quantityNote: { type: string }
+        expiresOn: { type: [string, "null"], format: date }
+        canonicalIngredientId: { type: [string, "null"] }
+        autoAddToShoppingListWhenOut: { type: boolean }
+        version: { type: integer, minimum: 1 }
+    ShoppingPurchaseInput:
+      type: object
+      required: [disposition, shoppingExpectedVersion, quantityNote, autoAddToShoppingListWhenOut]
+      properties:
+        disposition: { type: string, enum: [remove, keep] }
+        shoppingExpectedVersion: { type: integer, minimum: 1 }
+        pantryItemId: { type: [string, "null"], format: uuid }
+        createUsingCurrentName: { type: boolean, default: false }
+        pantryExpectedVersion: { type: [integer, "null"], minimum: 1 }
+        expiresOn: { type: [string, "null"], format: date }
+        quantityNote: { type: string, maxLength: 240 }
+        autoAddToShoppingListWhenOut: { type: boolean }
+    ShoppingPurchaseResponse:
+      type: object
+      required: [pantry, shoppingItems, purchaseActionId, undoAvailable]
+      properties:
+        pantry: { $ref: "#/components/schemas/PantryItem" }
+        shoppingItems:
+          type: array
+          items: { $ref: "#/components/schemas/ShoppingItem" }
+        purchaseActionId: { type: string, format: uuid }
+        undoAvailable: { type: boolean }
     IngredientReference:
       oneOf:
         - type: string
@@ -1340,13 +1436,17 @@ components:
           description: User-local calendar date used for date-only expiration classification. The server UTC date is used when omitted.
     Recommendation:
       type: object
-      required: [recipe, status, available, verify, missing, reasons, reasonDetails, score, scoreBreakdown, primarySource, matchedSources, desiredMatches, ingredientReasons, appliedControls]
+      required: [recipe, status, available, verify, missing, inShoppingList, reasons, reasonDetails, score, scoreBreakdown, primarySource, matchedSources, desiredMatches, ingredientReasons, appliedControls]
       properties:
         recipe: { $ref: "#/components/schemas/Recipe" }
         status: { type: string, enum: [READY, VERIFY, SHOP, BLOCKED] }
         available: { type: array, items: { type: string } }
         verify: { type: array, items: { type: string } }
         missing: { type: array, items: { type: string } }
+        inShoppingList:
+          type: array
+          items: { type: string }
+          description: Missing recipe ingredients whose canonical or owner-normalized unresolved identity is already active in this owner's shopping list.
         reasons:
           type: array
           items: { type: string }
@@ -1504,6 +1604,23 @@ components:
           type: string
           writeOnly: true
           description: Returned once. Cook stores only its digest.
+    AiCapabilities:
+      type: object
+      additionalProperties: false
+      required: [prefix, scopes, expiresAt, preset]
+      properties:
+        prefix: { type: string, description: Non-secret display prefix }
+        scopes:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum: ["recipes:import", "recipes:read", "recipes:write", "recipes:images:write", "recipes:publish"]
+        expiresAt: { type: [string, "null"], format: date-time }
+        preset:
+          type: [string, "null"]
+          enum: [import, manage, publish, null]
+          description: Present only when the exact scope set matches a standard preset.
     AiRecipeInput:
       type: object
       additionalProperties: false
@@ -1518,6 +1635,14 @@ components:
           minimum: 1
           maximum: 100000
           description: Estimated total kcal for the whole recipe.
+        sourceUrl: { type: [string, "null"], format: uri, maxLength: 2048 }
+        sourceTitle: { type: [string, "null"], maxLength: 200 }
+        sourceAuthor: { type: [string, "null"], maxLength: 200 }
+        sourceLicense:
+          type: [string, "null"]
+          maxLength: 200
+          description: License metadata is not independently verified by Cook.
+        sourceAttribution: { type: [string, "null"], maxLength: 1000 }
         visibility:
           type: string
           enum: [private, public]
@@ -1546,7 +1671,7 @@ components:
             revision: { $ref: "#/components/schemas/RecipeRevision" }
     RecipeRevision:
       type: object
-      required: [id, recipeId, expectedVersion, title, description, instructions, difficulty, estimatedCalories, ingredients, imageAction, imageAltText, imageUrl, imageSourceUrl, imageSourceLicense, imageSourceAttribution, status, createdAt, updatedAt]
+      required: [id, recipeId, expectedVersion, title, description, instructions, difficulty, estimatedCalories, sourceUrl, sourceTitle, sourceAuthor, sourceLicense, sourceAttribution, ingredients, imageAction, imageAltText, imageUrl, imageSourceUrl, imageSourceLicense, imageSourceAttribution, status, createdAt, updatedAt]
       properties:
         id: { type: string, format: uuid }
         recipeId: { type: string, format: uuid }
@@ -1556,6 +1681,11 @@ components:
         instructions: { type: string }
         difficulty: { type: [integer, "null"], minimum: 1, maximum: 5 }
         estimatedCalories: { type: [integer, "null"], minimum: 1, maximum: 100000 }
+        sourceUrl: { type: [string, "null"], format: uri, maxLength: 2048 }
+        sourceTitle: { type: [string, "null"], maxLength: 200 }
+        sourceAuthor: { type: [string, "null"], maxLength: 200 }
+        sourceLicense: { type: [string, "null"], maxLength: 200 }
+        sourceAttribution: { type: [string, "null"], maxLength: 1000 }
         ingredients:
           type: array
           items: { $ref: "#/components/schemas/Ingredient" }
@@ -1581,6 +1711,11 @@ components:
           description: Must use HTTP or HTTPS and include a host. Cook does not fetch it.
         sourceTitle: { type: [string, "null"], maxLength: 200 }
         sourceAuthor: { type: [string, "null"], maxLength: 200 }
+        sourceLicense:
+          type: [string, "null"]
+          maxLength: 200
+          description: License metadata is not independently verified by Cook.
+        sourceAttribution: { type: [string, "null"], maxLength: 1000 }
         title: { type: string, minLength: 1, maxLength: 120 }
         description: { type: string, maxLength: 2000, default: "" }
         difficulty: { type: [integer, "null"], minimum: 1, maximum: 5 }
@@ -1626,12 +1761,14 @@ components:
       allOf:
         - $ref: "#/components/schemas/ImportDraftUpdate"
         - type: object
-          required: [id, sourceUrl, sourceTitle, sourceAuthor, difficulty, estimatedCalories, warnings, confidence, status, acceptedRecipeId, reviewUrl, createdAt, updatedAt]
+          required: [id, sourceUrl, sourceTitle, sourceAuthor, sourceLicense, sourceAttribution, difficulty, estimatedCalories, warnings, confidence, status, acceptedRecipeId, reviewUrl, createdAt, updatedAt]
           properties:
             id: { type: string, format: uuid }
             sourceUrl: { type: string, format: uri }
             sourceTitle: { type: [string, "null"] }
             sourceAuthor: { type: [string, "null"] }
+            sourceLicense: { type: [string, "null"] }
+            sourceAttribution: { type: [string, "null"] }
             warnings:
               type: array
               items: { type: string }

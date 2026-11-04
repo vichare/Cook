@@ -30,6 +30,11 @@ impl LicensedRecipeImporter for FixtureImporter {
                 visibility: "private".into(),
                 difficulty: None,
                 estimated_calories: None,
+                source_url: Some("https://example.test/recipes/licensed-fixture".into()),
+                source_title: Some("Licensed fixture toast".into()),
+                source_author: None,
+                source_license: Some("CC0-1.0".into()),
+                source_attribution: Some("Cook test fixture".into()),
                 ingredients: vec![IngredientInput {
                     name: "bread".into(),
                     quantity_note: "one slice".into(),

@@ -9,6 +9,13 @@ export interface User {
   locale: 'en' | 'zh-CN' | null
 }
 
+export interface AiCapabilities {
+  prefix: string
+  scopes: string[]
+  expiresAt: string | null
+  preset: 'import' | 'manage' | 'publish' | null
+}
+
 export interface AuthConfig {
   mode: 'development' | 'production'
   google: boolean
@@ -86,9 +93,11 @@ export interface RecipeImage {
 }
 
 export interface RecipeSource {
-  url: string
+  url: string | null
   title: string | null
   author: string | null
+  license: string | null
+  attribution: string | null
   warnings: string[]
   confidence: number | null
 }
@@ -101,7 +110,9 @@ export interface PantryItem {
   confirmedAt: string | null
   expiresOn: string | null
   canonicalIngredientId: string | null
+  aliases?: string[]
   autoAddToShoppingListWhenOut: boolean
+  version: number
 }
 
 export interface ShoppingItemSource {
@@ -115,9 +126,29 @@ export interface ShoppingItem {
   name: string
   canonicalIngredientId: string | null
   automatic: boolean
-  completedAt: string | null
   pantryItemId: string | null
   sources: ShoppingItemSource[]
+  version: number
+  purchaseOptions: {
+    resolution: 'reuse' | 'create' | 'choice'
+    candidates: Array<{
+      id: string
+      name: string
+      status: 'have' | 'out' | 'unknown'
+      quantityNote: string
+      expiresOn: string | null
+      canonicalIngredientId: string | null
+      autoAddToShoppingListWhenOut: boolean
+      version: number
+    }>
+  }
+}
+
+export interface ShoppingPurchaseResponse {
+  pantry: PantryItem
+  shoppingItems: ShoppingItem[]
+  purchaseActionId: string
+  undoAvailable: boolean
 }
 
 export interface RecommendationSettings {
@@ -134,6 +165,7 @@ export interface Recommendation {
   available: string[]
   verify: string[]
   missing: string[]
+  inShoppingList: string[]
   reasons: string[]
   reasonDetails: RecommendationReason[]
   score: number
@@ -212,6 +244,11 @@ export interface RecipeRevision {
   instructions: string
   difficulty: number | null
   estimatedCalories: number | null
+  sourceUrl: string | null
+  sourceTitle: string | null
+  sourceAuthor: string | null
+  sourceLicense: string | null
+  sourceAttribution: string | null
   ingredients: Ingredient[]
   imageAction: 'keep' | 'replace' | 'delete'
   imageAltText: string | null
@@ -234,6 +271,8 @@ export interface ImportDraft {
   sourceUrl: string
   sourceTitle: string | null
   sourceAuthor: string | null
+  sourceLicense: string | null
+  sourceAttribution: string | null
   title: string
   description: string
   instructions: string

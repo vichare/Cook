@@ -42,6 +42,16 @@ pub struct AiRecipeInput {
     difficulty: Option<i64>,
     #[serde(default)]
     estimated_calories: Option<i64>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    source_title: Option<String>,
+    #[serde(default)]
+    source_author: Option<String>,
+    #[serde(default)]
+    source_license: Option<String>,
+    #[serde(default)]
+    source_attribution: Option<String>,
     ingredients: Vec<IngredientInput>,
     expected_version: Option<i64>,
     visibility: Option<String>,
@@ -58,6 +68,11 @@ pub struct RecipeRevision {
     instructions: String,
     difficulty: Option<i64>,
     estimated_calories: Option<i64>,
+    source_url: Option<String>,
+    source_title: Option<String>,
+    source_author: Option<String>,
+    source_license: Option<String>,
+    source_attribution: Option<String>,
     ingredients: Vec<IngredientInput>,
     image_action: String,
     image_alt_text: Option<String>,
@@ -154,8 +169,9 @@ pub async fn create_ai_recipe(
     sqlx::query(
         "INSERT INTO recipes
          (id, owner_id, title, description, instructions, visibility, difficulty,
-          estimated_calories, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+          estimated_calories, source_url, source_title, source_author, source_license,
+          source_attribution, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(&recipe_id)
     .bind(&principal.owner_id)
@@ -165,6 +181,13 @@ pub async fn create_ai_recipe(
     .bind(&recipe_input.visibility)
     .bind(recipe_input.difficulty)
     .bind(recipe_input.estimated_calories)
+    .bind(crate::routes::optional_text(&recipe_input.source_url))
+    .bind(crate::routes::optional_text(&recipe_input.source_title))
+    .bind(crate::routes::optional_text(&recipe_input.source_author))
+    .bind(crate::routes::optional_text(&recipe_input.source_license))
+    .bind(crate::routes::optional_text(
+        &recipe_input.source_attribution,
+    ))
     .execute(&mut *transaction)
     .await?;
     crate::routes::insert_ingredients(
@@ -450,7 +473,8 @@ pub(crate) async fn accept_revision(
     let mut transaction = state.pool.begin().await?;
     let row = sqlx::query(
         "SELECT recipe_id, expected_version, title, description, instructions, difficulty,
-                estimated_calories, image_action,
+                estimated_calories, source_url, source_title, source_author, source_license,
+                source_attribution, image_action,
                 image_media_type, image_bytes, image_width, image_height, image_sha256,
                 image_alt_text, image_source_url, image_source_license, image_source_attribution
          FROM recipe_revisions WHERE id = ? AND owner_id = ? AND status = 'pending'",
@@ -464,7 +488,9 @@ pub(crate) async fn accept_revision(
     let expected_version: i64 = row.get("expected_version");
     let updated = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?,
-           difficulty = ?, estimated_calories = ?, version = version + 1,
+           difficulty = ?, estimated_calories = ?, source_url = ?, source_title = ?,
+           source_author = ?, source_license = ?, source_attribution = ?,
+           version = version + 1,
            updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ? AND version = ?",
     )
@@ -473,6 +499,11 @@ pub(crate) async fn accept_revision(
     .bind(row.get::<String, _>("instructions"))
     .bind(row.get::<Option<i64>, _>("difficulty"))
     .bind(row.get::<Option<i64>, _>("estimated_calories"))
+    .bind(row.get::<Option<String>, _>("source_url"))
+    .bind(row.get::<Option<String>, _>("source_title"))
+    .bind(row.get::<Option<String>, _>("source_author"))
+    .bind(row.get::<Option<String>, _>("source_license"))
+    .bind(row.get::<Option<String>, _>("source_attribution"))
     .bind(&recipe_id)
     .bind(&user.id)
     .bind(expected_version)
@@ -601,6 +632,8 @@ async fn update_recipe_direct(
     let result = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?,
            visibility = ?, difficulty = ?, estimated_calories = ?,
+           source_url = ?, source_title = ?, source_author = ?, source_license = ?,
+           source_attribution = ?,
            version = version + 1, updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ? AND visibility = ? AND version = ?",
     )
@@ -610,6 +643,11 @@ async fn update_recipe_direct(
     .bind(&input.visibility)
     .bind(input.difficulty)
     .bind(input.estimated_calories)
+    .bind(crate::routes::optional_text(&input.source_url))
+    .bind(crate::routes::optional_text(&input.source_title))
+    .bind(crate::routes::optional_text(&input.source_author))
+    .bind(crate::routes::optional_text(&input.source_license))
+    .bind(crate::routes::optional_text(&input.source_attribution))
     .bind(recipe_id)
     .bind(&principal.owner_id)
     .bind(current_visibility)
@@ -672,10 +710,11 @@ async fn create_revision(
     sqlx::query(
         "INSERT INTO recipe_revisions
          (id, recipe_id, owner_id, token_id, expected_version, title, description,
-          instructions, difficulty, estimated_calories, image_action, image_media_type, image_bytes, image_width,
+          instructions, difficulty, estimated_calories, source_url, source_title, source_author,
+          source_license, source_attribution, image_action, image_media_type, image_bytes, image_width,
           image_height, image_sha256, image_alt_text, image_source_url,
           image_source_license, image_source_attribution, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(recipe_id)
@@ -687,6 +726,11 @@ async fn create_revision(
     .bind(input.instructions.trim())
     .bind(input.difficulty)
     .bind(input.estimated_calories)
+    .bind(crate::routes::optional_text(&input.source_url))
+    .bind(crate::routes::optional_text(&input.source_title))
+    .bind(crate::routes::optional_text(&input.source_author))
+    .bind(crate::routes::optional_text(&input.source_license))
+    .bind(crate::routes::optional_text(&input.source_attribution))
     .bind(image_action)
     .bind(image.map(|_| "image/jpeg"))
     .bind(image.map(|value| value.bytes.as_slice()))
@@ -750,7 +794,8 @@ async fn load_recipe_input_tx(
     recipe_id: &str,
 ) -> AppResult<RecipeInput> {
     let row = sqlx::query(
-        "SELECT title, description, instructions, difficulty, estimated_calories
+        "SELECT title, description, instructions, difficulty, estimated_calories,
+                source_url, source_title, source_author, source_license, source_attribution
          FROM recipes WHERE id = ?",
     )
     .bind(recipe_id)
@@ -764,6 +809,11 @@ async fn load_recipe_input_tx(
         visibility: "private".into(),
         difficulty: row.get("difficulty"),
         estimated_calories: row.get("estimated_calories"),
+        source_url: row.get("source_url"),
+        source_title: row.get("source_title"),
+        source_author: row.get("source_author"),
+        source_license: row.get("source_license"),
+        source_attribution: row.get("source_attribution"),
         ingredients,
     })
 }
@@ -776,6 +826,11 @@ fn recipe_input(input: &AiRecipeInput, visibility: &str) -> RecipeInput {
         visibility: visibility.into(),
         difficulty: input.difficulty,
         estimated_calories: input.estimated_calories,
+        source_url: input.source_url.clone(),
+        source_title: input.source_title.clone(),
+        source_author: input.source_author.clone(),
+        source_license: input.source_license.clone(),
+        source_attribution: input.source_attribution.clone(),
         ingredients: input.ingredients.clone(),
     }
 }
@@ -855,7 +910,8 @@ async fn load_revision(
 ) -> AppResult<RecipeRevision> {
     let row = sqlx::query(
         "SELECT id, recipe_id, expected_version, title, description, instructions,
-                difficulty, estimated_calories,
+                difficulty, estimated_calories, source_url, source_title, source_author,
+                source_license, source_attribution,
                 image_action, image_alt_text, image_source_url, image_source_license,
                 image_source_attribution, status, created_at, updated_at
          FROM recipe_revisions WHERE id = ? AND owner_id = ?",
@@ -881,6 +937,11 @@ async fn load_revision(
         instructions: row.get("instructions"),
         difficulty: row.get("difficulty"),
         estimated_calories: row.get("estimated_calories"),
+        source_url: row.get("source_url"),
+        source_title: row.get("source_title"),
+        source_author: row.get("source_author"),
+        source_license: row.get("source_license"),
+        source_attribution: row.get("source_attribution"),
         ingredients: ingredients
             .into_iter()
             .map(

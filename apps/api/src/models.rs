@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct User {
     pub id: String,
@@ -47,6 +47,16 @@ pub struct RecipeInput {
     pub difficulty: Option<i64>,
     #[serde(default)]
     pub estimated_calories: Option<i64>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub source_title: Option<String>,
+    #[serde(default)]
+    pub source_author: Option<String>,
+    #[serde(default)]
+    pub source_license: Option<String>,
+    #[serde(default)]
+    pub source_attribution: Option<String>,
     pub ingredients: Vec<IngredientInput>,
 }
 
@@ -94,9 +104,11 @@ pub struct RecipeImage {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecipeSource {
-    pub url: String,
+    pub url: Option<String>,
     pub title: Option<String>,
     pub author: Option<String>,
+    pub license: Option<String>,
+    pub attribution: Option<String>,
     pub warnings: Vec<String>,
     pub confidence: Option<f64>,
 }
@@ -131,7 +143,7 @@ where
     Option::<T>::deserialize(deserializer).map(NullableUpdate::Value)
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PantryItem {
     pub id: String,
@@ -141,7 +153,9 @@ pub struct PantryItem {
     pub confirmed_at: Option<String>,
     pub expires_on: Option<String>,
     pub canonical_ingredient_id: Option<String>,
+    pub aliases: Vec<String>,
     pub auto_add_to_shopping_list_when_out: bool,
+    pub version: i64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -152,7 +166,7 @@ pub struct ShoppingItemInput {
     pub canonical_ingredient_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShoppingItemSource {
     pub kind: String,
@@ -160,16 +174,37 @@ pub struct ShoppingItemSource {
     pub recipe_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShoppingItem {
     pub id: String,
     pub name: String,
     pub canonical_ingredient_id: Option<String>,
     pub automatic: bool,
-    pub completed_at: Option<String>,
     pub pantry_item_id: Option<String>,
     pub sources: Vec<ShoppingItemSource>,
+    pub version: i64,
+    pub purchase_options: ShoppingPurchaseOptions,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShoppingPurchaseOptions {
+    pub resolution: String,
+    pub candidates: Vec<PantryPurchaseCandidate>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PantryPurchaseCandidate {
+    pub id: String,
+    pub name: String,
+    pub status: PantryStatus,
+    pub quantity_note: String,
+    pub expires_on: Option<String>,
+    pub canonical_ingredient_id: Option<String>,
+    pub auto_add_to_shopping_list_when_out: bool,
+    pub version: i64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

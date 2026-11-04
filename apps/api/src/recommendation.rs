@@ -31,6 +31,7 @@ pub struct Recommendation {
     pub available: Vec<String>,
     pub verify: Vec<String>,
     pub missing: Vec<String>,
+    pub in_shopping_list: Vec<String>,
     pub reasons: Vec<String>,
     pub reason_details: Vec<RecommendationReason>,
     pub score: i32,
@@ -324,6 +325,7 @@ fn recommend_inner(
             available,
             verify,
             missing,
+            in_shopping_list: Vec::new(),
             reasons,
             reason_details,
             score,
@@ -538,7 +540,9 @@ mod tests {
             confirmed_at: confirmed_at.map(str::to_string),
             expires_on: None,
             canonical_ingredient_id: None,
+            aliases: Vec::new(),
             auto_add_to_shopping_list_when_out: false,
+            version: 1,
         }
     }
 

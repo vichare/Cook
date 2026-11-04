@@ -14,9 +14,26 @@ import type {
   PasskeySummary,
   SecuritySettings,
   ShoppingItem,
+  ShoppingPurchaseResponse,
   PublicAuthorProfile,
+  AiCapabilities,
   User,
 } from './types'
+
+export interface SaveRecipeInput {
+  title: string
+  description: string
+  instructions: string
+  visibility: 'private' | 'public'
+  difficulty: number | null
+  estimatedCalories: number | null
+  sourceUrl: string | null
+  sourceTitle: string | null
+  sourceAuthor: string | null
+  sourceLicense: string | null
+  sourceAttribution: string | null
+  ingredients: Recipe['ingredients']
+}
 
 export class ApiError extends Error {
   constructor(
@@ -123,16 +140,7 @@ export const api = {
       method: favorite ? 'PUT' : 'DELETE',
     }),
   saveRecipe: (
-    value: Pick<
-      Recipe,
-      | 'title'
-      | 'description'
-      | 'instructions'
-      | 'visibility'
-      | 'difficulty'
-      | 'estimatedCalories'
-      | 'ingredients'
-    >,
+    value: SaveRecipeInput,
     id?: string,
     expectedVersion?: number,
   ) =>
@@ -236,12 +244,29 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(value),
     }),
-  completeShoppingItem: (id: string) =>
-    request<ShoppingItem[]>(`/api/shopping-list/${id}/complete`, { method: 'POST' }),
   deleteShoppingItem: (id: string) =>
     request<ShoppingItem[]>(`/api/shopping-list/${id}`, { method: 'DELETE' }),
-  markAutomaticShoppingPurchased: (pantryItemId: string) =>
-    request<ShoppingItem[]>(`/api/shopping-list/automatic/${pantryItemId}/purchased`, {
+  purchaseShoppingItem: (
+    id: string,
+    value: {
+      disposition: 'remove' | 'keep'
+      shoppingExpectedVersion: number
+      pantryItemId: string | null
+      createUsingCurrentName: boolean
+      pantryExpectedVersion: number | null
+      expiresOn: string | null
+      quantityNote: string
+      autoAddToShoppingListWhenOut: boolean
+    },
+    idempotencyKey: string,
+  ) =>
+    request<ShoppingPurchaseResponse>(`/api/shopping-list/${id}/purchase`, {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(value),
+    }),
+  undoShoppingPurchase: (purchaseActionId: string) =>
+    request<ShoppingItem[]>(`/api/shopping-list/purchases/${purchaseActionId}/undo`, {
       method: 'POST',
     }),
   addRecipeIngredientToShopping: (
@@ -285,6 +310,10 @@ export const api = {
         preset,
         confirmPublishRisk: preset === 'publish',
       }),
+    }),
+  aiCapabilities: (secret: string) =>
+    request<AiCapabilities>('/api/ai/capabilities', {
+      headers: { authorization: `Bearer ${secret}` },
     }),
   revokeImportToken: (id: string) =>
     request<void>(`/api/settings/import-tokens/${id}`, { method: 'DELETE' }),

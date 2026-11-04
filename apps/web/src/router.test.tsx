@@ -1,6 +1,14 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import {
+  RouterProvider,
+  createMemoryHistory,
+  createRoute,
+  createRootRoute,
+  createRouter,
+} from '@tanstack/react-router'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   AccountSecuritySettings,
@@ -9,16 +17,23 @@ import {
   GuestLanguageSelector,
   LanguageSettings,
   PantryConfirmation,
+  PrimaryNavigation,
   ProfileSetup,
   RecipeCoverFields,
   RecipeConflictNotice,
+  RecipeEditorForm,
+  RecipeIngredientList,
   RecipeMetadataFields,
+  RecipeProvenanceFields,
+  RecommendationsPage,
   ShoppingListPage,
   persistRecipeEdit,
+  pantryStatusForIngredient,
+  recipeSchema,
 } from './router'
 import type { RecipeForm } from './router'
-import { LocaleProvider, type Locale } from './i18n'
-import type { Recipe } from './types'
+import { LocaleProvider, useI18n, type Locale } from './i18n'
+import type { PantryItem, Recipe, Recommendation } from './types'
 
 const storedLocale = { value: null as string | null }
 const testStorage = {
@@ -38,7 +53,9 @@ function Providers({ children, locale = 'en' }: { children: React.ReactNode; loc
 
 const {
   deleteRecipeCover,
-  markAutomaticShoppingPurchased,
+  addRecipeIngredientToShopping,
+  purchaseShoppingItem,
+  recommendationsApi,
   recipeApi,
   requestEmailLink,
   requestEmailOtp,
@@ -108,21 +125,39 @@ const {
       name: 'Milk',
       canonicalIngredientId: null,
       automatic: true,
-      completedAt: null,
       pantryItemId: 'pantry-1',
       sources: [{ kind: 'automatic', label: '', recipeId: null }],
+      version: 1,
+      purchaseOptions: {
+        resolution: 'reuse',
+        candidates: [{
+          id: 'pantry-1', name: 'Milk', status: 'out', quantityNote: '', expiresOn: null,
+          canonicalIngredientId: null, autoAddToShoppingListWhenOut: true, version: 1,
+        }],
+      },
     },
     {
       id: 'manual-1',
       name: 'Rice',
       canonicalIngredientId: null,
       automatic: false,
-      completedAt: null,
       pantryItemId: null,
       sources: [{ kind: 'manual', label: '', recipeId: null }],
+      version: 1,
+      purchaseOptions: { resolution: 'create', candidates: [] },
     },
   ]),
-  markAutomaticShoppingPurchased: vi.fn().mockResolvedValue([]),
+  purchaseShoppingItem: vi.fn().mockResolvedValue({
+    pantry: {
+      id: 'pantry-1', name: 'Milk', status: 'have', quantityNote: '', confirmedAt: '2026-11-04T00:00:00Z',
+      expiresOn: null, canonicalIngredientId: null, autoAddToShoppingListWhenOut: true, version: 2,
+    },
+    shoppingItems: [],
+    purchaseActionId: 'purchase-1',
+    undoAvailable: true,
+  }),
+  recommendationsApi: vi.fn(),
+  addRecipeIngredientToShopping: vi.fn(),
   saveRecipe: vi.fn(),
   recipeApi: vi.fn(),
   uploadRecipeCover: vi.fn(),
@@ -137,6 +172,7 @@ vi.mock('./api', async () => {
     api: {
       ...actual.api,
       savePantry: vi.fn().mockResolvedValue([]),
+      purchaseShoppingItem,
       pantry: vi.fn().mockResolvedValue([
         {
           id: 'pantry-1',
@@ -147,14 +183,16 @@ vi.mock('./api', async () => {
           expiresOn: null,
           canonicalIngredientId: null,
           autoAddToShoppingListWhenOut: true,
+          version: 1,
         },
       ]),
       shoppingItems,
       addShoppingItem: vi.fn().mockResolvedValue([]),
       updateShoppingItem: vi.fn().mockResolvedValue([]),
-      completeShoppingItem: vi.fn().mockResolvedValue([]),
       deleteShoppingItem: vi.fn().mockResolvedValue([]),
-      markAutomaticShoppingPurchased,
+      recommendations: recommendationsApi,
+      addRecipeIngredientToShopping,
+      undoShoppingPurchase: vi.fn().mockResolvedValue([]),
       saveProfile,
       saveRecipe,
       recipe: recipeApi,
@@ -177,19 +215,21 @@ vi.mock('./api', async () => {
 afterEach(cleanup)
 
 describe('shopping list', () => {
-  it('separates automatic and manual items and confirms a pantry purchase', async () => {
+  it('uses the same Bought flow for automatic and manual items', async () => {
     shoppingItems.mockClear()
-    markAutomaticShoppingPurchased.mockClear()
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    purchaseShoppingItem.mockClear()
     render(
       <Providers>
         <ShoppingListPage />
       </Providers>,
     )
-    expect(await screen.findByRole('heading', { name: 'Automatic restock' })).toBeVisible()
-    expect(screen.getByRole('heading', { name: 'Manual and recipe items' })).toBeVisible()
-    fireEvent.click(screen.getByRole('button', { name: 'Mark Milk purchased' }))
-    await waitFor(() => expect(markAutomaticShoppingPurchased).toHaveBeenCalledWith('pantry-1'))
+    expect(await screen.findByRole('button', { name: 'Bought Milk' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Bought Rice' })).toBeVisible()
+    expect(screen.queryByText('Completed items')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Bought Milk' }))
+    expect(screen.getByRole('dialog', { name: 'Update pantry' })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Save to pantry and remove from list' }))
+    await waitFor(() => expect(purchaseShoppingItem).toHaveBeenCalled())
   })
 
   describe('recipe concurrency', () => {
@@ -228,6 +268,11 @@ describe('shopping list', () => {
       visibility: 'private',
       difficulty: null,
       estimatedCalories: null,
+      sourceUrl: '',
+      sourceTitle: '',
+      sourceAuthor: '',
+      sourceLicense: '',
+      sourceAttribution: '',
       ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
     }
     const coverMetadata = {
@@ -263,6 +308,80 @@ describe('shopping list', () => {
         'target',
         '_blank',
       )
+    })
+
+    it('saves trimmed recipe provenance and treats an external provenance edit as a conflict', async () => {
+      const withSource: RecipeForm = {
+        ...editedForm,
+        sourceUrl: ' https://example.test/source ',
+        sourceTitle: ' Source title ',
+        sourceAuthor: ' Source author ',
+        sourceLicense: ' CC-BY-4.0 ',
+        sourceAttribution: ' Source author — Source title ',
+      }
+      const saved = {
+        ...originalRecipe,
+        title: withSource.title,
+        version: 4,
+        source: {
+          url: 'https://example.test/source',
+          title: 'Source title',
+          author: 'Source author',
+          license: 'CC-BY-4.0',
+          attribution: 'Source author — Source title',
+          warnings: [],
+          confidence: null,
+        },
+      }
+      recipeApi.mockResolvedValueOnce(originalRecipe)
+      saveRecipe.mockResolvedValueOnce(saved)
+      await persistRecipeEdit({
+        value: withSource,
+        recipe: originalRecipe,
+        acknowledgedVersion: 3,
+        coverFile: null,
+        removeCover: false,
+        coverMetadata: {
+          altText: originalRecipe.coverImage!.altText,
+          sourceUrl: '',
+          sourceLicense: '',
+          sourceAttribution: '',
+        },
+        coverMutationKey: 'provenance-save-key',
+        acknowledgeVersion: vi.fn(),
+      })
+      expect(saveRecipe).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceUrl: 'https://example.test/source',
+          sourceTitle: 'Source title',
+          sourceAuthor: 'Source author',
+          sourceLicense: 'CC-BY-4.0',
+          sourceAttribution: 'Source author — Source title',
+        }),
+        'recipe-1',
+        3,
+      )
+
+      recipeApi.mockResolvedValueOnce({
+        ...saved,
+        version: 5,
+        source: { ...saved.source!, license: 'External license change' },
+      })
+      await expect(persistRecipeEdit({
+        value: withSource,
+        recipe: originalRecipe,
+        acknowledgedVersion: 4,
+        coverFile: null,
+        removeCover: false,
+        coverMetadata: {
+          altText: originalRecipe.coverImage!.altText,
+          sourceUrl: '',
+          sourceLicense: '',
+          sourceAttribution: '',
+        },
+        coverMutationKey: 'provenance-conflict-key',
+        acknowledgeVersion: vi.fn(),
+      })).rejects.toEqual(expect.objectContaining({ status: 409, code: 'conflict' }))
     })
 
     it('retries a failed cover upload using the acknowledged body version', async () => {
@@ -524,19 +643,51 @@ describe('shopping list', () => {
     })
   })
 
-  function RecipeMetadataHarness() {
+  function RecipeMetadataHarness({
+    initialDifficulty = null,
+    initialCalories = null,
+    onSubmit = vi.fn(),
+  }: {
+    initialDifficulty?: number | null
+    initialCalories?: number | null
+    onSubmit?: (value: RecipeForm) => void
+  }) {
+    const { t } = useI18n()
     const form = useForm<RecipeForm>({
+      resolver: zodResolver(recipeSchema(t)),
       defaultValues: {
-        title: '',
+        title: 'Recipe',
         description: '',
         instructions: '',
         visibility: 'private',
-        difficulty: null,
-        estimatedCalories: null,
+        difficulty: initialDifficulty,
+        estimatedCalories: initialCalories,
+        sourceUrl: '',
+        sourceTitle: '',
+        sourceAuthor: '',
+        sourceLicense: '',
+        sourceAttribution: '',
         ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
       },
     })
-    return <RecipeMetadataFields form={form} />
+    return (
+      <form noValidate onSubmit={form.handleSubmit(onSubmit)}>
+        <input type="hidden" {...form.register('title')} />
+        <input type="hidden" {...form.register('description')} />
+        <input type="hidden" {...form.register('instructions')} />
+        <input type="hidden" {...form.register('visibility')} />
+        <input type="hidden" {...form.register('sourceUrl')} />
+        <input type="hidden" {...form.register('sourceTitle')} />
+        <input type="hidden" {...form.register('sourceAuthor')} />
+        <input type="hidden" {...form.register('sourceLicense')} />
+        <input type="hidden" {...form.register('sourceAttribution')} />
+        <input type="hidden" {...form.register('ingredients.0.name')} />
+        <input type="hidden" {...form.register('ingredients.0.quantityNote')} />
+        <input type="hidden" {...form.register('ingredients.0.canonicalIngredientId')} />
+        <RecipeMetadataFields form={form} />
+        <button type="submit">Submit metadata</button>
+      </form>
+    )
   }
 
   describe('recipe metadata', () => {
@@ -550,11 +701,87 @@ describe('shopping list', () => {
       fireEvent.change(difficulty, { target: { value: '4' } })
       expect(difficulty).toHaveValue('4')
       expect(screen.getByRole('option', { name: '4 — Challenging' })).toBeVisible()
-      const calories = screen.getByRole('spinbutton', { name: /Estimated total calories/ })
+      const calories = screen.getByRole('textbox', { name: /Estimated total calories/ })
       fireEvent.change(calories, { target: { value: '850' } })
-      expect(calories).toHaveValue(850)
+      expect(calories).toHaveValue('850')
       fireEvent.change(difficulty, { target: { value: '' } })
       expect(difficulty).toHaveValue('')
+    })
+
+    it.each([
+      ['en' as const, 'Difficulty', /Estimated total calories/],
+      ['zh-CN' as const, '难度', /整份预估热量/],
+    ])('submits empty and cleared optional values repeatedly in %s', async (locale, difficultyLabel, caloriesLabel) => {
+      const onSubmit = vi.fn()
+      const { unmount } = render(
+        <Providers locale={locale}>
+          <RecipeMetadataHarness onSubmit={onSubmit} />
+        </Providers>,
+      )
+      const firstDifficulty = screen.getByLabelText(difficultyLabel)
+      const firstCalories = screen.getByRole('textbox', { name: caloriesLabel })
+      expect(firstDifficulty).toBeValid()
+      expect(firstCalories).toBeValid()
+      fireEvent.click(screen.getByRole('button', { name: 'Submit metadata' }))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({ difficulty: null, estimatedCalories: null }),
+        expect.anything(),
+      ))
+      unmount()
+
+      render(
+        <Providers locale={locale}>
+          <RecipeMetadataHarness
+            initialDifficulty={4}
+            initialCalories={850}
+            onSubmit={onSubmit}
+          />
+        </Providers>,
+      )
+      const difficulty = screen.getByLabelText(difficultyLabel)
+      const calories = screen.getByRole('textbox', { name: caloriesLabel })
+      fireEvent.change(difficulty, { target: { value: '' } })
+      fireEvent.change(calories, { target: { value: '' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Submit metadata' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Submit metadata' }))
+      await waitFor(() => expect(onSubmit).toHaveBeenLastCalledWith(
+        expect.objectContaining({ difficulty: null, estimatedCalories: null }),
+        expect.anything(),
+      ))
+    })
+
+    it('keeps malformed and out-of-range non-empty values visible and reports localized errors', async () => {
+      const onSubmit = vi.fn()
+      render(
+        <Providers locale="zh-CN">
+          <RecipeMetadataHarness onSubmit={onSubmit} />
+        </Providers>,
+      )
+      const difficulty = screen.getByLabelText('难度')
+      const invalidOption = document.createElement('option')
+      invalidOption.value = '6'
+      invalidOption.textContent = '6'
+      difficulty.append(invalidOption)
+      fireEvent.change(difficulty, { target: { value: '6' } })
+      const calories = screen.getByRole('textbox', { name: /整份预估热量/ })
+      fireEvent.change(calories, { target: { value: '1.5' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Submit metadata' }))
+      expect(await screen.findByText('请选择 1 到 5 的整数难度，或留空。')).toBeVisible()
+      expect(screen.getByText('请输入 1 到 100000 的整份整数估算热量，或留空。')).toBeVisible()
+      expect(calories).toHaveValue('1.5')
+      expect(onSubmit).not.toHaveBeenCalled()
+    })
+
+    it('disables native constraint validation on the full recipe editor', () => {
+      render(
+        <Providers>
+          <RecipeEditorForm onSaved={vi.fn()} />
+        </Providers>,
+      )
+      const form = screen.getByRole('button', { name: 'Save recipe' }).closest('form')
+      expect(form).toHaveAttribute('novalidate')
+      expect(screen.getByLabelText('Difficulty')).not.toBeRequired()
+      expect(screen.getByRole('textbox', { name: /Estimated total calories/ })).not.toBeRequired()
     })
 
     it('localizes difficulty and whole-recipe calorie guidance', () => {
@@ -568,14 +795,361 @@ describe('shopping list', () => {
     })
   })
 
+  describe('recipe ingredient pantry badges', () => {
+    const pantry = (overrides: Partial<PantryItem>): PantryItem => ({
+      id: 'pantry-1',
+      name: 'Milk',
+      status: 'have',
+      quantityNote: '',
+      confirmedAt: null,
+      expiresOn: null,
+      canonicalIngredientId: null,
+      aliases: [],
+      autoAddToShoppingListWhenOut: false,
+      version: 1,
+      ...overrides,
+    })
+
+    it('uses only canonical, confirmed alias, or exact unresolved matches', () => {
+      expect(pantryStatusForIngredient(
+        { name: 'dairy', quantityNote: '', canonicalIngredientId: 'milk-id' },
+        [pantry({ canonicalIngredientId: 'milk-id' })],
+      )).toBe('available')
+      expect(pantryStatusForIngredient(
+        { name: '牛奶', quantityNote: '', canonicalIngredientId: null },
+        [pantry({ canonicalIngredientId: 'milk-id', aliases: ['牛奶'] })],
+      )).toBe('available')
+      expect(pantryStatusForIngredient(
+        { name: ' milk ', quantityNote: '', canonicalIngredientId: null },
+        [pantry({})],
+      )).toBe('available')
+      expect(pantryStatusForIngredient(
+        { name: 'mil', quantityNote: '', canonicalIngredientId: null },
+        [pantry({})],
+      )).toBeNull()
+      expect(pantryStatusForIngredient(
+        { name: 'Milk', quantityNote: '', canonicalIngredientId: 'other-id' },
+        [pantry({ canonicalIngredientId: 'milk-id' })],
+      )).toBeNull()
+    })
+
+    it('maps have, out, unknown, and expired states without a no-match placeholder', () => {
+      const ingredient = { name: 'Milk', quantityNote: '', canonicalIngredientId: null }
+      expect(pantryStatusForIngredient(ingredient, [pantry({ status: 'have' })])).toBe('available')
+      expect(pantryStatusForIngredient(ingredient, [pantry({ status: 'out' })])).toBe('out')
+      expect(pantryStatusForIngredient(ingredient, [pantry({ status: 'unknown' })])).toBe('unsure')
+      expect(pantryStatusForIngredient(
+        ingredient,
+        [pantry({ status: 'have', expiresOn: '2020-01-01' })],
+      )).toBe('verify')
+      expect(pantryStatusForIngredient(
+        { name: 'Egg', quantityNote: '', canonicalIngredientId: null },
+        [pantry({})],
+      )).toBeNull()
+    })
+
+    it('renders localized text and an ingredient-specific accessible label', async () => {
+      const { unmount } = render(
+        <Providers>
+          <RecipeIngredientList ingredients={[
+            { name: 'Milk', quantityNote: '1 cup', canonicalIngredientId: null },
+            { name: 'Egg', quantityNote: '', canonicalIngredientId: null },
+          ]} />
+        </Providers>,
+      )
+      expect(await screen.findByLabelText('Milk: pantry status Out')).toHaveTextContent('Out')
+      expect(screen.queryByText('Unsure')).not.toBeInTheDocument()
+      unmount()
+      render(
+        <Providers locale="zh-CN">
+          <RecipeIngredientList ingredients={[
+            { name: 'Milk', quantityNote: '', canonicalIngredientId: null },
+          ]} />
+        </Providers>,
+      )
+      expect(await screen.findByLabelText('Milk：库存状态为已用光')).toHaveTextContent('已用光')
+    })
+  })
+
+  it('exposes optional recipe provenance separately from cover provenance in both locales', () => {
+    function Harness() {
+      const form = useForm<RecipeForm>({
+        defaultValues: {
+          title: '',
+          description: '',
+          instructions: '',
+          visibility: 'private',
+          difficulty: null,
+          estimatedCalories: null,
+          sourceUrl: '',
+          sourceTitle: '',
+          sourceAuthor: '',
+          sourceLicense: '',
+          sourceAttribution: '',
+          ingredients: [{ name: 'water', quantityNote: '', canonicalIngredientId: null }],
+        },
+      })
+      return <RecipeProvenanceFields form={form} />
+    }
+    const { unmount } = render(<Providers><Harness /></Providers>)
+    fireEvent.click(screen.getByText('Recipe source details (optional)'))
+    expect(screen.getByLabelText('Recipe source URL')).toHaveAttribute('type', 'url')
+    expect(screen.getByText(/not independent proof/)).toBeVisible()
+    unmount()
+    render(<Providers locale="zh-CN"><Harness /></Providers>)
+    fireEvent.click(screen.getByText('菜谱来源信息（可选）'))
+    expect(screen.getByLabelText('来源许可证')).toBeVisible()
+    expect(screen.getByText(/不是对许可证适用性的独立证明/)).toBeVisible()
+  })
+
   it('renders shopping controls in Simplified Chinese', async () => {
     render(
       <Providers locale="zh-CN">
         <ShoppingListPage />
       </Providers>,
     )
-    expect(await screen.findByRole('heading', { name: '自动补货' })).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Milk 已买到' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: '购物清单' })).toBeVisible()
+    expect(await screen.findByRole('button', { name: 'Milk 已买到' })).toBeVisible()
+    expect(screen.getByText('这里只显示仍需购买的食材。买到后可直接更新库存。')).toBeVisible()
+  })
+})
+
+describe('responsive primary navigation', () => {
+  function renderNavigation(locale: Locale = 'en', initialPath = '/pantry') {
+    storedLocale.value = null
+    Object.defineProperty(window, 'scrollTo', {
+      configurable: true,
+      value: vi.fn(),
+    })
+    const root = createRootRoute({
+      component: () => (
+        <Providers locale={locale}>
+          <PrimaryNavigation />
+        </Providers>
+      ),
+    })
+    const routes = [
+      '/recommendations',
+      '/recipes',
+      '/pantry',
+      '/shopping-list',
+      '/imports',
+      '/settings',
+    ].map((path) => createRoute({
+      getParentRoute: () => root,
+      path,
+      component: () => null,
+    }))
+    const router = createRouter({
+      routeTree: root.addChildren(routes),
+      history: createMemoryHistory({ initialEntries: [initialPath] }),
+    })
+    render(<RouterProvider router={router} />)
+    return router
+  }
+
+  it('uses a semantic active state and exposes every destination in the mobile menu', async () => {
+    renderNavigation()
+    const activeDesktop = await screen.findByRole('link', { name: 'Pantry' })
+    expect(activeDesktop).toHaveAttribute('aria-current', 'page')
+    const trigger = screen.getByRole('button', { name: 'Menu' })
+    fireEvent.click(trigger)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    const dialog = screen.getByRole('dialog', { name: 'Menu' })
+    for (const label of ['Recommend', 'Recipes', 'Pantry', 'Shopping list', 'Imports', 'Settings']) {
+      expect(within(dialog).getByRole('link', { name: label })).toBeVisible()
+    }
+    expect(within(dialog).getByRole('link', { name: 'Pantry' })).toHaveAttribute('aria-current', 'page')
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Menu' })).not.toBeInTheDocument())
+    expect(trigger).toHaveFocus()
+  })
+
+  it('closes after navigation and renders Chinese labels', async () => {
+    const router = renderNavigation('zh-CN')
+    fireEvent.click(await screen.findByRole('button', { name: '菜单' }))
+    const dialog = screen.getByRole('dialog', { name: '菜单' })
+    fireEvent.click(within(dialog).getByRole('link', { name: '购物清单' }))
+    await waitFor(() => expect(router.state.location.pathname).toBe('/shopping-list'))
+    expect(screen.queryByRole('dialog', { name: '菜单' })).not.toBeInTheDocument()
+  })
+})
+
+describe('recommendation shopping membership', () => {
+  function renderRecommendations(locale: Locale = 'en') {
+    Object.defineProperty(window, 'scrollTo', {
+      configurable: true,
+      value: vi.fn(),
+    })
+    const root = createRootRoute({
+      component: () => (
+        <LocaleProvider initialLocale={locale} storage={null}>
+          <QueryClientProvider client={new QueryClient()}>
+            <RecommendationsPage />
+          </QueryClientProvider>
+        </LocaleProvider>
+      ),
+    })
+    const testRouter = createRouter({
+      routeTree: root,
+      history: createMemoryHistory({ initialEntries: ['/'] }),
+    })
+    return render(<RouterProvider router={testRouter} />)
+  }
+
+  function recommendation(inShoppingList: string[] = []): Recommendation {
+    return {
+      recipe: {
+        id: 'recipe-shop',
+        version: 1,
+        isOwner: true,
+        authorHandle: 'owner',
+        authorNickname: null,
+        title: 'Saffron rice',
+        description: '',
+        instructions: '',
+        visibility: 'private' as const,
+        difficulty: null,
+        estimatedCalories: null,
+        ingredients: [{
+          name: 'Saffron',
+          quantityNote: '',
+          canonicalIngredientId: 'canonical-saffron',
+        }],
+        isFavorite: false,
+        isFavoriteAuthor: false,
+        coverImage: null,
+        source: null,
+      },
+      status: 'SHOP' as const,
+      available: [],
+      verify: [],
+      missing: ['Saffron'],
+      inShoppingList,
+      reasons: [],
+      reasonDetails: [{ code: 'confirmedIngredients' as const, confirmed: 0, total: 1 }],
+      score: 250,
+      scoreBreakdown: {
+        statusBase: 250,
+        source: 100,
+        availability: 0,
+        desired: 0,
+        certainty: 0,
+        simplicity: 8,
+      },
+      primarySource: 'OWN' as const,
+      matchedSources: ['OWN' as const],
+      desiredMatches: [],
+      ingredientReasons: [{
+        ingredient: 'Saffron',
+        code: 'MISSING' as const,
+        expiresOn: null,
+      }],
+      appliedControls: {
+        preferred: [],
+        required: [],
+        excluded: [],
+        pantryOnly: false,
+        includeOwn: true,
+        includeFavoriteRecipes: true,
+        includeFavoriteAccounts: true,
+        includeOtherPublic: true,
+      },
+    }
+  }
+
+  it('renders semantic membership instead of an add action when already active', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation(['Saffron'])])
+    renderRecommendations()
+    expect(await screen.findByText('Saffron: In shopping list')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Add Saffron' })).not.toBeInTheDocument()
+  })
+
+  it('uses compact preview and ingredient groups with details collapsed by default', async () => {
+    const result = recommendation(['Saffron'])
+    result.recipe.description = 'A **compact** bowl. <script>unsafe()</script>'
+    result.recipe.coverImage = {
+      id: 'cover-1',
+      url: '/api/recipes/recipe-shop/cover',
+      altText: 'Saffron rice in a bowl',
+      sourceUrl: null,
+      sourceLicense: null,
+      sourceAttribution: null,
+      version: 1,
+      width: 640,
+      height: 480,
+    }
+    result.recipe.ingredients = [
+      { name: 'Rice', quantityNote: '', canonicalIngredientId: 'rice' },
+      { name: 'Egg', quantityNote: '', canonicalIngredientId: 'egg' },
+      { name: 'Saffron', quantityNote: '', canonicalIngredientId: 'canonical-saffron' },
+    ]
+    result.available = ['Rice']
+    result.verify = ['Egg']
+    result.reasonDetails = [{ code: 'confirmedIngredients', confirmed: 1, total: 3 }]
+    result.ingredientReasons = [
+      { ingredient: 'Rice', code: 'AVAILABLE', expiresOn: null },
+      { ingredient: 'Egg', code: 'UNKNOWN', expiresOn: null },
+      { ingredient: 'Saffron', code: 'MISSING', expiresOn: null },
+    ]
+    recommendationsApi.mockReset().mockResolvedValue([result])
+    renderRecommendations()
+    expect(await screen.findByRole('img', { name: 'Saffron rice in a bowl' })).toHaveAttribute(
+      'src',
+      '/api/recipes/recipe-shop/cover',
+    )
+    expect(screen.getByText('compact')).toBeVisible()
+    expect(document.querySelector('script')).toBeNull()
+    expect(screen.getByText('Primary source: My recipe')).toBeVisible()
+    expect(screen.getByText('Available')).toBeVisible()
+    expect(screen.getByText('Verify')).toBeVisible()
+    expect(screen.getByText('Missing')).toBeVisible()
+    expect(screen.getByText('Saffron: In shopping list')).toBeVisible()
+    const detailReason = screen.getByText('1 of 3 ingredients confirmed')
+    expect(detailReason).not.toBeVisible()
+    expect(screen.getByText('Rice: confirmed available')).not.toBeVisible()
+    fireEvent.click(screen.getByText('Why recommended'))
+    expect(detailReason).toBeVisible()
+    expect(screen.getByText('Rice: confirmed available')).toBeVisible()
+  })
+
+  it('omits empty ingredient groups and preview placeholders', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations()
+    await screen.findByText('Saffron rice')
+    expect(screen.queryByText('Available')).not.toBeInTheDocument()
+    expect(screen.queryByText('Verify')).not.toBeInTheDocument()
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+  })
+
+  it('prevents duplicate submits and transitions immediately after a successful add', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    let resolveAdd!: (value: never[]) => void
+    addRecipeIngredientToShopping.mockReset().mockReturnValue(
+      new Promise<never[]>((resolve) => {
+        resolveAdd = resolve
+      }),
+    )
+    renderRecommendations()
+    const add = await screen.findByRole('button', { name: 'Add Saffron' })
+    fireEvent.click(add)
+    fireEvent.click(add)
+    await waitFor(() => expect(addRecipeIngredientToShopping).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('button', { name: 'Adding Saffron…' })).toBeDisabled()
+    resolveAdd([])
+    expect(await screen.findByText('Saffron: In shopping list')).toBeVisible()
+    expect(screen.getByRole('status')).toHaveTextContent('Saffron added to the shopping list.')
+  })
+
+  it('restores the add action after failure and never claims success', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    addRecipeIngredientToShopping.mockReset().mockRejectedValue(new Error('network failed'))
+    renderRecommendations()
+    fireEvent.click(await screen.findByRole('button', { name: 'Add Saffron' }))
+    expect(await screen.findByText('network failed')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Add Saffron' })).toBeEnabled()
+    expect(screen.queryByText('Saffron: In shopping list')).not.toBeInTheDocument()
+    expect(screen.queryByText('Saffron added to the shopping list.')).not.toBeInTheDocument()
   })
 })
 

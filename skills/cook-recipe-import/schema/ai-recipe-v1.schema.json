@@ -21,6 +21,20 @@
       "maximum": 100000,
       "description": "Optional estimated total kcal for the whole recipe, not per serving."
     },
+    "sourceUrl": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "maxLength": 2048,
+      "description": "Optional HTTP or HTTPS recipe source URL."
+    },
+    "sourceTitle": { "type": ["string", "null"], "maxLength": 200 },
+    "sourceAuthor": { "type": ["string", "null"], "maxLength": 200 },
+    "sourceLicense": {
+      "type": ["string", "null"],
+      "maxLength": 200,
+      "description": "License text reported by the source or user; Cook does not independently verify it."
+    },
+    "sourceAttribution": { "type": ["string", "null"], "maxLength": 1000 },
     "visibility": {
       "type": "string",
       "enum": ["private", "public"],

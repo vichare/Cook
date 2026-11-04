@@ -18,6 +18,7 @@ use rust_web_auth_passkey::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use url::Url;
 use uuid::Uuid;
 
 use crate::{
@@ -41,6 +42,10 @@ use crate::{
     recommendation::{recommend_limited, Recommendation},
     shopping, AppState,
 };
+
+const MAX_PANTRY_ITEMS_PER_OWNER: i64 = 500;
+const MAX_INGREDIENT_ALIASES_PER_OWNER: i64 = 2_000;
+const MAX_INGREDIENT_SUGGESTION_CANDIDATES: i64 = 5_000;
 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
@@ -113,12 +118,12 @@ pub fn router(state: AppState) -> Router {
             put(shopping::update_manual_item).delete(shopping::delete_manual_item),
         )
         .route(
-            "/api/shopping-list/{id}/complete",
-            post(shopping::complete_manual_item),
+            "/api/shopping-list/{id}/purchase",
+            post(shopping::purchase_item),
         )
         .route(
-            "/api/shopping-list/automatic/{id}/purchased",
-            post(shopping::mark_automatic_purchased),
+            "/api/shopping-list/purchases/{id}/undo",
+            post(shopping::undo_purchase),
         )
         .route(
             "/api/recipes/{id}/shopping-list-items",
@@ -171,6 +176,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/auth/logout", post(logout))
         .route("/api/authors/{handle}", get(public_author_profile))
+        .route(
+            "/api/ai/capabilities",
+            get(imports::inspect_ai_capabilities),
+        )
         .route("/api/import/drafts", post(imports::create_import_draft))
         .route(
             "/api/ai/recipes",
@@ -1213,7 +1222,9 @@ async fn update_recipe(
             .ok_or(AppError::NotFound)?;
     let result = sqlx::query(
         "UPDATE recipes SET title = ?, description = ?, instructions = ?, visibility = ?,
-         difficulty = ?, estimated_calories = ?, version = version + 1,
+         difficulty = ?, estimated_calories = ?, source_url = ?, source_title = ?,
+         source_author = ?, source_license = ?, source_attribution = ?,
+         version = version + 1,
          updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND owner_id = ? AND version = ?",
     )
@@ -1223,6 +1234,11 @@ async fn update_recipe(
     .bind(&input.visibility)
     .bind(input.difficulty)
     .bind(input.estimated_calories)
+    .bind(optional_text(&input.source_url))
+    .bind(optional_text(&input.source_title))
+    .bind(optional_text(&input.source_author))
+    .bind(optional_text(&input.source_license))
+    .bind(optional_text(&input.source_attribution))
     .bind(&id)
     .bind(&user.id)
     .bind(expected_version)
@@ -1340,20 +1356,34 @@ async fn ingredient_suggestions(
          ) OR EXISTS (
              SELECT 1 FROM ingredient_aliases a
              WHERE a.canonical_ingredient_id = c.id AND a.owner_id = ?
-         )",
+         )
+         LIMIT ?",
     )
     .bind(&user.id)
     .bind(&user.id)
     .bind(&user.id)
+    .bind(MAX_INGREDIENT_SUGGESTION_CANDIDATES + 1)
     .fetch_all(&state.pool)
     .await?;
+    if candidates.len() as i64 > MAX_INGREDIENT_SUGGESTION_CANDIDATES {
+        return Err(AppError::Validation(
+            "ingredient suggestion candidate limit exceeded".into(),
+        ));
+    }
     let aliases: Vec<(String, String)> = sqlx::query_as(
         "SELECT canonical_ingredient_id, alias_name
-         FROM ingredient_aliases WHERE owner_id = ?",
+         FROM ingredient_aliases WHERE owner_id = ?
+         ORDER BY alias_normalized LIMIT ?",
     )
     .bind(&user.id)
+    .bind(MAX_INGREDIENT_ALIASES_PER_OWNER + 1)
     .fetch_all(&state.pool)
     .await?;
+    if aliases.len() as i64 > MAX_INGREDIENT_ALIASES_PER_OWNER {
+        return Err(AppError::Validation(
+            "ingredient alias limit exceeded".into(),
+        ));
+    }
     let mut alias_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for (canonical_id, alias_name) in aliases {
@@ -1394,8 +1424,17 @@ async fn ingredient_suggestions(
 async fn list_pantry(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
-) -> AppResult<Json<Vec<PantryItem>>> {
-    Ok(Json(load_pantry(&state.pool, &user.id).await?))
+) -> AppResult<(HeaderMap, Json<Vec<PantryItem>>)> {
+    let items = load_pantry(&state.pool, &user.id).await?;
+    let digest = Sha256::digest(
+        serde_json::to_vec(&items).map_err(|error| AppError::Data(error.to_string()))?,
+    );
+    let etag = format!("\"pantry-{digest:x}\"").parse().map_err(
+        |error: axum::http::header::InvalidHeaderValue| AppError::Data(error.to_string()),
+    )?;
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::ETAG, etag);
+    Ok((headers, Json(items)))
 }
 
 async fn upsert_pantry(
@@ -1410,6 +1449,11 @@ async fn upsert_pantry(
         ));
     }
     let mut transaction = state.pool.begin().await?;
+    let mut pantry_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pantry_items WHERE owner_id = ?")
+            .bind(&user.id)
+            .fetch_one(&mut *transaction)
+            .await?;
     for item in items {
         let normalized = normalize_ingredient(&item.name);
         if normalized.is_empty() {
@@ -1442,6 +1486,14 @@ async fn upsert_pantry(
             .first()
             .cloned()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        if existing_ids.is_empty() {
+            if pantry_count >= MAX_PANTRY_ITEMS_PER_OWNER {
+                return Err(AppError::Validation("pantry item limit exceeded".into()));
+            }
+            pantry_count += 1;
+        } else if existing_ids.len() > 1 {
+            pantry_count -= (existing_ids.len() - 1) as i64;
+        }
         let existing_expiry: Option<String> = if existing_ids.is_empty() {
             None
         } else {
@@ -1488,6 +1540,7 @@ async fn upsert_pantry(
                confirmed_at = excluded.confirmed_at, expires_on = excluded.expires_on,
                canonical_ingredient_id = excluded.canonical_ingredient_id,
                auto_add_to_shopping_list_when_out = excluded.auto_add_to_shopping_list_when_out,
+               version = pantry_items.version + 1,
                updated_at = CURRENT_TIMESTAMP",
         )
         .bind(item_id)
@@ -1595,6 +1648,7 @@ async fn get_recommendations(
     let settings = load_settings(&state.pool, &user.id).await?;
     let pantry = load_pantry(&state.pool, &user.id).await?;
     let mut transaction = state.pool.begin().await?;
+    let active_shopping = shopping::active_identity_keys_tx(&mut transaction, &user.id).await?;
     let candidates = load_candidate_recipes(&mut transaction, &user.id, &settings).await?;
     pause_after_recommendation_selection(&user.id).await;
     let mut recommendations = recommend_limited(
@@ -1605,6 +1659,21 @@ async fn get_recommendations(
         recommendation_time,
         limit,
     );
+    for recommendation in &mut recommendations {
+        recommendation.in_shopping_list = recommendation
+            .recipe
+            .ingredients
+            .iter()
+            .filter(|ingredient| recommendation.missing.contains(&ingredient.name))
+            .filter(|ingredient| {
+                active_shopping.contains(&shopping::dedupe_key(
+                    ingredient.canonical_ingredient_id.as_deref(),
+                    &normalize_ingredient(&ingredient.name),
+                ))
+            })
+            .map(|ingredient| ingredient.name.clone())
+            .collect();
+    }
     hydrate_recommendation_recipes(&mut transaction, &user.id, &mut recommendations).await?;
     transaction.commit().await?;
     discard_unauthorized_recommendations(&state.pool, &user.id, &mut recommendations).await?;
@@ -1746,7 +1815,49 @@ pub(crate) fn validate_recipe(input: &RecipeInput) -> AppResult<()> {
             "estimated total calories must be an integer from 1 to 100000".into(),
         ));
     }
+    validate_recipe_source(input)?;
     Ok(())
+}
+
+fn validate_recipe_source(input: &RecipeInput) -> AppResult<()> {
+    if let Some(value) = optional_text(&input.source_url) {
+        if value.len() > 2_048 {
+            return Err(AppError::Validation(
+                "source URL must be at most 2048 characters".into(),
+            ));
+        }
+        let url = Url::parse(value)
+            .map_err(|_| AppError::Validation("source URL must be HTTP or HTTPS".into()))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(AppError::Validation(
+                "source URL must be HTTP or HTTPS".into(),
+            ));
+        }
+    }
+    for (label, value) in [
+        ("source title", &input.source_title),
+        ("source author", &input.source_author),
+        ("source license", &input.source_license),
+    ] {
+        if optional_text(value).is_some_and(|text| text.chars().count() > 200) {
+            return Err(AppError::Validation(format!(
+                "{label} must be at most 200 characters"
+            )));
+        }
+    }
+    if optional_text(&input.source_attribution).is_some_and(|text| text.chars().count() > 1_000) {
+        return Err(AppError::Validation(
+            "source attribution must be at most 1000 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn optional_text(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn expand_ingredient_inputs(items: Vec<IngredientInput>) -> Vec<IngredientInput> {
@@ -1887,6 +1998,27 @@ async fn resolve_canonical_ingredient(
                 .fetch_one(&mut **transaction)
                 .await?;
         if canonical_normalized != normalized {
+            let alias_exists: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ingredient_aliases
+                 WHERE owner_id = ? AND alias_normalized = ?",
+            )
+            .bind(owner_id)
+            .bind(&normalized)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            if alias_exists.is_none() {
+                let alias_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM ingredient_aliases WHERE owner_id = ?",
+                )
+                .bind(owner_id)
+                .fetch_one(&mut **transaction)
+                .await?;
+                if alias_count >= MAX_INGREDIENT_ALIASES_PER_OWNER {
+                    return Err(AppError::Validation(
+                        "ingredient alias limit exceeded".into(),
+                    ));
+                }
+            }
             sqlx::query(
                 "INSERT INTO ingredient_aliases
                  (id, owner_id, alias_name, alias_normalized, canonical_ingredient_id, created_at)
@@ -2090,8 +2222,10 @@ async fn save_recipe(
     let mut transaction = pool.begin().await?;
     sqlx::query(
         "INSERT INTO recipes
-         (id, owner_id, title, description, instructions, visibility, difficulty, estimated_calories)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, owner_id, title, description, instructions, visibility, difficulty,
+          estimated_calories, source_url, source_title, source_author, source_license,
+          source_attribution)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(owner_id)
@@ -2101,6 +2235,11 @@ async fn save_recipe(
     .bind(&input.visibility)
     .bind(input.difficulty)
     .bind(input.estimated_calories)
+    .bind(optional_text(&input.source_url))
+    .bind(optional_text(&input.source_title))
+    .bind(optional_text(&input.source_author))
+    .bind(optional_text(&input.source_license))
+    .bind(optional_text(&input.source_attribution))
     .execute(&mut *transaction)
     .await?;
     insert_ingredients(&mut transaction, id, owner_id, &input.ingredients).await?;
@@ -2190,7 +2329,7 @@ pub(crate) async fn load_visible_recipes(
             "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
                r.difficulty, r.estimated_calories, r.version,
                u.public_handle, u.public_nickname, r.source_url, r.source_title, r.source_author,
-               r.source_warnings, r.source_confidence,
+               r.source_license, r.source_attribution, r.source_warnings, r.source_confidence,
                EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite,
                EXISTS(SELECT 1 FROM favorite_accounts fa
                       WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id) AS is_favorite_author
@@ -2208,7 +2347,7 @@ pub(crate) async fn load_visible_recipes(
             "SELECT r.id, r.owner_id, r.title, r.description, r.instructions, r.visibility,
                r.difficulty, r.estimated_calories, r.version,
                u.public_handle, u.public_nickname, r.source_url, r.source_title, r.source_author,
-               r.source_warnings, r.source_confidence,
+               r.source_license, r.source_attribution, r.source_warnings, r.source_confidence,
                EXISTS(SELECT 1 FROM favorites f WHERE f.user_id = ? AND f.recipe_id = r.id) AS is_favorite,
                EXISTS(SELECT 1 FROM favorite_accounts fa
                       WHERE fa.viewer_id = ? AND fa.author_id = r.owner_id) AS is_favorite_author
@@ -2226,7 +2365,16 @@ pub(crate) async fn load_visible_recipes(
         let recipe_id: String = row.get("id");
         let owner_id: String = row.get("owner_id");
         let source_url: Option<String> = row.get("source_url");
-        let source = if let Some(url) = source_url {
+        let source_title: Option<String> = row.get("source_title");
+        let source_author: Option<String> = row.get("source_author");
+        let source_license: Option<String> = row.get("source_license");
+        let source_attribution: Option<String> = row.get("source_attribution");
+        let source = if source_url.is_some()
+            || source_title.is_some()
+            || source_author.is_some()
+            || source_license.is_some()
+            || source_attribution.is_some()
+        {
             let warnings = match row.get::<Option<String>, _>("source_warnings") {
                 Some(value) => serde_json::from_str(&value).map_err(|error| {
                     AppError::Data(format!("invalid stored recipe source warnings: {error}"))
@@ -2234,9 +2382,11 @@ pub(crate) async fn load_visible_recipes(
                 None => Vec::new(),
             };
             Some(RecipeSource {
-                url,
-                title: row.get("source_title"),
-                author: row.get("source_author"),
+                url: source_url,
+                title: source_title,
+                author: source_author,
+                license: source_license,
+                attribution: source_attribution,
                 warnings,
                 confidence: row.get("source_confidence"),
             })
@@ -2409,7 +2559,9 @@ async fn hydrate_recommendation_recipes(
     }
     let mut query = QueryBuilder::<Sqlite>::new(
         "SELECT r.id, r.description, r.instructions, r.source_url, r.source_title,
-                r.source_author, r.source_warnings, r.source_confidence,
+                r.source_author, r.source_license AS recipe_source_license,
+                r.source_attribution AS recipe_source_attribution,
+                r.source_warnings, r.source_confidence,
                 img.id AS image_id, img.width, img.height, img.alt_text,
                 img.source_url AS image_source_url, img.source_license,
                 img.source_attribution, img.version AS image_version
@@ -2443,7 +2595,16 @@ async fn hydrate_recommendation_recipes(
         recommendation.recipe.description = row.get("description");
         recommendation.recipe.instructions = row.get("instructions");
         let source_url: Option<String> = row.get("source_url");
-        recommendation.recipe.source = if let Some(url) = source_url {
+        let source_title: Option<String> = row.get("source_title");
+        let source_author: Option<String> = row.get("source_author");
+        let source_license: Option<String> = row.get("recipe_source_license");
+        let source_attribution: Option<String> = row.get("recipe_source_attribution");
+        recommendation.recipe.source = if source_url.is_some()
+            || source_title.is_some()
+            || source_author.is_some()
+            || source_license.is_some()
+            || source_attribution.is_some()
+        {
             let warnings = row
                 .get::<Option<String>, _>("source_warnings")
                 .map(|value| serde_json::from_str(&value))
@@ -2453,9 +2614,11 @@ async fn hydrate_recommendation_recipes(
                 })?
                 .unwrap_or_default();
             Some(RecipeSource {
-                url,
-                title: row.get("source_title"),
-                author: row.get("source_author"),
+                url: source_url,
+                title: source_title,
+                author: source_author,
+                license: source_license,
+                attribution: source_attribution,
                 warnings,
                 confidence: row.get("source_confidence"),
             })
@@ -2552,15 +2715,41 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
         Option<String>,
         Option<String>,
         bool,
+        i64,
     );
     let rows: Vec<PantryRow> = sqlx::query_as(
         "SELECT id, name, status, quantity_note, confirmed_at, expires_on,
-                canonical_ingredient_id, auto_add_to_shopping_list_when_out
-         FROM pantry_items WHERE owner_id = ? ORDER BY normalized_name",
+                canonical_ingredient_id, auto_add_to_shopping_list_when_out, version
+         FROM pantry_items WHERE owner_id = ? ORDER BY normalized_name LIMIT ?",
     )
     .bind(user_id)
+    .bind(MAX_PANTRY_ITEMS_PER_OWNER + 1)
     .fetch_all(pool)
     .await?;
+    if rows.len() as i64 > MAX_PANTRY_ITEMS_PER_OWNER {
+        return Err(AppError::Validation("pantry item limit exceeded".into()));
+    }
+    let alias_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT canonical_ingredient_id, alias_normalized
+         FROM ingredient_aliases WHERE owner_id = ?
+         ORDER BY alias_normalized LIMIT ?",
+    )
+    .bind(user_id)
+    .bind(MAX_INGREDIENT_ALIASES_PER_OWNER + 1)
+    .fetch_all(pool)
+    .await?;
+    if alias_rows.len() as i64 > MAX_INGREDIENT_ALIASES_PER_OWNER {
+        return Err(AppError::Validation(
+            "ingredient alias limit exceeded".into(),
+        ));
+    }
+    let mut aliases = std::collections::HashMap::<String, Vec<String>>::new();
+    for (canonical_id, normalized_alias) in alias_rows {
+        aliases
+            .entry(canonical_id)
+            .or_default()
+            .push(normalized_alias);
+    }
     Ok(rows
         .into_iter()
         .map(
@@ -2573,15 +2762,25 @@ async fn load_pantry(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<PantryIt
                 expires_on,
                 canonical_ingredient_id,
                 auto_add_to_shopping_list_when_out,
-            )| PantryItem {
-                id,
-                name,
-                status: PantryStatus::parse(&status),
-                quantity_note,
-                confirmed_at,
-                expires_on,
-                canonical_ingredient_id,
-                auto_add_to_shopping_list_when_out,
+                version,
+            )| {
+                let item_aliases = canonical_ingredient_id
+                    .as_ref()
+                    .and_then(|id| aliases.get(id))
+                    .cloned()
+                    .unwrap_or_default();
+                PantryItem {
+                    id,
+                    name,
+                    status: PantryStatus::parse(&status),
+                    quantity_note,
+                    confirmed_at,
+                    expires_on,
+                    canonical_ingredient_id,
+                    aliases: item_aliases,
+                    auto_add_to_shopping_list_when_out,
+                    version,
+                }
             },
         )
         .collect())
@@ -2781,6 +2980,8 @@ mod tests {
             "sourceUrl": source_url,
             "sourceTitle": "Example soup",
             "sourceAuthor": "Example author",
+            "sourceLicense": "CC-BY-4.0",
+            "sourceAttribution": "Example author — Example soup",
             "title": "Imported soup",
             "description": "Review me",
             "difficulty": 2,
@@ -3228,6 +3429,261 @@ mod tests {
         let recommendations = response_json(response).await;
         assert_eq!(recommendations.as_array().unwrap().len(), 37);
         eprintln!("10k candidate recommendation duration: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn recommendation_marks_active_shopping_membership_by_owner_identity() {
+        let (app, _, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Shopping recommendation owner").await;
+        let other_cookie = login(&app, "Shopping recommendation other").await;
+        let owner_id: String = sqlx::query_scalar(
+            "SELECT id FROM users WHERE display_name = 'Shopping recommendation owner'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let first = create_recipe(&app, &owner_cookie, "private").await;
+        let first_id = first["id"].as_str().unwrap();
+        let canonical_id = first["ingredients"][0]["canonicalIngredientId"]
+            .as_str()
+            .unwrap();
+        let second = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recipes")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!({
+                            "title": "Second water recipe",
+                            "description": "",
+                            "instructions": "",
+                            "visibility": "private",
+                            "ingredients": [{
+                                "name": "Water",
+                                "quantityNote": "",
+                                "canonicalIngredientId": canonical_id
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second = response_json(second).await;
+        for recipe_id in [first_id, second["id"].as_str().unwrap()] {
+            let added = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/recipes/{recipe_id}/shopping-list-items"))
+                        .header("content-type", "application/json")
+                        .header("cookie", &owner_cookie)
+                        .body(Body::from(
+                            json!({
+                                "name": "Water",
+                                "canonicalIngredientId": canonical_id
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!([StatusCode::OK, StatusCode::CREATED].contains(&added.status()));
+        }
+        let shopping = app
+            .clone()
+            .oneshot(
+                Request::get("/api/shopping-list")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let shopping = response_json(shopping).await;
+        assert_eq!(shopping.as_array().unwrap().len(), 1);
+        assert_eq!(shopping[0]["sources"].as_array().unwrap().len(), 2);
+        let canonical_shopping_id = shopping[0]["id"].as_str().unwrap().to_string();
+        let canonical_shopping_version = shopping[0]["version"].as_i64().unwrap();
+
+        sqlx::query(
+            "INSERT INTO recipes
+             (id, owner_id, title, description, instructions, visibility)
+             VALUES ('unresolved-recipe', ?, 'Unresolved herb', '', '', 'private')",
+        )
+        .bind(&owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO recipe_ingredients
+             (id, recipe_id, name, normalized_name, quantity_note, sort_order)
+             VALUES ('unresolved-ingredient', 'unresolved-recipe', 'Mystery leaf',
+                     'mystery leaf', '', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shopping_items
+             (id, owner_id, name, normalized_name, canonical_ingredient_id,
+              completed_at, created_at, updated_at)
+             VALUES ('unresolved-shopping', ?, 'Mystery leaf', 'mystery leaf',
+                     NULL, NULL, 0, 0)",
+        )
+        .bind(&owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shopping_item_sources
+             (id, item_id, source_type, recipe_id, label, created_at)
+             VALUES ('unresolved-source', 'unresolved-shopping', 'manual', NULL, '', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let recommendations = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let recommendations = response_json(recommendations).await;
+        let water = recommendations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == first["id"])
+            .unwrap();
+        assert_eq!(water["inShoppingList"], json!(["water"]));
+        let unresolved = recommendations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == "unresolved-recipe")
+            .unwrap();
+        assert_eq!(unresolved["inShoppingList"], json!(["Mystery leaf"]));
+
+        let purchase = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/shopping-list/{canonical_shopping_id}/purchase"
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &owner_cookie)
+                .header(
+                    "idempotency-key",
+                    format!(
+                        "{}.recommendation-membership-purchase",
+                        Utc::now().timestamp()
+                    ),
+                )
+                .body(Body::from(
+                    json!({
+                        "disposition": "remove",
+                        "shoppingExpectedVersion": canonical_shopping_version,
+                        "pantryItemId": null,
+                        "createUsingCurrentName": true,
+                        "pantryExpectedVersion": null,
+                        "expiresOn": null,
+                        "quantityNote": "",
+                        "autoAddToShoppingListWhenOut": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let purchase_status = purchase.status();
+        let purchase = response_json(purchase).await;
+        assert_eq!(purchase_status, StatusCode::OK, "{purchase}");
+        let after_purchase = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let after_purchase = response_json(after_purchase).await;
+        let water_after_purchase = after_purchase
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == first["id"])
+            .unwrap();
+        assert_eq!(water_after_purchase["status"], "READY");
+        assert_eq!(water_after_purchase["inShoppingList"], json!([]));
+
+        let undo = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/shopping-list/purchases/{}/undo",
+                    purchase["purchaseActionId"].as_str().unwrap()
+                ))
+                .header("cookie", &owner_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(undo.status(), StatusCode::OK);
+        let after_undo = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let after_undo = response_json(after_undo).await;
+        let water_after_undo = after_undo
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == first["id"])
+            .unwrap();
+        assert_eq!(water_after_undo["status"], "SHOP");
+        assert_eq!(water_after_undo["inShoppingList"], json!(["water"]));
+
+        let other_recipe = create_recipe(&app, &other_cookie, "private").await;
+        let other_recommendations = app
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", other_cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let other_recommendations = response_json(other_recommendations).await;
+        let other_result = other_recommendations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["recipe"]["id"] == other_recipe["id"])
+            .unwrap();
+        assert_eq!(other_result["inShoppingList"], json!([]));
     }
 
     #[tokio::test]
@@ -3698,6 +4154,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ai_capabilities_accepts_any_valid_token_without_exposing_account_data() {
+        let (app, _, pool) = app_with_runtime().await;
+        let cookie = login(&app, "Capability owner").await;
+        let created = create_import_token(&app, &cookie).await;
+        let secret = created["secret"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ai/capabilities")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["prefix"], created["token"]["prefix"]);
+        assert_eq!(body["scopes"], json!(["recipes:import"]));
+        assert_eq!(body["preset"], "import");
+        assert!(body["expiresAt"].as_str().is_some());
+        assert!(body.get("id").is_none());
+        assert!(body.get("ownerId").is_none());
+        assert!(body.get("email").is_none());
+        assert!(!body.to_string().contains(secret));
+
+        let audit = sqlx::query(
+            "SELECT action, token_prefix FROM ai_token_audit_events
+             WHERE token_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(created["token"]["id"].as_str().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.get::<String, _>("action"), "token.capabilities");
+        assert_eq!(
+            audit.get::<String, _>("token_prefix"),
+            created["token"]["prefix"].as_str().unwrap()
+        );
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ai/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let revoked = app
+            .clone()
+            .oneshot(
+                Request::delete(format!(
+                    "/api/settings/import-tokens/{}",
+                    created["token"]["id"].as_str().unwrap()
+                ))
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ai/capabilities")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let expired = create_manage_token(&app, &cookie).await;
+        sqlx::query("UPDATE import_tokens SET expires_at = ? WHERE id = ?")
+            .bind(Utc::now().timestamp() - 1)
+            .bind(expired["token"]["id"].as_str().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let expired_response = app
+            .oneshot(
+                Request::get("/api/ai/capabilities")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", expired["secret"].as_str().unwrap()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn scoped_ai_recipe_access_is_idempotent_owner_scoped_and_versioned() {
         let app = build_app(Config::test()).await.unwrap();
         let owner_cookie = login(&app, "Owner").await;
@@ -3726,6 +4282,11 @@ mod tests {
             "title": "AI private soup",
             "description": "Private",
             "instructions": "Stir.",
+            "sourceUrl": "https://example.test/recipes/soup",
+            "sourceTitle": "Source soup",
+            "sourceAuthor": "Example author",
+            "sourceLicense": "CC-BY-4.0",
+            "sourceAttribution": "Example author — Source soup",
             "ingredients": [{"name": "water", "quantityNote": "1 cup"}]
         });
         let create_once = |key: &'static str| {
@@ -3743,6 +4304,11 @@ mod tests {
         let first = response_json(first).await;
         assert_eq!(first["visibility"], "private");
         assert_eq!(first["version"], 1);
+        assert_eq!(first["source"]["license"], "CC-BY-4.0");
+        assert_eq!(
+            first["source"]["attribution"],
+            "Example author — Source soup"
+        );
         let recipe_id = first["id"].as_str().unwrap();
         let replay = create_once("test-create-0001").await.unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
@@ -3780,6 +4346,11 @@ mod tests {
             "title": "Updated private soup",
             "description": "Private",
             "instructions": "Stir twice.",
+            "sourceUrl": "https://example.test/recipes/soup-v2",
+            "sourceTitle": "Source soup, revised",
+            "sourceAuthor": "Example author",
+            "sourceLicense": "CC-BY-4.0",
+            "sourceAttribution": "Example author — Source soup, revised",
             "ingredients": [{"name": "water", "quantityNote": "2 cups"}],
             "expectedVersion": 1
         });
@@ -3798,6 +4369,10 @@ mod tests {
         let update = response_json(update).await;
         assert_eq!(update["status"], "updated");
         assert_eq!(update["recipe"]["version"], 2);
+        assert_eq!(
+            update["recipe"]["source"]["url"],
+            "https://example.test/recipes/soup-v2"
+        );
 
         let stale = app
             .clone()
@@ -4205,6 +4780,11 @@ mod tests {
             "instructions": "Stir carefully.",
             "difficulty": 4,
             "estimatedCalories": 1200,
+            "sourceUrl": "https://example.test/public-soup",
+            "sourceTitle": "Public soup source",
+            "sourceAuthor": "Source author",
+            "sourceLicense": "CC-BY-4.0",
+            "sourceAttribution": "Source author — Public soup source",
             "ingredients": [{"name": "water", "quantityNote": "3 cups"}],
             "expectedVersion": created["version"]
         });
@@ -4224,6 +4804,7 @@ mod tests {
         assert_eq!(pending["status"], "pendingReview");
         assert_eq!(pending["revision"]["difficulty"], 4);
         assert_eq!(pending["revision"]["estimatedCalories"], 1200);
+        assert_eq!(pending["revision"]["sourceLicense"], "CC-BY-4.0");
         let revision_id = pending["revision"]["id"].as_str().unwrap();
 
         let live = app
@@ -4253,6 +4834,11 @@ mod tests {
         assert_eq!(accepted["title"], "Reviewed public soup");
         assert_eq!(accepted["difficulty"], 4);
         assert_eq!(accepted["estimatedCalories"], 1200);
+        assert_eq!(
+            accepted["source"]["url"],
+            "https://example.test/public-soup"
+        );
+        assert_eq!(accepted["source"]["license"], "CC-BY-4.0");
         assert_eq!(accepted["version"], 2);
         assert_eq!(accepted["visibility"], "public");
 
@@ -4629,6 +5215,7 @@ mod tests {
         let draft_id = draft["id"].as_str().unwrap();
         assert_eq!(draft["difficulty"], 2);
         assert_eq!(draft["estimatedCalories"], 450);
+        assert_eq!(draft["sourceLicense"], "CC-BY-4.0");
 
         let other = app
             .clone()
@@ -4667,6 +5254,11 @@ mod tests {
         let recipe = response_json(accept).await;
         assert_eq!(recipe["visibility"], "private");
         assert_eq!(recipe["source"]["url"], "https://example.test/soup");
+        assert_eq!(recipe["source"]["license"], "CC-BY-4.0");
+        assert_eq!(
+            recipe["source"]["attribution"],
+            "Example author — Example soup"
+        );
         assert_eq!(recipe["source"]["warnings"][0], "Timing was inferred.");
         assert_eq!(recipe["difficulty"], 2);
         assert_eq!(recipe["estimatedCalories"], 450);
@@ -5421,6 +6013,7 @@ mod tests {
         let other_cookie = login(&app, "Other").await;
         let pantry = app
             .clone()
+            .clone()
             .oneshot(
                 Request::put("/api/pantry")
                     .header("content-type", "application/json")
@@ -5497,6 +6090,9 @@ mod tests {
         assert_eq!(list[0]["name"], "milk");
         assert_eq!(list[0]["automatic"], true);
         assert_eq!(list[0]["pantryItemId"], milk_id);
+        let shopping_id = list[0]["id"].as_str().unwrap().to_string();
+        let shopping_version = list[0]["version"].as_i64().unwrap();
+        let pantry_version = milk["version"].as_i64().unwrap();
         assert_eq!(list[0]["sources"].as_array().unwrap().len(), 2);
         assert!(list[0]["sources"]
             .as_array()
@@ -5523,34 +6119,78 @@ mod tests {
         let cross_account = app
             .clone()
             .oneshot(
-                Request::post(format!("/api/shopping-list/automatic/{milk_id}/purchased"))
+                Request::post(format!("/api/shopping-list/{shopping_id}/purchase"))
                     .header("cookie", &other_cookie)
-                    .body(Body::empty())
+                    .header("content-type", "application/json")
+                    .header(
+                        "idempotency-key",
+                        format!("{}.cross-account", Utc::now().timestamp()),
+                    )
+                    .body(Body::from(
+                        json!({
+                            "disposition": "remove",
+                            "shoppingExpectedVersion": shopping_version,
+                            "pantryItemId": milk_id,
+                            "pantryExpectedVersion": pantry_version,
+                            "expiresOn": null,
+                            "quantityNote": "",
+                            "autoAddToShoppingListWhenOut": true
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(cross_account.status(), StatusCode::NOT_FOUND);
 
+        let purchase_key = format!("{}.purchase", Utc::now().timestamp());
+        let purchase_body = json!({
+            "disposition": "remove",
+            "shoppingExpectedVersion": shopping_version,
+            "pantryItemId": milk_id,
+            "pantryExpectedVersion": pantry_version,
+            "expiresOn": null,
+            "quantityNote": "",
+            "autoAddToShoppingListWhenOut": true
+        })
+        .to_string();
         let purchased = app
             .clone()
             .oneshot(
-                Request::post(format!("/api/shopping-list/automatic/{milk_id}/purchased"))
+                Request::post(format!("/api/shopping-list/{shopping_id}/purchase"))
                     .header("cookie", &owner_cookie)
-                    .body(Body::empty())
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", &purchase_key)
+                    .body(Body::from(purchase_body.clone()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(purchased.status(), StatusCode::OK);
         let purchased = response_json(purchased).await;
-        assert_eq!(purchased.as_array().unwrap().len(), 1);
-        assert_eq!(purchased[0]["automatic"], false);
-        assert!(purchased[0]["completedAt"].is_string());
+        assert!(purchased["shoppingItems"].as_array().unwrap().is_empty());
+        assert!(purchased["purchaseActionId"].is_string());
+        let action_id = purchased["purchaseActionId"].as_str().unwrap();
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/{shopping_id}/purchase"))
+                    .header("cookie", &owner_cookie)
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", &purchase_key)
+                    .body(Body::from(purchase_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["purchaseActionId"], action_id);
         let pantry = app
+            .clone()
             .oneshot(
                 Request::get("/api/pantry")
-                    .header("cookie", owner_cookie)
+                    .header("cookie", &owner_cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5566,6 +6206,283 @@ mod tests {
         assert_eq!(milk["status"], "have");
         assert!(milk["confirmedAt"].is_string());
         assert_eq!(milk["autoAddToShoppingListWhenOut"], true);
+        let undo = app
+            .oneshot(
+                Request::post(format!("/api/shopping-list/purchases/{action_id}/undo"))
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(undo.status(), StatusCode::OK);
+        let restored = response_json(undo).await;
+        assert_eq!(restored.as_array().unwrap().len(), 1);
+        assert_eq!(restored[0]["sources"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shopping_purchase_handles_automatic_keep_cross_item_keys_and_undo_identity_conflicts()
+    {
+        let app = build_app(Config::test()).await.unwrap();
+        let cookie = login(&app, "Owner").await;
+        let pantry_response = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!([{
+                            "name": "Milk",
+                            "status": "out",
+                            "quantityNote": "",
+                            "autoAddToShoppingListWhenOut": true
+                        }])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pantry_response = response_json(pantry_response).await;
+        let pantry_id = pantry_response[0]["id"].as_str().unwrap();
+        let pantry_canonical_id = pantry_response[0]["canonicalIngredientId"]
+            .as_str()
+            .unwrap();
+        let pantry_version = pantry_response[0]["version"].as_i64().unwrap();
+        let list = app
+            .clone()
+            .oneshot(
+                Request::get("/api/shopping-list")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list = response_json(list).await;
+        let automatic_id = list[0]["id"].as_str().unwrap();
+        let kept = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/{automatic_id}/purchase"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header(
+                        "idempotency-key",
+                        format!("{}.automatic-keep", Utc::now().timestamp()),
+                    )
+                    .body(Body::from(
+                        json!({
+                            "disposition": "keep",
+                            "shoppingExpectedVersion": list[0]["version"],
+                            "pantryItemId": pantry_id,
+                            "pantryExpectedVersion": pantry_version,
+                            "expiresOn": null,
+                            "quantityNote": "",
+                            "autoAddToShoppingListWhenOut": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept.status(), StatusCode::OK);
+        let kept = response_json(kept).await;
+        assert_eq!(kept["pantry"]["status"], "have");
+        assert_eq!(kept["shoppingItems"].as_array().unwrap().len(), 1);
+        assert_eq!(kept["shoppingItems"][0]["sources"][0]["kind"], "manual");
+        let keep_action = kept["purchaseActionId"].as_str().unwrap();
+        let undo_keep = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/purchases/{keep_action}/undo"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(undo_keep.status(), StatusCode::OK);
+        let undo_keep = response_json(undo_keep).await;
+        assert_eq!(undo_keep.as_array().unwrap().len(), 1);
+        assert!(undo_keep[0]["id"].as_str().unwrap().starts_with("auto:"));
+
+        let manual_milk = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        json!({
+                            "name": "Milk",
+                            "canonicalIngredientId": pantry_canonical_id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manual_milk.status(), StatusCode::CREATED);
+        let stale_keep = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/{automatic_id}/purchase"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header(
+                        "idempotency-key",
+                        format!("{}.stale-automatic-keep", Utc::now().timestamp()),
+                    )
+                    .body(Body::from(
+                        json!({
+                            "disposition": "keep",
+                            "shoppingExpectedVersion": list[0]["version"],
+                            "pantryItemId": pantry_id,
+                            "pantryExpectedVersion": pantry_version,
+                            "expiresOn": null,
+                            "quantityNote": "",
+                            "autoAddToShoppingListWhenOut": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_keep.status(), StatusCode::OK);
+        let stale_keep = response_json(stale_keep).await;
+        let stale_action = stale_keep["purchaseActionId"].as_str().unwrap();
+        let undo_stale = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/purchases/{stale_action}/undo"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(undo_stale.status(), StatusCode::OK);
+        let undo_stale = response_json(undo_stale).await;
+        assert_eq!(undo_stale.as_array().unwrap().len(), 1);
+        assert!(!undo_stale[0]["id"].as_str().unwrap().starts_with("auto:"));
+        assert!(undo_stale[0]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["kind"] == "manual"));
+
+        for name in ["Apple", "Banana"] {
+            let added = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/shopping-list")
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .body(Body::from(json!({ "name": name }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(added.status(), StatusCode::CREATED);
+        }
+        let list = app
+            .clone()
+            .oneshot(
+                Request::get("/api/shopping-list")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list = response_json(list).await;
+        let apple = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "Apple")
+            .unwrap();
+        let banana = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "Banana")
+            .unwrap();
+        let shared_key = format!("{}.cross-item", Utc::now().timestamp());
+        let shared_body = json!({
+            "disposition": "remove",
+            "shoppingExpectedVersion": 1,
+            "createUsingCurrentName": true,
+            "expiresOn": null,
+            "quantityNote": "",
+            "autoAddToShoppingListWhenOut": false
+        })
+        .to_string();
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/shopping-list/{}/purchase",
+                    apple["id"].as_str().unwrap()
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .header("idempotency-key", &shared_key)
+                .body(Body::from(shared_body.clone()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let cross_item = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/shopping-list/{}/purchase",
+                    banana["id"].as_str().unwrap()
+                ))
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .header("idempotency-key", &shared_key)
+                .body(Body::from(shared_body))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_item.status(), StatusCode::CONFLICT);
+
+        let apple_action = response_json(first).await["purchaseActionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let readded = app
+            .clone()
+            .oneshot(
+                Request::post("/api/shopping-list")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(json!({ "name": "Apple" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readded.status(), StatusCode::CREATED);
+        let undo_conflict = app
+            .oneshot(
+                Request::post(format!("/api/shopping-list/purchases/{apple_action}/undo"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(undo_conflict.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -5612,9 +6529,10 @@ mod tests {
         assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
 
         let list = app
+            .clone()
             .oneshot(
                 Request::get("/api/shopping-list")
-                    .header("cookie", cookie)
+                    .header("cookie", &cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5638,6 +6556,45 @@ mod tests {
             .unwrap();
         assert_eq!(water["sources"][0]["kind"], "recipe");
         assert_eq!(water["sources"][0]["recipeId"], recipe_id);
+        let water_id = water["id"].as_str().unwrap();
+        let water_version = water["version"].as_i64().unwrap();
+        let partial = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/shopping-list/{water_id}/purchase"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header(
+                        "idempotency-key",
+                        format!("{}.recipe-partial", Utc::now().timestamp()),
+                    )
+                    .body(Body::from(
+                        json!({
+                            "disposition": "keep",
+                            "shoppingExpectedVersion": water_version,
+                            "createUsingCurrentName": true,
+                            "expiresOn": "2026-11-07",
+                            "quantityNote": "one pack",
+                            "autoAddToShoppingListWhenOut": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::OK);
+        let partial = response_json(partial).await;
+        assert_eq!(partial["pantry"]["status"], "have");
+        assert_eq!(partial["pantry"]["expiresOn"], "2026-11-07");
+        assert_eq!(partial["pantry"]["quantityNote"], "one pack");
+        let kept = partial["shoppingItems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == water_id)
+            .unwrap();
+        assert_eq!(kept["sources"][0]["kind"], "recipe");
     }
 
     #[tokio::test]

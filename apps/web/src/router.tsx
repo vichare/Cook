@@ -176,16 +176,9 @@ function Root() {
         <Link to="/" className="brand">
           Cook
         </Link>
-        <nav aria-label={t('app.primaryNavigation')}>
-          <Link to="/recommendations">{t('app.recommend')}</Link>
-          <Link to="/recipes">{t('app.recipes')}</Link>
-          <Link to="/pantry">{t('app.pantry')}</Link>
-          <Link to="/shopping-list">{t('app.shopping')}</Link>
-          <Link to="/imports">{t('app.imports')}</Link>
-          <Link to="/settings">{t('app.settings')}</Link>
-        </nav>
+        <PrimaryNavigation />
         <button
-          className="button ghost"
+          className="button ghost desktop-sign-out"
           onClick={() =>
             void api.logout().then(() => queryClient.setQueryData(['me'], undefined)).finally(() => location.reload())
           }
@@ -198,6 +191,73 @@ function Root() {
       </main>
       {me.data && !me.data.onboardingCompleted && <ProfileSetup user={me.data} />}
     </div>
+  )
+}
+
+const primaryDestinations = [
+  ['/recommendations', 'app.recommend'],
+  ['/recipes', 'app.recipes'],
+  ['/pantry', 'app.pantry'],
+  ['/shopping-list', 'app.shopping'],
+  ['/imports', 'app.imports'],
+  ['/settings', 'app.settings'],
+] as const
+
+export function PrimaryNavigation() {
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const [open, setOpen] = useState(false)
+  useEffect(() => {
+    if (!window.matchMedia) return
+    const media = window.matchMedia('(min-width: 761px)')
+    const closeOnDesktop = (event: MediaQueryListEvent | MediaQueryList) => {
+      if (event.matches) setOpen(false)
+    }
+    closeOnDesktop(media)
+    media.addEventListener('change', closeOnDesktop)
+    return () => media.removeEventListener('change', closeOnDesktop)
+  }, [])
+  const signOut = () =>
+    void api.logout().then(() => queryClient.setQueryData(['me'], undefined)).finally(() => location.reload())
+  return (
+    <>
+      <nav className="desktop-nav" aria-label={t('app.primaryNavigation')}>
+        {primaryDestinations.map(([to, key]) => (
+          <Link key={to} to={to}>{t(key)}</Link>
+        ))}
+      </nav>
+      <Dialog.Root open={open} onOpenChange={setOpen}>
+        <Dialog.Trigger asChild>
+          <button type="button" className="button ghost mobile-menu-trigger">
+            {t('app.menu')}
+          </button>
+        </Dialog.Trigger>
+        <Dialog.Portal>
+          <Dialog.Overlay className="mobile-nav-overlay" />
+          <Dialog.Content className="mobile-nav-dialog">
+            <div className="mobile-nav-heading">
+              <Dialog.Title>{t('app.menu')}</Dialog.Title>
+              <Dialog.Close asChild>
+                <button type="button" className="button ghost" aria-label={t('app.closeMenu')}>
+                  ×
+                </button>
+              </Dialog.Close>
+            </div>
+            <Dialog.Description className="sr-only">
+              {t('app.menuDescription')}
+            </Dialog.Description>
+            <nav aria-label={t('app.primaryNavigation')}>
+              {primaryDestinations.map(([to, key]) => (
+                <Link key={to} to={to} onClick={() => setOpen(false)}>{t(key)}</Link>
+              ))}
+            </nav>
+            <button type="button" className="button ghost mobile-sign-out" onClick={signOut}>
+              {t('app.signOut')}
+            </button>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+    </>
   )
 }
 
@@ -412,7 +472,7 @@ function HomePage() {
   )
 }
 
-function RecommendationsPage() {
+export function RecommendationsPage() {
   const { formatDate, formatNumber, t } = useI18n()
   const queryClient = useQueryClient()
   const [filters, setFilters] = useState({
@@ -437,15 +497,47 @@ function RecommendationsPage() {
     [recommendations.data],
   )
   const [confirmOpen, setConfirmOpen] = useState(false)
+  const shoppingAddInFlight = useRef(new Set<string>())
+  const [pendingShoppingIdentity, setPendingShoppingIdentity] = useState<string | null>(null)
+  const [shoppingNotice, setShoppingNotice] = useState<{ id: number; name: string } | null>(null)
+  const shoppingNoticeSequence = useRef(0)
   const addShopping = useMutation({
     mutationFn: ({
       recipeId,
       ingredient,
+      identity,
     }: {
       recipeId: string
       ingredient: IngredientReference
-    }) => api.addRecipeIngredientToShopping(recipeId, ingredient),
-    onSuccess: (items) => queryClient.setQueryData(['shopping-list'], items),
+      identity: string
+    }) => api.addRecipeIngredientToShopping(recipeId, ingredient).then((items) => ({
+      items,
+      identity,
+      name: ingredient.name,
+    })),
+    onSuccess: ({ items, identity, name }) => {
+      queryClient.setQueryData(['shopping-list'], items)
+      queryClient.setQueriesData<Recommendation[]>({ queryKey: ['recommendations'] }, (current) =>
+        current?.map((recommendation) => {
+          const names = recommendation.recipe.ingredients
+            .filter((ingredient) =>
+              ingredientIdentity(ingredient) === identity
+              && recommendation.missing.some(
+                (missing) => normalizeIngredient(missing) === normalizeIngredient(ingredient.name),
+              ))
+            .map((ingredient) => ingredient.name)
+          return names.length === 0 ? recommendation : {
+            ...recommendation,
+            inShoppingList: [...new Set([...recommendation.inShoppingList, ...names])],
+          }
+        }),
+      )
+      setShoppingNotice({ id: ++shoppingNoticeSequence.current, name })
+    },
+    onSettled: (_data, _error, variables) => {
+      shoppingAddInFlight.current.delete(variables.identity)
+      setPendingShoppingIdentity((current) => current === variables.identity ? null : current)
+    },
   })
 
   return (
@@ -509,61 +601,100 @@ function RecommendationsPage() {
                   {t('recommend.details')}
                 </Link>
               </div>
-              <RecipeMetadata
-                difficulty={result.recipe.difficulty}
-                estimatedCalories={result.recipe.estimatedCalories}
-                formatNumber={formatNumber}
-                t={t}
-              />
-              <p>
-                {result.reasonDetails
-                  .map((reason) => recommendationReasonLabel(reason, t, formatDate, formatNumber))
-                  .join(' · ')}
-              </p>
-              <p>{t('recommend.sourceSummary', {
+              {(result.recipe.coverImage || result.recipe.description) && (
+                <div className="recommendation-preview">
+                  {result.recipe.coverImage && (
+                    <img
+                      src={result.recipe.coverImage.url}
+                      alt={result.recipe.coverImage.altText ?? ''}
+                    />
+                  )}
+                  {result.recipe.description && (
+                    <div className="recommendation-description">
+                      <SafeMarkdown value={result.recipe.description} />
+                    </div>
+                  )}
+                </div>
+              )}
+              <span className="recommendation-source-chip">{t('recommend.sourceSummary', {
                 source: recommendationSourceLabel(result.primarySource, t),
-              })}</p>
+              })}</span>
               <IngredientSummary label={t('recommend.available')} items={result.available} />
               <IngredientSummary label={t('recommend.verify')} items={result.verify} />
-              <IngredientSummary label={t('recommend.missing')} items={result.missing} />
-              <ul className="plain-list" aria-label={t('recommend.ingredientReasons')}>
-                {result.ingredientReasons.map((reason) => (
-                  <li key={`${reason.ingredient}-${reason.code}`}>
-                    {recommendationIngredientReasonLabel(reason, t, formatDate)}
-                  </li>
-                ))}
-              </ul>
               {result.missing.length > 0 && (
-                <div className="form-actions" aria-label={t('shopping.addMissingGroup')}>
-                  {result.missing.map((name) => {
-                    const ingredient = result.recipe.ingredients.find(
-                      (candidate) => normalizeIngredient(candidate.name) === normalizeIngredient(name),
-                    )
-                    return (
-                      <button
-                        type="button"
-                        className="button ghost"
-                        key={name}
-                        disabled={addShopping.isPending}
-                        onClick={() => {
-                          if (!window.confirm(t('shopping.addMissingConfirm', { name }))) return
-                          addShopping.mutate({
-                            recipeId: result.recipe.id,
-                            ingredient: {
-                              name,
-                              canonicalIngredientId: ingredient?.canonicalIngredientId ?? null,
-                            },
-                          })
-                        }}
-                      >
-                        {t('shopping.addMissing', { name })}
-                      </button>
-                    )
-                  })}
+                <div className="ingredient-summary" aria-label={t('recommend.missing')}>
+                  <strong>{t('recommend.missing')}</strong>
+                  <ul className="ingredient-summary-list">
+                    {result.missing.map((name) => {
+                      const ingredient = result.recipe.ingredients.find(
+                        (candidate) => normalizeIngredient(candidate.name) === normalizeIngredient(name),
+                      )
+                      const reference = {
+                        name,
+                        canonicalIngredientId: ingredient?.canonicalIngredientId ?? null,
+                      }
+                      const identity = ingredientIdentity(reference)
+                      const inShoppingList = result.inShoppingList.some(
+                        (candidate) => normalizeIngredient(candidate) === normalizeIngredient(name),
+                      )
+                      return (
+                        <li key={name}>
+                          <span>{name}</span>
+                          {inShoppingList ? (
+                            <span className="shopping-membership-status">
+                              <span className="sr-only">{t('shopping.inList', { name })}</span>
+                              <span aria-hidden="true">{t('shopping.inListShort')}</span>
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              className="button ghost"
+                              disabled={pendingShoppingIdentity === identity}
+                              aria-label={pendingShoppingIdentity === identity
+                                ? t('shopping.addingMissing', { name })
+                                : t('shopping.addMissing', { name })}
+                              onClick={() => {
+                                if (shoppingAddInFlight.current.has(identity)) return
+                                shoppingAddInFlight.current.add(identity)
+                                setPendingShoppingIdentity(identity)
+                                addShopping.mutate({
+                                  recipeId: result.recipe.id,
+                                  ingredient: reference,
+                                  identity,
+                                })
+                              }}
+                            >
+                              {pendingShoppingIdentity === identity
+                                ? t('shopping.addingMissing', { name })
+                                : t('shopping.addMissingShort')}
+                            </button>
+                          )}
+                        </li>
+                      )
+                    })}
+                  </ul>
                 </div>
               )}
               <details>
                 <summary>{t('recommend.scoreDetails')}</summary>
+                <RecipeMetadata
+                  difficulty={result.recipe.difficulty}
+                  estimatedCalories={result.recipe.estimatedCalories}
+                  formatNumber={formatNumber}
+                  t={t}
+                />
+                <p>
+                  {result.reasonDetails
+                    .map((reason) => recommendationReasonLabel(reason, t, formatDate, formatNumber))
+                    .join(' · ')}
+                </p>
+                <ul className="plain-list" aria-label={t('recommend.ingredientReasons')}>
+                  {result.ingredientReasons.map((reason) => (
+                    <li key={`${reason.ingredient}-${reason.code}`}>
+                      {recommendationIngredientReasonLabel(reason, t, formatDate)}
+                    </li>
+                  ))}
+                </ul>
                 <p>{t('recommend.matchedSources', {
                   sources: result.matchedSources.map((source) => recommendationSourceLabel(source, t)).join(', '),
                 })}</p>
@@ -576,9 +707,21 @@ function RecommendationsPage() {
           })}
         </div>
       </QueryState>
+      {shoppingNotice && (
+        <p key={shoppingNotice.id} role="status" aria-live="polite">
+          {t('shopping.addedMissing', { name: shoppingNotice.name })}
+        </p>
+      )}
+      {addShopping.error && <ErrorText error={addShopping.error} />}
       <PantryConfirmation open={confirmOpen} onOpenChange={setConfirmOpen} names={verifyNames} />
     </Page>
   )
+}
+
+function ingredientIdentity(ingredient: IngredientReference): string {
+  return ingredient.canonicalIngredientId
+    ? `c:${ingredient.canonicalIngredientId}`
+    : `n:${normalizeIngredient(ingredient.name)}`
 }
 
 function IngredientFilterInput({
@@ -872,11 +1015,22 @@ function RecipeDetailPage() {
             {recipe.data.source && (
               <aside className="source-note">
                 <strong>{t('recipe.importedSource')}</strong>
-                <a href={recipe.data.source.url} rel="noreferrer">
-                  {recipe.data.source.title ?? recipe.data.source.url}
-                </a>
+                {recipe.data.source.url ? (
+                  <a href={recipe.data.source.url} rel="noreferrer">
+                    {recipe.data.source.title ?? recipe.data.source.url}
+                  </a>
+                ) : (
+                  recipe.data.source.title && <span>{recipe.data.source.title}</span>
+                )}
                 {recipe.data.source.author && (
                   <span>{t('recipe.sourceBy', { author: recipe.data.source.author })}</span>
+                )}
+                {recipe.data.source.attribution && <p>{recipe.data.source.attribution}</p>}
+                {recipe.data.source.license && (
+                  <p>{t('recipe.sourceLicenseValue', { license: recipe.data.source.license })}</p>
+                )}
+                {(recipe.data.source.license || recipe.data.source.attribution) && (
+                  <small>{t('recipe.sourceLicenseUnverified')}</small>
                 )}
                 {recipe.data.source.warnings.map((warning) => (
                   <p key={warning}>{warning}</p>
@@ -885,13 +1039,7 @@ function RecipeDetailPage() {
             )}
             {recipe.data.description && <SafeMarkdown value={recipe.data.description} />}
             <h2>{t('recipe.ingredients')}</h2>
-            <ul>
-              {recipe.data.ingredients.map((ingredient, index) => (
-                <li key={`${ingredient.name}-${index}`}>
-                  {ingredient.name} {ingredient.quantityNote && <span>— {ingredient.quantityNote}</span>}
-                </li>
-              ))}
-            </ul>
+            <RecipeIngredientList ingredients={recipe.data.ingredients} />
             <h2>{t('recipe.method')}</h2>
             {recipe.data.instructions ? (
               <SafeMarkdown value={recipe.data.instructions} />
@@ -985,6 +1133,28 @@ function RevisionReview({ recipeId }: { recipeId: string }) {
             formatNumber={formatNumber}
             t={t}
           />
+          {(revision.sourceUrl
+            || revision.sourceTitle
+            || revision.sourceAuthor
+            || revision.sourceLicense
+            || revision.sourceAttribution) && (
+            <div className="source-note">
+              <strong>{t('recipe.sourceDetails')}</strong>
+              {revision.sourceUrl ? (
+                <a href={revision.sourceUrl} rel="noreferrer">
+                  {revision.sourceTitle ?? revision.sourceUrl}
+                </a>
+              ) : revision.sourceTitle ? <span>{revision.sourceTitle}</span> : null}
+              {revision.sourceAuthor && (
+                <span>{t('recipe.sourceBy', { author: revision.sourceAuthor })}</span>
+              )}
+              {revision.sourceAttribution && <p>{revision.sourceAttribution}</p>}
+              {revision.sourceLicense && (
+                <p>{t('recipe.sourceLicenseValue', { license: revision.sourceLicense })}</p>
+              )}
+              <small>{t('recipe.sourceLicenseUnverified')}</small>
+            </div>
+          )}
           <p>{t('recipe.revisionImageAction', {
             action: t(
               revision.imageAction === 'replace'
@@ -1014,11 +1184,7 @@ function RevisionReview({ recipeId }: { recipeId: string }) {
           <details>
             <summary>{t('recipe.reviewRevision')}</summary>
             <h4>{t('recipe.ingredients')}</h4>
-            <ul>
-              {revision.ingredients.map((ingredient, index) => (
-                <li key={`${ingredient.name}-${index}`}>{ingredient.name} {ingredient.quantityNote}</li>
-              ))}
-            </ul>
+            <RecipeIngredientList ingredients={revision.ingredients} />
             <h4>{t('recipe.method')}</h4>
             <SafeMarkdown value={revision.instructions} />
           </details>
@@ -1066,14 +1232,35 @@ function EditRecipePage() {
   )
 }
 
-function recipeSchema(t: Translate) {
+export function recipeSchema(t: Translate) {
   return z.object({
   title: z.string().trim().min(1, t('recipe.titleRequired')),
   description: z.string(),
   instructions: z.string(),
   visibility: z.enum(['private', 'public']),
-  difficulty: z.number().int().min(1).max(5).nullable(),
-  estimatedCalories: z.number().int().min(1).max(100000).nullable(),
+  difficulty: z.custom<number | null>(
+    (value) => value === null
+      || (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 5),
+    t('recipe.difficultyInvalid'),
+  ),
+  estimatedCalories: z.custom<number | null>(
+    (value) => value === null
+      || (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 100000),
+    t('recipe.estimatedCaloriesInvalid'),
+  ),
+  sourceUrl: z.string().max(2048).refine((value) => {
+    if (!value.trim()) return true
+    try {
+      const url = new URL(value)
+      return (url.protocol === 'http:' || url.protocol === 'https:') && Boolean(url.hostname)
+    } catch {
+      return false
+    }
+  }, t('recipe.sourceUrlInvalid')),
+  sourceTitle: z.string().max(200),
+  sourceAuthor: z.string().max(200),
+  sourceLicense: z.string().max(200),
+  sourceAttribution: z.string().max(1000),
   ingredients: z.array(z.object({
     name: z.string().trim().min(1, t('recipe.ingredientRequired')),
     quantityNote: z.string(),
@@ -1123,6 +1310,64 @@ function RecipeMetadata({
   )
 }
 
+export function pantryStatusForIngredient(
+  ingredient: Recipe['ingredients'][number],
+  pantry: PantryItem[],
+): 'available' | 'out' | 'unsure' | 'verify' | null {
+  const normalized = normalizeIngredient(ingredient.name)
+  const item = pantry.find((candidate) => {
+    if (ingredient.canonicalIngredientId) {
+      return candidate.canonicalIngredientId === ingredient.canonicalIngredientId
+    }
+    return normalizeIngredient(candidate.name) === normalized
+      || candidate.aliases?.includes(normalized) === true
+  })
+  if (!item) return null
+  if (item.status === 'out') return 'out'
+  if (item.status === 'unknown') return 'unsure'
+  if (item.expiresOn && item.expiresOn <= localDateValue(new Date())) return 'verify'
+  return 'available'
+}
+
+export function RecipeIngredientList({ ingredients }: { ingredients: Recipe['ingredients'] }) {
+  const { t } = useI18n()
+  const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
+  return (
+    <ul className="recipe-ingredient-list">
+      {ingredients.map((ingredient, index) => {
+        const status = pantry.data
+          ? pantryStatusForIngredient(ingredient, pantry.data)
+          : null
+        const statusKey = status
+          ? `recipe.pantryStatus.${status}` as
+            | 'recipe.pantryStatus.available'
+            | 'recipe.pantryStatus.out'
+            | 'recipe.pantryStatus.unsure'
+            | 'recipe.pantryStatus.verify'
+          : null
+        return (
+          <li key={`${ingredient.name}-${index}`}>
+            <span>
+              {ingredient.name} {ingredient.quantityNote && <span>— {ingredient.quantityNote}</span>}
+            </span>
+            {statusKey && (
+              <span
+                className={`pantry-status-badge pantry-status-${status}`}
+                aria-label={t('recipe.pantryStatusLabel', {
+                  name: ingredient.name,
+                  status: t(statusKey),
+                })}
+              >
+                {t(statusKey)}
+              </span>
+            )}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
 export function RecipeMetadataFields({ form }: { form: UseFormReturn<RecipeForm> }) {
   const { t } = useI18n()
   return (
@@ -1132,8 +1377,10 @@ export function RecipeMetadataFields({ form }: { form: UseFormReturn<RecipeForm>
         {t('recipe.difficulty')}
         <select
           {...form.register('difficulty', {
-            setValueAs: (value) => (value === '' ? null : Number(value)),
+            setValueAs: (value) => (value == null || value === '' ? null : Number(value)),
           })}
+          aria-invalid={Boolean(form.formState.errors.difficulty)}
+          aria-describedby={form.formState.errors.difficulty ? 'recipe-difficulty-error' : undefined}
         >
           <option value="">{t('recipe.notSet')}</option>
           {[1, 2, 3, 4, 5].map((value) => (
@@ -1142,22 +1389,73 @@ export function RecipeMetadataFields({ form }: { form: UseFormReturn<RecipeForm>
             </option>
           ))}
         </select>
+        <FieldError id="recipe-difficulty-error" message={form.formState.errors.difficulty?.message} />
       </label>
       <label>
         {t('recipe.estimatedCalories')}
         <input
-          type="number"
+          type="text"
           inputMode="numeric"
-          min={1}
-          max={100000}
-          step={1}
           {...form.register('estimatedCalories', {
-            setValueAs: (value) => (value === '' ? null : Number(value)),
+            setValueAs: (value) => {
+              if (value == null) return null
+              const normalized = String(value).trim()
+              if (!normalized) return null
+              return /^\d+$/.test(normalized) ? Number(normalized) : Number.NaN
+            },
           })}
+          aria-invalid={Boolean(form.formState.errors.estimatedCalories)}
+          aria-describedby={
+            form.formState.errors.estimatedCalories
+              ? 'recipe-estimated-calories-error recipe-estimated-calories-help'
+              : 'recipe-estimated-calories-help'
+          }
         />
-        <small>{t('recipe.estimatedCaloriesHelp')}</small>
+        <small id="recipe-estimated-calories-help">{t('recipe.estimatedCaloriesHelp')}</small>
+        <FieldError
+          id="recipe-estimated-calories-error"
+          message={form.formState.errors.estimatedCalories?.message}
+        />
       </label>
     </fieldset>
+  )
+}
+
+export function RecipeProvenanceFields({ form }: { form: UseFormReturn<RecipeForm> }) {
+  const { t } = useI18n()
+  return (
+    <details className="source-note">
+      <summary>{t('recipe.sourceDetails')}</summary>
+      <p>{t('recipe.sourceDetailsHelp')}</p>
+      <label>
+        {t('recipe.sourceUrl')}
+        <input
+          type="url"
+          maxLength={2048}
+          {...form.register('sourceUrl')}
+          aria-invalid={Boolean(form.formState.errors.sourceUrl)}
+          aria-describedby={form.formState.errors.sourceUrl ? 'recipe-source-url-error' : undefined}
+        />
+        <FieldError id="recipe-source-url-error" message={form.formState.errors.sourceUrl?.message} />
+      </label>
+      <label>
+        {t('recipe.sourceTitle')}
+        <input maxLength={200} {...form.register('sourceTitle')} />
+      </label>
+      <label>
+        {t('recipe.sourceAuthor')}
+        <input maxLength={200} {...form.register('sourceAuthor')} />
+      </label>
+      <label>
+        {t('recipe.sourceLicense')}
+        <input maxLength={200} {...form.register('sourceLicense')} />
+      </label>
+      <label>
+        {t('recipe.sourceAttribution')}
+        <textarea rows={3} maxLength={1000} {...form.register('sourceAttribution')} />
+      </label>
+      <small>{t('recipe.sourceLicenseUnverified')}</small>
+    </details>
   )
 }
 
@@ -1178,6 +1476,11 @@ function recipeMatchesForm(recipe: Recipe, value: RecipeForm): boolean {
     && recipe.visibility === value.visibility
     && recipe.difficulty === value.difficulty
     && recipe.estimatedCalories === value.estimatedCalories
+    && (recipe.source?.url ?? '') === value.sourceUrl.trim()
+    && (recipe.source?.title ?? '') === value.sourceTitle.trim()
+    && (recipe.source?.author ?? '') === value.sourceAuthor.trim()
+    && (recipe.source?.license ?? '') === value.sourceLicense.trim()
+    && (recipe.source?.attribution ?? '') === value.sourceAttribution.trim()
     && recipe.ingredients.length === value.ingredients.length
     && recipe.ingredients.every((ingredient, index) => {
       const submitted = value.ingredients[index]
@@ -1284,8 +1587,16 @@ export async function persistRecipeEdit({
   acknowledgeVersion: (version: number) => void
 }): Promise<Recipe> {
   let saved: Recipe
+  const payload = {
+    ...value,
+    sourceUrl: value.sourceUrl.trim() || null,
+    sourceTitle: value.sourceTitle.trim() || null,
+    sourceAuthor: value.sourceAuthor.trim() || null,
+    sourceLicense: value.sourceLicense.trim() || null,
+    sourceAttribution: value.sourceAttribution.trim() || null,
+  }
   if (!recipe) {
-    saved = await api.saveRecipe(value)
+    saved = await api.saveRecipe(payload)
     acknowledgeVersion(saved.version)
   } else {
     const current = await api.recipe(recipe.id)
@@ -1319,7 +1630,7 @@ export async function persistRecipeEdit({
     if (recipeMatchesForm(current, value)) {
       saved = current
     } else {
-      saved = await api.saveRecipe(value, recipe.id, current.version)
+      saved = await api.saveRecipe(payload, recipe.id, current.version)
       acknowledgeVersion(saved.version)
     }
   }
@@ -1364,13 +1675,31 @@ export function RecipeEditorForm({
   }, [coverFile])
   const form = useForm<RecipeForm>({
     resolver: zodResolver(recipeSchema(t)),
-    defaultValues: recipe ?? {
+    defaultValues: recipe ? {
+      title: recipe.title,
+      description: recipe.description,
+      instructions: recipe.instructions,
+      visibility: recipe.visibility,
+      difficulty: recipe.difficulty,
+      estimatedCalories: recipe.estimatedCalories,
+      sourceUrl: recipe.source?.url ?? '',
+      sourceTitle: recipe.source?.title ?? '',
+      sourceAuthor: recipe.source?.author ?? '',
+      sourceLicense: recipe.source?.license ?? '',
+      sourceAttribution: recipe.source?.attribution ?? '',
+      ingredients: recipe.ingredients,
+    } : {
       title: '',
       description: '',
       instructions: '',
       visibility: 'private',
       difficulty: null,
       estimatedCalories: null,
+      sourceUrl: '',
+      sourceTitle: '',
+      sourceAuthor: '',
+      sourceLicense: '',
+      sourceAttribution: '',
       ingredients: [{ name: '', quantityNote: '', canonicalIngredientId: null }],
     },
   })
@@ -1399,6 +1728,8 @@ export function RecipeEditorForm({
     : []
   const validationMessages = [
     form.formState.errors.title?.message,
+    form.formState.errors.difficulty?.message,
+    form.formState.errors.estimatedCalories?.message,
     ...ingredientErrors.map((error, index) =>
       error?.name?.message
         ? t('recipe.ingredientError', { number: index + 1, message: error.name.message })
@@ -1408,6 +1739,7 @@ export function RecipeEditorForm({
   return (
     <form
       className="editor-form"
+      noValidate
       onSubmit={form.handleSubmit(
         (value) => save.mutate(value),
         () => window.requestAnimationFrame(() => errorSummaryRef.current?.focus()),
@@ -1450,6 +1782,7 @@ export function RecipeEditorForm({
         </select>
       </label>
       <RecipeMetadataFields form={form} />
+      <RecipeProvenanceFields form={form} />
       <RecipeCoverFields
         hasImage={Boolean(coverFile || recipe?.coverImage)}
         removed={removeCover}
@@ -1667,6 +2000,23 @@ function PantryPage() {
     autoAddToShoppingListWhenOut: false,
   })
   const [editingName, setEditingName] = useState<string | null>(null)
+  const pantryFormRef = useRef<HTMLFormElement>(null)
+  useEffect(() => {
+    if (!pantry.data || !window.location.hash.startsWith('#pantry-')) return
+    const id = window.location.hash.slice('#pantry-'.length)
+    const item = pantry.data.find((value) => value.id === id)
+    if (!item) return
+    setDraft({
+      name: item.name,
+      status: item.status,
+      quantityNote: item.quantityNote,
+      expiresOn: item.expiresOn,
+      canonicalIngredientId: item.canonicalIngredientId,
+      autoAddToShoppingListWhenOut: item.autoAddToShoppingListWhenOut,
+    })
+    setEditingName(item.name)
+    queueMicrotask(() => pantryFormRef.current?.querySelector<HTMLElement>('input')?.focus())
+  }, [pantry.data])
   const save = useMutation({
     mutationFn: api.savePantry,
     onSuccess: (items) => {
@@ -1678,6 +2028,7 @@ function PantryPage() {
   return (
     <Page title={t('pantry.title')} intro={t('pantry.intro')}>
       <form
+        ref={pantryFormRef}
         className="inline-form pantry-form"
         onSubmit={(event) => {
           event.preventDefault()
@@ -1750,7 +2101,7 @@ function PantryPage() {
       <QueryState query={pantry} empty={t('pantry.empty')}>
         <div className="pantry-table" role="table" aria-label={t('pantry.itemsLabel')}>
           {pantry.data?.map((item) => (
-            <div className="pantry-row" role="row" key={item.id}>
+            <div className="pantry-row" role="row" key={item.id} id={`pantry-${item.id}`}>
               <strong role="cell">{item.name}</strong>
               <span role="cell" className={`status ${item.status === 'have' ? 'ready' : item.status === 'out' ? 'shop' : 'verify'}`}>
                 {pantryStatusLabel(item.status, t)}
@@ -1806,136 +2157,118 @@ export function ShoppingListPage() {
   const queryClient = useQueryClient()
   const shopping = useQuery({ queryKey: ['shopping-list'], queryFn: api.shoppingItems })
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: api.pantry })
-  const [draft, setDraft] = useState<IngredientReference>({
-    name: '',
-    canonicalIngredientId: null,
-  })
+  const [draft, setDraft] = useState<IngredientReference>({ name: '', canonicalIngredientId: null })
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [undoItem, setUndoItem] = useState<PantryItem | null>(null)
+  const [purchase, setPurchase] = useState<{
+    item: NonNullable<typeof shopping.data>[number]
+    pantryItemId: string | null
+    createUsingCurrentName: boolean
+    expiresOn: string | null
+    quantityNote: string
+    autoAddToShoppingListWhenOut: boolean
+    idempotencyKey: string
+  } | null>(null)
+  const [banner, setBanner] = useState<{
+    name: string
+    pantryId: string
+    actionId: string
+    kept: boolean
+  } | null>(null)
+  const errorSummaryRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    setPurchase((current) => {
+      if (!current) return current
+      const latest = shopping.data?.find((item) => item.id === current.item.id)
+      return latest ? { ...current, item: latest } : current
+    })
+  }, [shopping.data])
   const listMutation = useMutation({
     mutationFn: (operation: () => ReturnType<typeof api.addShoppingItem>) => operation(),
     onSuccess: (items) => {
       queryClient.setQueryData(['shopping-list'], items)
+      void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
       setDraft({ name: '', canonicalIngredientId: null })
       setEditingId(null)
     },
   })
-  const pantryMutation = useMutation({
-    mutationFn: api.savePantry,
+  const purchaseMutation = useMutation({
+    mutationFn: ({ disposition }: { disposition: 'remove' | 'keep' }) => {
+      if (!purchase) throw new Error('No purchase is open')
+      const candidate = purchase.item.purchaseOptions.candidates.find(
+        (value) => value.id === purchase.pantryItemId,
+      )
+      return api.purchaseShoppingItem(
+        purchase.item.id,
+        {
+          disposition,
+          shoppingExpectedVersion: purchase.item.version,
+          pantryItemId: purchase.pantryItemId,
+          createUsingCurrentName: purchase.createUsingCurrentName,
+          pantryExpectedVersion: candidate?.version ?? null,
+          expiresOn: purchase.expiresOn,
+          quantityNote: purchase.quantityNote,
+          autoAddToShoppingListWhenOut: purchase.autoAddToShoppingListWhenOut,
+        },
+        purchase.idempotencyKey,
+      )
+    },
+    onSuccess: (result, variables) => {
+      queryClient.setQueryData(['shopping-list'], result.shoppingItems)
+      queryClient.setQueryData<PantryItem[]>(['pantry'], (current = []) => [
+        ...current.filter((item) => item.id !== result.pantry.id),
+        result.pantry,
+      ])
+      setBanner({
+        name: result.pantry.name,
+        pantryId: result.pantry.id,
+        actionId: result.purchaseActionId,
+        kept: variables.disposition === 'keep',
+      })
+      void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+      setPurchase(null)
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) {
+        void queryClient.invalidateQueries({ queryKey: ['shopping-list'] })
+        void queryClient.invalidateQueries({ queryKey: ['pantry'] })
+      }
+      queueMicrotask(() => errorSummaryRef.current?.focus())
+    },
+  })
+  const undoMutation = useMutation({
+    mutationFn: api.undoShoppingPurchase,
     onSuccess: (items) => {
-      queryClient.setQueryData(['pantry'], items)
+      queryClient.setQueryData(['shopping-list'], items)
+      void queryClient.invalidateQueries({ queryKey: ['pantry'] })
+      void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+      setBanner(null)
+    },
+    onError: () => {
       void queryClient.invalidateQueries({ queryKey: ['shopping-list'] })
+      void queryClient.invalidateQueries({ queryKey: ['pantry'] })
+      void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
     },
   })
   const items = shopping.data ?? []
-  const automatic = items.filter((item) => item.automatic && !item.completedAt)
-  const manual = items.filter((item) => !item.automatic && !item.completedAt)
-  const completed = items.filter((item) => item.completedAt && !item.automatic)
   function sourceLabel(kind: string, label: string) {
     if (kind === 'automatic') return t('shopping.sourceAutomatic')
     if (kind === 'manual') return t('shopping.sourceManual')
     return t('shopping.sourceRecipe', { recipe: label })
   }
-  function pantryPayload(item: PantryItem, overrides: Partial<PantryItem>) {
-    return {
-      name: item.name,
-      status: overrides.status ?? item.status,
-      quantityNote: item.quantityNote,
-      expiresOn: item.expiresOn,
-      canonicalIngredientId: item.canonicalIngredientId,
-      autoAddToShoppingListWhenOut:
-        overrides.autoAddToShoppingListWhenOut ?? item.autoAddToShoppingListWhenOut,
-    }
-  }
-  function renderItems(sectionItems: typeof items, automaticSection: boolean) {
-    return (
-      <div className="card-list">
-        {sectionItems.map((item) => {
-          const pantryItem = item.pantryItemId
-            ? pantry.data?.find((candidate) => candidate.id === item.pantryItemId)
-            : undefined
-          const canEdit = item.sources.some((source) => source.kind === 'manual')
-          return (
-            <article className="recipe-card" key={item.id}>
-              <strong>{item.name}</strong>
-              <span>{item.sources.map((source) => sourceLabel(source.kind, source.label)).join(' · ')}</span>
-              <div className="form-actions">
-                {automaticSection && pantryItem && (
-                  <>
-                    <button
-                      type="button"
-                      className="button primary"
-                      aria-label={t('shopping.purchasedLabel', { name: item.name })}
-                      onClick={() => {
-                        if (!window.confirm(t('shopping.purchasedConfirm', { name: item.name }))) return
-                        setUndoItem(pantryItem)
-                        listMutation.mutate(async () => {
-                          const items = await api.markAutomaticShoppingPurchased(pantryItem.id)
-                          await queryClient.invalidateQueries({ queryKey: ['pantry'] })
-                          return items
-                        })
-                      }}
-                    >
-                      {t('shopping.purchased')}
-                    </button>
-                    <button
-                      type="button"
-                      className="button ghost"
-                      onClick={() =>
-                        pantryMutation.mutate([
-                          pantryPayload(pantryItem, {
-                            autoAddToShoppingListWhenOut: false,
-                          }),
-                        ])
-                      }
-                    >
-                      {t('shopping.disableAutomatic')}
-                    </button>
-                  </>
-                )}
-                {!automaticSection && !item.completedAt && (
-                  <button
-                    type="button"
-                    className="button primary"
-                    onClick={() => listMutation.mutate(() => api.completeShoppingItem(item.id))}
-                  >
-                    {t('shopping.complete')}
-                  </button>
-                )}
-                {canEdit && !item.completedAt && (
-                  <button
-                    type="button"
-                    className="button ghost"
-                    onClick={() => {
-                      setEditingId(item.id)
-                      setDraft({
-                        name: item.name,
-                        canonicalIngredientId: item.canonicalIngredientId,
-                      })
-                    }}
-                  >
-                    {t('shopping.edit')}
-                  </button>
-                )}
-                {canEdit && (
-                  <button
-                    type="button"
-                    className="button ghost"
-                    onClick={() => {
-                      if (window.confirm(t('shopping.deleteConfirm', { name: item.name }))) {
-                        listMutation.mutate(() => api.deleteShoppingItem(item.id))
-                      }
-                    }}
-                  >
-                    {t('shopping.delete')}
-                  </button>
-                )}
-              </div>
-            </article>
-          )
-        })}
-      </div>
-    )
+  function openPurchase(item: (typeof items)[number]) {
+    const candidate = item.purchaseOptions.candidates.find((value) => value.id === item.pantryItemId)
+      ?? item.purchaseOptions.candidates[0]
+    const reuse = item.purchaseOptions.resolution === 'reuse'
+    setPurchase({
+      item,
+      pantryItemId: reuse ? candidate?.id ?? null : null,
+      createUsingCurrentName: item.purchaseOptions.resolution === 'create',
+      expiresOn: candidate?.status === 'out' ? null : candidate?.expiresOn ?? null,
+      quantityNote: candidate?.quantityNote ?? '',
+      autoAddToShoppingListWhenOut: candidate?.autoAddToShoppingListWhenOut ?? false,
+      idempotencyKey: `${Math.floor(Date.now() / 1000)}.${crypto.randomUUID()}`,
+    })
+    purchaseMutation.reset()
   }
   return (
     <Page title={t('shopping.title')} intro={t('shopping.intro')}>
@@ -1944,11 +2277,7 @@ export function ShoppingListPage() {
         onSubmit={(event) => {
           event.preventDefault()
           if (!draft.name.trim()) return
-          listMutation.mutate(() =>
-            editingId
-              ? api.updateShoppingItem(editingId, draft)
-              : api.addShoppingItem(draft),
-          )
+          listMutation.mutate(() => editingId ? api.updateShoppingItem(editingId, draft) : api.addShoppingItem(draft))
         }}
       >
         <IngredientCombobox
@@ -1961,53 +2290,173 @@ export function ShoppingListPage() {
           {editingId ? t('shopping.saveEdit') : t('shopping.add')}
         </button>
         {editingId && (
-          <button
-            type="button"
-            className="button ghost"
-            onClick={() => {
-              setEditingId(null)
-              setDraft({ name: '', canonicalIngredientId: null })
-            }}
-          >
-            {t('common.cancel')}
-          </button>
+          <button type="button" className="button ghost" onClick={() => {
+            setEditingId(null)
+            setDraft({ name: '', canonicalIngredientId: null })
+          }}>{t('common.cancel')}</button>
         )}
       </form>
-      {undoItem && (
-        <div className="status-banner" role="status">
-          <span>{t('shopping.purchasedSaved', { name: undoItem.name })}</span>
-          <button
-            type="button"
-            className="button secondary"
-            onClick={() => {
-              pantryMutation.mutate([pantryPayload(undoItem, { status: 'out' })])
-              setUndoItem(null)
-            }}
-          >
-            {t('common.undo')}
-          </button>
+      {banner && (
+        <div className="status-banner" role="status" aria-live="polite">
+          <span>{t(banner.kept ? 'shopping.purchaseKept' : 'shopping.purchaseRemoved', { name: banner.name })}</span>
+          <div className="form-actions">
+            <a className="button secondary" href={`/pantry#pantry-${banner.pantryId}`}>{t('shopping.editPantry')}</a>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={undoMutation.isPending}
+              onClick={() => undoMutation.mutate(banner.actionId)}
+            >{t('shopping.undoPurchase')}</button>
+            <button type="button" className="button ghost" aria-label={t('common.dismiss')} onClick={() => setBanner(null)}>×</button>
+          </div>
         </div>
       )}
-      {(listMutation.error || pantryMutation.error) && (
-        <ErrorText error={listMutation.error ?? pantryMutation.error} />
+      {undoMutation.error && (
+        <div className="error-summary" role="alert">
+          {undoMutation.error instanceof ApiError && undoMutation.error.status === 409
+            ? t('shopping.undoConflict')
+            : <ErrorText error={undoMutation.error} />}
+        </div>
       )}
+      {listMutation.error && <ErrorText error={listMutation.error} />}
       <QueryState query={shopping} empty={t('shopping.empty')}>
-        <section>
-          <h2>{t('shopping.automaticTitle')}</h2>
-          <p>{t('shopping.automaticDetail')}</p>
-          {automatic.length ? renderItems(automatic, true) : <p>{t('shopping.automaticEmpty')}</p>}
-        </section>
-        <section>
-          <h2>{t('shopping.manualTitle')}</h2>
-          {manual.length ? renderItems(manual, false) : <p>{t('shopping.manualEmpty')}</p>}
-        </section>
-        {completed.length > 0 && (
-          <section>
-            <h2>{t('shopping.completedTitle')}</h2>
-            {renderItems(completed, false)}
-          </section>
-        )}
+        <div className="card-list" aria-label={t('shopping.itemsLabel')}>
+          {items.map((item) => {
+            const canEdit = item.sources.some((source) => source.kind === 'manual')
+            return (
+              <article className="recipe-card" key={item.id}>
+                <strong>{item.name}</strong>
+                <span>{item.sources.map((source) => sourceLabel(source.kind, source.label)).join(' · ')}</span>
+                <div className="form-actions">
+                  <button
+                    type="button"
+                    className="button primary"
+                    aria-label={t('shopping.boughtLabel', { name: item.name })}
+                    onClick={() => openPurchase(item)}
+                  >{t('shopping.bought')}</button>
+                  {item.automatic && item.pantryItemId && (
+                    <button
+                      type="button"
+                      className="button ghost"
+                      onClick={() => {
+                        const pantryItem = pantry.data?.find((value) => value.id === item.pantryItemId)
+                        if (pantryItem) {
+                          void api.savePantry([{ ...pantryItem, autoAddToShoppingListWhenOut: false }])
+                            .then((values) => {
+                              queryClient.setQueryData(['pantry'], values)
+                              void Promise.all([
+                                shopping.refetch(),
+                                queryClient.invalidateQueries({ queryKey: ['recommendations'] }),
+                              ])
+                            })
+                        }
+                      }}
+                    >{t('shopping.disableAutomatic')}</button>
+                  )}
+                  {canEdit && (
+                    <>
+                      <button type="button" className="button ghost" onClick={() => {
+                        setEditingId(item.id)
+                        setDraft({ name: item.name, canonicalIngredientId: item.canonicalIngredientId })
+                      }}>{t('shopping.edit')}</button>
+                      <button type="button" className="button ghost" onClick={() => listMutation.mutate(() => api.deleteShoppingItem(item.id))}>
+                        {t('shopping.delete')}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </article>
+            )
+          })}
+        </div>
       </QueryState>
+      <Dialog.Root open={purchase !== null} onOpenChange={(open) => {
+        if (!open && !purchaseMutation.isPending) setPurchase(null)
+      }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          {purchase && (
+            <Dialog.Content className="confirmation-sheet purchase-sheet">
+              <div className="purchase-sheet-content">
+                <Dialog.Title>{t('shopping.updatePantry')}</Dialog.Title>
+                <Dialog.Description>{t('shopping.updatePantryDetail', { name: purchase.item.name })}</Dialog.Description>
+                {purchaseMutation.error && (
+                  <div className="error-summary" role="alert" tabIndex={-1} ref={errorSummaryRef}>
+                    {purchaseMutation.error instanceof ApiError && purchaseMutation.error.status === 409
+                      ? t('shopping.conflict')
+                      : t('shopping.networkError')}
+                  </div>
+                )}
+                {purchase.item.purchaseOptions.resolution === 'choice' && (
+                  <fieldset>
+                    <legend>{t('shopping.matchRequired')}</legend>
+                    <p>{t('shopping.matchGuidance')}</p>
+                    {purchase.item.purchaseOptions.candidates.map((candidate) => (
+                      <label className="choice-card" key={candidate.id}>
+                        <input
+                          type="radio"
+                          name="pantry-match"
+                          checked={!purchase.createUsingCurrentName && purchase.pantryItemId === candidate.id}
+                          onChange={() => setPurchase({
+                            ...purchase,
+                            pantryItemId: candidate.id,
+                            createUsingCurrentName: false,
+                            expiresOn: candidate.status === 'out' ? null : candidate.expiresOn,
+                            quantityNote: candidate.quantityNote,
+                            autoAddToShoppingListWhenOut: candidate.autoAddToShoppingListWhenOut,
+                          })}
+                        />
+                        <span><strong>{t('shopping.useExisting', { name: candidate.name })}</strong><small>{t('shopping.matchCandidateStatus', { status: t(`pantry.${candidate.status}`) })}</small></span>
+                      </label>
+                    ))}
+                    <label className="choice-card">
+                      <input
+                        type="radio"
+                        name="pantry-match"
+                        checked={purchase.createUsingCurrentName}
+                        onChange={() => setPurchase({
+                          ...purchase,
+                          pantryItemId: null,
+                          createUsingCurrentName: true,
+                          expiresOn: null,
+                          quantityNote: '',
+                          autoAddToShoppingListWhenOut: false,
+                        })}
+                      />
+                      <span>{t('shopping.createCurrent', { name: purchase.item.name })}</span>
+                    </label>
+                  </fieldset>
+                )}
+                {purchase.item.purchaseOptions.resolution === 'create' && <p>{t('shopping.noMatch')}</p>}
+                <p><strong>{t('shopping.available')}</strong></p>
+                <ExpirationEditor value={purchase.expiresOn} onChange={(expiresOn) => setPurchase({ ...purchase, expiresOn })} />
+                <label>{t('shopping.quantityNote')}
+                  <input value={purchase.quantityNote} maxLength={240} onChange={(event) => setPurchase({ ...purchase, quantityNote: event.target.value })} />
+                </label>
+                <label className="check-row">
+                  <input type="checkbox" checked={purchase.autoAddToShoppingListWhenOut} onChange={(event) => setPurchase({ ...purchase, autoAddToShoppingListWhenOut: event.target.checked })} />
+                  {t('shopping.autoAdd')}
+                </label>
+              </div>
+              <div className="purchase-sheet-actions">
+                <button
+                  type="button"
+                  className="button primary"
+                  disabled={purchaseMutation.isPending || (purchase.item.purchaseOptions.resolution === 'choice' && !purchase.pantryItemId && !purchase.createUsingCurrentName)}
+                  onClick={() => purchaseMutation.mutate({ disposition: 'remove' })}
+                >{t('shopping.saveRemove')}</button>
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={purchaseMutation.isPending || (purchase.item.purchaseOptions.resolution === 'choice' && !purchase.pantryItemId && !purchase.createUsingCurrentName)}
+                  onClick={() => purchaseMutation.mutate({ disposition: 'keep' })}
+                >{t('shopping.saveKeep')}</button>
+                <Dialog.Close asChild><button type="button" className="button ghost" disabled={purchaseMutation.isPending}>{t('common.cancel')}</button></Dialog.Close>
+              </div>
+            </Dialog.Content>
+          )}
+        </Dialog.Portal>
+      </Dialog.Root>
     </Page>
   )
 }
@@ -2508,8 +2957,116 @@ function ProfileSettings({ user }: { user: User }) {
 }
 
 export const COOK_SKILL_URL =
-  'https://github.com/vichare/Cook/blob/main/skills/cook-recipe-import/SKILL.md'
+  'https://github.com/vichare/Cook/tree/v0.4.0/skills/cook-recipe-import'
+export const COOK_IMPORT_SCHEMA_URL =
+  'https://raw.githubusercontent.com/vichare/Cook/v0.4.0/skills/cook-recipe-import/schema/import-draft-v1.schema.json'
+export const COOK_AI_RECIPE_SCHEMA_URL =
+  'https://raw.githubusercontent.com/vichare/Cook/v0.4.0/skills/cook-recipe-import/schema/ai-recipe-v1.schema.json'
 export type TokenPreset = 'import' | 'manage' | 'publish'
+
+export const importDraftExample = {
+  schemaVersion: '1.0',
+  sourceUrl: 'https://example.com/recipes/tomato-soup',
+  sourceTitle: 'Tomato soup',
+  sourceAuthor: 'Example author',
+  sourceLicense: 'CC-BY-4.0',
+  sourceAttribution: 'Example author — Tomato soup',
+  title: 'Tomato soup',
+  description: 'A concise description.',
+  difficulty: 2,
+  estimatedCalories: 900,
+  ingredients: [
+    { name: 'tomatoes', quantityNote: '800 g' },
+    { name: 'onion', quantityNote: '1' },
+  ],
+  steps: ['Chop the ingredients.', 'Simmer until tender, then blend.'],
+  warnings: ['Cooking time was inferred from the source.'],
+  confidence: 0.9,
+}
+
+export const createRecipeExample = {
+  title: 'Tomato soup',
+  description: 'A concise description.',
+  instructions: '1. Chop the ingredients.\n2. Simmer, then blend.',
+  visibility: 'private',
+  difficulty: 2,
+  estimatedCalories: 900,
+  sourceUrl: 'https://example.com/recipes/tomato-soup',
+  sourceTitle: 'Tomato soup',
+  sourceAuthor: 'Example author',
+  sourceLicense: 'CC-BY-4.0',
+  sourceAttribution: 'Example author — Tomato soup',
+  ingredients: [
+    { name: 'tomatoes', quantityNote: '800 g' },
+    { name: 'onion', quantityNote: '1' },
+  ],
+}
+
+export const updateRecipeExample = {
+  ...createRecipeExample,
+  title: 'Tomato soup, revised',
+  expectedVersion: 3,
+}
+
+function requestFormatReference(baseUrl: string) {
+  return `Request format / 请求格式
+
+Import a private review draft / 导入私密待审核草稿
+POST ${baseUrl}/api/import/drafts
+Authorization: Bearer $COOK_IMPORT_TOKEN
+Content-Type: application/json
+
+${JSON.stringify(importDraftExample, null, 2)}
+
+Create an owned recipe / 创建自己的菜谱
+POST ${baseUrl}/api/ai/recipes
+Authorization: Bearer $COOK_IMPORT_TOKEN
+Idempotency-Key: stable-source-item-revision-key
+Content-Type: application/json
+
+${JSON.stringify(createRecipeExample, null, 2)}
+
+Update an owned recipe / 更新自己的菜谱
+PUT ${baseUrl}/api/ai/recipes/{recipeId}
+Authorization: Bearer $COOK_IMPORT_TOKEN
+Content-Type: application/json
+
+${JSON.stringify(updateRecipeExample, null, 2)}
+
+Cover upload is multipart, not JSON / 封面上传使用 multipart，不是 JSON:
+POST ${baseUrl}/api/ai/recipes/{recipeId}/cover
+Authorization: Bearer $COOK_IMPORT_TOKEN
+If-Match: "recipe-v3"
+Content-Type: multipart/form-data
+Fields: image=<local JPEG/PNG/WebP>, altText, sourceUrl?, sourceLicense?, sourceAttribution?
+
+Authoritative schemas / 权威 schemas:
+${COOK_IMPORT_SCHEMA_URL}
+${COOK_AI_RECIPE_SCHEMA_URL}`
+}
+
+function deterministicAiPolicy(baseUrl: string) {
+  return `At task start, inspect GET ${baseUrl}/api/ai/capabilities once with the bearer token. Inspect it again only before a newly requested capability-sensitive phase when needed, not before every item.
+
+Process one recipe at a time and use a stable Idempotency-Key per source item/revision. Stop the batch on 401/403 or capability mismatch, on 429 (report Retry-After when provided), or after bounded repeated network/5xx failures. For an isolated item 400, provenance, or image failure, record it and continue; never silently skip. On 409, reread and never overwrite or guess a merge. Mark needs_review unless a true idempotent replay is positively identified. Never use last-write-wins.
+
+Final report: created, updated, skipped, failed, and needs_review counts, plus every source item and its recipe ID/URL or non-secret error.
+
+For externally sourced content, preserve sourceUrl, sourceTitle, sourceAuthor, sourceLicense, and sourceAttribution when available. A stated license is metadata, not verified proof. If reliable source/license/attribution is missing, do not directly publish: create a private review draft or private recipe and warn the user.
+
+Upload only local images the user owns or has explicit permission to use. A repository-level license may not cover every image. When uncertain, skip the image and record why. Cook never remotely fetches image URLs.`
+}
+
+export function firstTaskForPreset(preset: TokenPreset, locale: 'en' | 'zh-CN') {
+  if (locale === 'zh-CN') {
+    if (preset === 'publish') return '使用 Cook Skill 检查 token 权限，然后把这个我有权使用的菜谱保存并直接发布；缺少可靠来源/许可证/归属时改为私密并标记待审核。'
+    if (preset === 'manage') return '使用 Cook Skill 检查 token 权限，然后把这个我有权使用的菜谱保存为私密菜谱；保留来源信息，不确定的图片请跳过并说明原因。'
+    return '使用 Cook Skill 检查 token 权限，然后把这个我有权访问的菜谱 URL 导入为私密待审核草稿。'
+  }
+  if (preset === 'publish') return 'Use the Cook skill to inspect token capabilities, then save and publish this authorized recipe; if reliable source/license/attribution is missing, keep it private and flag it for review.'
+  if (preset === 'manage') return 'Use the Cook skill to inspect token capabilities, then save this authorized recipe as private; preserve provenance and skip any image whose rights are uncertain.'
+  return 'Use the Cook skill to inspect token capabilities, then import this authorized recipe URL as a private review draft.'
+}
 
 export function resolveCookBaseUrl(
   origin = typeof window === 'undefined' ? 'http://localhost:5173' : window.location.origin,
@@ -2559,30 +3116,50 @@ export function skillInstructionsForPreset(
 ) {
   const baseUrl = resolveCookBaseUrl(origin)
   return `English:
-Install the official Cook recipe skill from:
+GitHub Copilot skill installation:
+1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.4.0
+2. Install for cross-session use, pinned to this release:
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.0
+3. Restart GitHub Copilot if needed, then verify the skill in Customize → Skills.
+
+Manual fallback: download or copy the entire skills/cook-recipe-import directory, including its schema directory, to ~/.copilot/skills/cook-recipe-import or ~/.agents/skills/cook-recipe-import. Do not copy only SKILL.md.
+
+Human-review/source link (not a paste-to-install URL):
 ${COOK_SKILL_URL}
 
 COOK_BASE_URL is the trusted Cook site that receives skill API calls. Set it to this exact value:
 COOK_BASE_URL=${baseUrl}
 
-Store the separately copied one-time token in your AI client's secret store or environment under the exact name COOK_IMPORT_TOKEN. The token is intentionally not included in these reusable instructions. Never paste it into a prompt, URL, transcript, or log.
+GitHub Copilot does not document an arbitrary custom-secret UI for skills. Set COOK_BASE_URL and the separately copied one-time token as OS environment variables before launching the app; restart the app after changing them so it can inherit the values. On Windows PowerShell, use Read-Host -AsSecureString and assign the converted value only to the current process environment so the token is not embedded in command history. On macOS/Linux, use a silent read in the launching shell. The token is intentionally not included here. Never paste it into a prompt, URL, transcript, skill file, reusable command, or log.
 
 ${presetScopeGuidance(preset)}
 
-Minimal first use: ask your AI client, “Use the Cook skill to import this authorized recipe URL as a private review draft.” The import endpoint for this site is ${baseUrl}/api/import/drafts. Follow your client's documented “install skill from GitHub URL” and secret-configuration flow.
+Minimal first use: “${firstTaskForPreset(preset, 'en')}” The import endpoint for this site is ${baseUrl}/api/import/drafts.
 
 简体中文：
-从以下地址安装 Cook 官方菜谱 Skill：
+GitHub Copilot Skill 安装：
+1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.4.0
+2. 安装到用户范围并固定到此 release：
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.0
+3. 必要时重启 GitHub Copilot，然后在 Customize → Skills 中确认。
+
+手动备用：下载或复制整个 skills/cook-recipe-import 目录（必须包括 schema 目录）到 ~/.copilot/skills/cook-recipe-import 或 ~/.agents/skills/cook-recipe-import。不要只复制 SKILL.md。
+
+以下链接仅供人工查看来源，不是粘贴即安装的 URL：
 ${COOK_SKILL_URL}
 
 COOK_BASE_URL 是 Skill 调用 API 时使用的可信 Cook 站点。请设置为以下确定值，无需自行查找或修改：
 COOK_BASE_URL=${baseUrl}
 
-请使用单独的“复制 token”按钮取得一次性 secret，并在 AI 客户端的 secret store 或环境变量中以 COOK_IMPORT_TOKEN 为名称保存。可复用说明不会包含真实 token。绝不要把 token 粘贴到 prompt、URL、transcript 或日志中。
+GitHub Copilot 目前没有文档化的任意 Skill 自定义 secret UI。启动应用前，请把 COOK_BASE_URL 和单独复制的一次性 token 设置为操作系统环境变量；修改后需重启应用，使其继承新值。Windows PowerShell 可用 Read-Host -AsSecureString，并只把转换后的值赋给当前进程环境，避免 token 出现在命令历史；macOS/Linux 可在启动 shell 中静默读取。可复用说明不会包含真实 token。绝不要把 token 粘贴到 prompt、URL、transcript、Skill 文件、可复用命令或日志中。
 
 ${presetScopeGuidanceZh(preset)}
 
-首次使用示例：“请使用 Cook Skill，把这个我有权访问的菜谱 URL 导入为私密待审核草稿。”此站点的导入端点是 ${baseUrl}/api/import/drafts。安装 Skill 和配置 secret 时，请使用 AI 客户端提供的官方流程。`
+首次使用示例：“${firstTaskForPreset(preset, 'zh-CN')}”此站点的导入端点是 ${baseUrl}/api/import/drafts。
+
+${requestFormatReference(baseUrl)}
+
+${deterministicAiPolicy(baseUrl)}`
 }
 
 export function promptForPreset(preset: TokenPreset, origin = resolveCookBaseUrl()) {
@@ -2598,24 +3175,36 @@ Use this exact resolved value; do not ask me to discover or replace a base-URL p
 Use your browser or transcript tools only for content I am authorized to access. Use ${baseUrl} with the COOK_IMPORT_TOKEN secret/environment variable, and check that the token has recipes:read, recipes:write, and recipes:publish before requesting public visibility; cover changes also require recipes:images:write. With recipes:publish, you may create public recipes, publish my private recipes, and directly update my public recipes, but every update must use the current recipe version and stop on 409 until you reread it. Never delete recipes, access another account, bypass validation, or publish when recipes:publish is absent. Process bulk work one recipe at a time with a distinct Idempotency-Key for each creation. Do not silently skip failures. At the end, report created, updated, skipped, and failed counts with each recipe ID or URL and error. AI output becomes public immediately and may contain errors, copyrighted material, or private information, so preserve source/license/attribution, confirm image rights before uploading local JPEG/PNG/WebP bytes, and never fetch a source image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
 
 简体中文：
-仅使用浏览器或 transcript 工具处理我有权访问的内容。使用 ${baseUrl}，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN；请求公开可见性前，必须确认 token 同时具有 recipes:read、recipes:write 和 recipes:publish，修改封面还需要 recipes:images:write。有 recipes:publish 时，可以创建公开菜谱、把我的私密菜谱发布为公开，并直接更新我的公开菜谱；每次更新必须使用当前菜谱 version，遇到 409 必须重新读取后再处理。绝不能删除菜谱、访问其他账号、绕过校验，或在没有 recipes:publish 时发布。批量操作应逐条处理，每个创建使用独立 Idempotency-Key；不得悄悄跳过失败项。结束时输出 created、updated、skipped、failed 数量，以及每项菜谱 ID 或 URL 和错误。AI 输出会立即公开，可能包含错误、受版权保护材料或隐私信息，因此必须保留来源、许可和归属；上传本地 JPEG/PNG/WebP 图片前确认使用权，绝不自动抓取来源图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
+仅使用浏览器或 transcript 工具处理我有权访问的内容。使用 ${baseUrl}，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN；请求公开可见性前，必须确认 token 同时具有 recipes:read、recipes:write 和 recipes:publish，修改封面还需要 recipes:images:write。有 recipes:publish 时，可以创建公开菜谱、把我的私密菜谱发布为公开，并直接更新我的公开菜谱；每次更新必须使用当前菜谱 version，遇到 409 必须重新读取后再处理。绝不能删除菜谱、访问其他账号、绕过校验，或在没有 recipes:publish 时发布。批量操作应逐条处理，每个创建使用独立 Idempotency-Key；不得悄悄跳过失败项。结束时输出 created、updated、skipped、failed 数量，以及每项菜谱 ID 或 URL 和错误。AI 输出会立即公开，可能包含错误、受版权保护材料或隐私信息，因此必须保留来源、许可和归属；上传本地 JPEG/PNG/WebP 图片前确认使用权，绝不自动抓取来源图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。
+
+${requestFormatReference(baseUrl)}
+
+${deterministicAiPolicy(baseUrl)}`
   }
   if (preset === 'manage') {
     return `${setup}English:
 Use your browser or transcript tools only for content I am authorized to access. Prefer schema.org Recipe/JSON-LD and legitimately available captions/transcripts. Do not bypass login, paywalls, access controls, robots restrictions, or DRM. Use ${baseUrl} with the COOK_IMPORT_TOKEN secret/environment variable to read my recipes and versions, create private recipes, or update my private recipes with optimistic concurrency. Updates to public recipes must create a pending revision for my review and must never publish directly. Before uploading a local JPEG, PNG, or WebP cover image, ask me to confirm that I own it or have permission, then provide accurate alt text and any source/license/attribution. Never fetch or copy a source site's image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
 
 简体中文：
-仅使用浏览器或 transcript 工具处理我有权访问的内容。优先使用 schema.org Recipe/JSON-LD 和合法可用的字幕或 transcript。不得绕过登录、付费墙、访问控制、robots 限制或 DRM。使用 ${baseUrl}，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN，以读取我的菜谱及版本、创建私密菜谱，或通过乐观并发更新我的私密菜谱。公开菜谱的更新必须创建待审核 revision，绝不能直接发布。上传本地 JPEG、PNG 或 WebP 封面前，先请我确认拥有或获准使用，并提供准确的替代文字及来源、许可、归属信息。绝不要自动抓取或复制来源网站图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
+仅使用浏览器或 transcript 工具处理我有权访问的内容。优先使用 schema.org Recipe/JSON-LD 和合法可用的字幕或 transcript。不得绕过登录、付费墙、访问控制、robots 限制或 DRM。使用 ${baseUrl}，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN，以读取我的菜谱及版本、创建私密菜谱，或通过乐观并发更新我的私密菜谱。公开菜谱的更新必须创建待审核 revision，绝不能直接发布。上传本地 JPEG、PNG 或 WebP 封面前，先请我确认拥有或获准使用，并提供准确的替代文字及来源、许可、归属信息。绝不要自动抓取或复制来源网站图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。
+
+${requestFormatReference(baseUrl)}
+
+${deterministicAiPolicy(baseUrl)}`
   }
   return `${setup}English:
 Use your browser tools to extract a recipe from a webpage I am authorized to access, preferring schema.org Recipe/JSON-LD. For video, use only legitimately available captions/transcripts; if unavailable, ask me for a transcript. Do not bypass login, paywalls, robots restrictions, access controls, or DRM. Rewrite concise structured ingredients and steps, preserve source URL/title/author, and record uncertainty as warnings. Preserve a stated 1–5 difficulty; include estimatedCalories only as an explicitly estimated whole-recipe total, never per serving or medical advice. Validate against the Cook import draft schema, then create a private review draft at ${baseUrl}/api/import/drafts using the recipes:import credential from the COOK_IMPORT_TOKEN secret/environment variable. Never print, quote, log, download, or place that token in a URL or prompt. Do not publish or finalize the recipe; tell me to review the private draft in Cook.
 
 简体中文：
-请使用浏览器工具，从我有权访问的网页提取菜谱，优先使用 schema.org Recipe/JSON-LD。视频只能使用合法可用的字幕或 transcript；若无法取得，请要求我提供 transcript。不得绕过登录、付费墙、robots 限制、访问控制或 DRM。请将食材和步骤简洁结构化并改写，保留来源 URL、标题和作者，把不确定内容记录为 warnings。保留来源明确给出的 1–5 难度；estimatedCalories 只能表示明确标注为估算的整份总热量，不能当作每份或医疗建议。按 Cook 导入草稿 schema 验证后，使用 secret store/环境变量中的 COOK_IMPORT_TOKEN（recipes:import 权限）调用 ${baseUrl}/api/import/drafts，创建私密待审核草稿。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。不要发布或完成菜谱；请提醒我在 Cook 中人工审核私密草稿。`
+请使用浏览器工具，从我有权访问的网页提取菜谱，优先使用 schema.org Recipe/JSON-LD。视频只能使用合法可用的字幕或 transcript；若无法取得，请要求我提供 transcript。不得绕过登录、付费墙、robots 限制、访问控制或 DRM。请将食材和步骤简洁结构化并改写，保留来源 URL、标题和作者，把不确定内容记录为 warnings。保留来源明确给出的 1–5 难度；estimatedCalories 只能表示明确标注为估算的整份总热量，不能当作每份或医疗建议。按 Cook 导入草稿 schema 验证后，使用 secret store/环境变量中的 COOK_IMPORT_TOKEN（recipes:import 权限）调用 ${baseUrl}/api/import/drafts，创建私密待审核草稿。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。不要发布或完成菜谱；请提醒我在 Cook 中人工审核私密草稿。
+
+${requestFormatReference(baseUrl)}
+
+${deterministicAiPolicy(baseUrl)}`
 }
 
 export function ImportTokenSettings() {
-  const { formatDateTime, t } = useI18n()
+  const { formatDateTime, locale, t } = useI18n()
   const queryClient = useQueryClient()
   const baseUrl = useMemo(() => resolveCookBaseUrl(), [])
   const tokens = useQuery({ queryKey: ['import-tokens'], queryFn: api.importTokens })
@@ -2630,12 +3219,19 @@ export function ImportTokenSettings() {
     kind: 'success' | 'error'
     message: string
   } | null>(null)
+  const connection = useMutation({
+    mutationFn: () => {
+      if (!secret) throw new Error('The one-time token is no longer available')
+      return api.aiCapabilities(secret)
+    },
+  })
   const create = useMutation({
     mutationFn: () => api.createImportToken(name, expiresInDays, preset),
     onSuccess: async (created) => {
       setSecret(created.secret)
       setCreatedPreset(preset)
       setCopyNotice(null)
+      connection.reset()
       await queryClient.invalidateQueries({ queryKey: ['import-tokens'] })
     },
   })
@@ -2719,6 +3315,49 @@ export function ImportTokenSettings() {
             </span>
           </label>
         </fieldset>
+        <section className="source-note" aria-labelledby="token-setup-flow">
+          <h3 id="token-setup-flow">{t('token.setupFlow')}</h3>
+          <ol>
+            <li>{t('token.setupCreate')}</li>
+            <li>{t('token.setupStore')}</li>
+            <li>{t('token.setupInstall')}</li>
+            <li>{t('token.setupTest')}</li>
+            <li>{t('token.setupFirstTask')}</li>
+          </ol>
+        </section>
+        <details className="source-note">
+          <summary>{t('token.requestFormat')}</summary>
+          <p>{t('token.requestFormatDetail')}</p>
+          <h4>{t('token.draftExample')}</h4>
+          <pre><code>{JSON.stringify(importDraftExample, null, 2)}</code></pre>
+          <button
+            type="button"
+            className="button ghost"
+            onClick={() => copyOutput(JSON.stringify(importDraftExample, null, 2), t('token.exampleCopied'))}
+          >
+            {t('token.copyExample')}
+          </button>
+          <a href={COOK_IMPORT_SCHEMA_URL} target="_blank" rel="noreferrer">
+            {t('token.openDraftSchema')}
+          </a>
+          <h4>{t('token.recipeExamples')}</h4>
+          <pre><code>{JSON.stringify(createRecipeExample, null, 2)}</code></pre>
+          <pre><code>{JSON.stringify(updateRecipeExample, null, 2)}</code></pre>
+          <button
+            type="button"
+            className="button ghost"
+            onClick={() => copyOutput(
+              `${JSON.stringify(createRecipeExample, null, 2)}\n\n${JSON.stringify(updateRecipeExample, null, 2)}`,
+              t('token.exampleCopied'),
+            )}
+          >
+            {t('token.copyExample')}
+          </button>
+          <a href={COOK_AI_RECIPE_SCHEMA_URL} target="_blank" rel="noreferrer">
+            {t('token.openRecipeSchema')}
+          </a>
+          <p>{t('token.coverMultipart')}</p>
+        </details>
         {preset === 'publish' && (
           <p className="expiry-warning" role="alert">{t('token.publishRisk')}</p>
         )}
@@ -2752,6 +3391,28 @@ export function ImportTokenSettings() {
           >
             {t('token.copyToken')}
           </button>
+          <button
+            type="button"
+            className="button secondary"
+            disabled={connection.isPending}
+            onClick={() => connection.mutate()}
+          >
+            {connection.isPending ? t('token.testingConnection') : t('token.testConnection')}
+          </button>
+          {connection.data && (
+            <div className="notice" role="status">
+              <strong>{t('token.connectionSuccess')}</strong>
+              <p>{t('token.connectionScopes', { scopes: connection.data.scopes.join(', ') })}</p>
+              <p>
+                {connection.data.expiresAt
+                  ? t('token.connectionExpiry', { date: formatDateTime(connection.data.expiresAt) })
+                  : t('token.connectionNoExpiry')}
+              </p>
+            </div>
+          )}
+          {connection.error && (
+            <p className="error" role="alert">{t('token.connectionFailed')}</p>
+          )}
           <section>
             <h3>{t('token.installSkill')}</h3>
             <p>{t('token.installSkillDetail')}</p>
@@ -2772,7 +3433,7 @@ export function ImportTokenSettings() {
               <input readOnly value={COOK_SKILL_URL} />
             </label>
             <a className="button secondary" href={COOK_SKILL_URL} rel="noreferrer" target="_blank">
-              {t('token.installSkill')}
+              {t('token.reviewSkillSource')}
             </a>
             <button
               className="button ghost"
@@ -2784,6 +3445,25 @@ export function ImportTokenSettings() {
               {t('token.copyInstall')}
             </button>
           </section>
+          <section>
+            <h3>{t('token.firstTask')}</h3>
+            <p>{firstTaskForPreset(createdPreset, locale)}</p>
+            <button
+              type="button"
+              className="button ghost"
+              onClick={() => copyOutput(
+                firstTaskForPreset(createdPreset, locale),
+                t('token.firstTaskCopied'),
+              )}
+            >
+              {t('token.copyFirstTask')}
+            </button>
+          </section>
+          <details className="source-note">
+            <summary>{t('token.detailedRules')}</summary>
+            <p>{t('token.bulkRules')}</p>
+            <p>{t('token.imageRules')}</p>
+          </details>
           <section>
             <h3>{t('token.copyPrompt')}</h3>
             <p>{t('token.promptDetail')}</p>
@@ -2911,6 +3591,13 @@ function ImportDraftPage() {
               <a href={draft.data.sourceUrl} rel="noreferrer">{draft.data.sourceTitle ?? draft.data.sourceUrl}</a>
               {draft.data.sourceAuthor && (
                 <p>{t('import.sourceAuthor', { author: draft.data.sourceAuthor })}</p>
+              )}
+              {draft.data.sourceAttribution && <p>{draft.data.sourceAttribution}</p>}
+              {draft.data.sourceLicense && (
+                <p>{t('recipe.sourceLicenseValue', { license: draft.data.sourceLicense })}</p>
+              )}
+              {(draft.data.sourceLicense || draft.data.sourceAttribution) && (
+                <small>{t('recipe.sourceLicenseUnverified')}</small>
               )}
               <p>
                 {t('import.confidence', {
@@ -3202,9 +3889,12 @@ function Metric({ label, value }: { label: string; value: string | number }) {
 function IngredientSummary({ label, items }: { label: string; items: string[] }) {
   if (items.length === 0) return null
   return (
-    <p>
-      <strong>{label}:</strong> {items.join(', ')}
-    </p>
+    <div className="ingredient-summary">
+      <strong>{label}</strong>
+      <ul className="ingredient-summary-list">
+        {items.map((item) => <li key={item}>{item}</li>)}
+      </ul>
+    </div>
   )
 }
 

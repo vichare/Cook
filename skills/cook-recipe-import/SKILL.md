@@ -1,63 +1,160 @@
+---
+name: cook-recipe-import
+description: Import authorized recipes into Cook review drafts, manage owned recipes and covers, and publish only with an explicitly granted publish token.
+---
+
 # Cook recipe import and management
 
-Use this skill to turn an authorized source into a private Cook review draft, manage a user's private recipes and cover images, or publish only when the user deliberately grants the high-risk publish preset.
+Use this skill only for content the user is authorized to access. Prefer the safest task: create a private review draft. Manage owned recipes only with the matching scopes, and publish only when the user explicitly selected the high-risk publish preset.
 
-## Required configuration
+## Configuration and capability check
 
-- Read the Cook import token from the client's secret store or the `COOK_IMPORT_TOKEN` environment variable.
-- Read the Cook origin from `COOK_BASE_URL`. Cook Settings generates copyable installation instructions with the exact trusted frontend origin already assigned, for example `COOK_BASE_URL=https://cook.vichare.net` on production. Do not ask the user to discover, type, or replace a base-URL placeholder that the website already resolved.
-- The separately copied one-time token must be stored under the exact secret/environment name `COOK_IMPORT_TOKEN`. Never interpolate its value into reusable instructions.
-- Never place the token in a URL, prompt, transcript, log, source document, or generated file.
-- Do not copy the token into skill installation instructions or a general-AI prompt. Prompts must reference the secret/environment variable name `COOK_IMPORT_TOKEN` only.
-- The recommended token has only `recipes:import`. The optional management preset has `recipes:read`, `recipes:write`, and `recipes:images:write`.
-- The high-risk publish preset has those management scopes plus `recipes:publish`. Check the token's returned scope list; never infer or request public visibility without that exact scope.
-- No preset grants recipe deletion, pantry, shopping-list, account/profile, favorite-account, another user's recipes, or ordinary Cook session access.
+- Read the trusted Cook origin from `COOK_BASE_URL`. Cook Settings generates its exact value, such as `https://cook.vichare.net`; never ask the user to replace a base-URL placeholder.
+- Read the bearer token from the `COOK_IMPORT_TOKEN` environment variable at request time. Never print, quote, log, download, or write it into a URL, prompt, transcript, skill file, or generated artifact.
+- GitHub Copilot does not document an arbitrary custom-secret UI for skills. The user should set both environment variables before launching the app and restart it after changes so the app inherits them.
+- At task start, call `GET $COOK_BASE_URL/api/ai/capabilities` once. It returns only the token prefix, scopes, expiry, and optional preset. Check again only before a newly requested capability-sensitive phase when needed, not before every recipe.
+- `recipes:import` creates private review drafts. Management uses `recipes:read`, `recipes:write`, and `recipes:images:write`. Direct public creation/update additionally requires `recipes:publish`.
+- No token preset grants recipe deletion, pantry, shopping-list, account/profile, favorite-account, another user's recipes, or ordinary browser-session access.
 
-## Extraction rules
+## Source and provenance policy
 
-1. Use browser capabilities already available in the user's AI client. Cook does not fetch the source URL.
-2. For web pages, prefer a `schema.org/Recipe` JSON-LD object. If it is absent or incomplete, extract only from visible content the user can legitimately access.
-3. For video, use captions or a transcript obtained through a legitimate client capability. If neither is available, ask the user to provide a transcript.
-4. Do not bypass authentication, paywalls, robots restrictions, DRM, or access controls.
-5. Do not copy source images or long passages. Convert the recipe into concise structured ingredients and rewritten cooking steps while preserving source attribution.
-6. Treat every extracted field as untrusted. Record ambiguity, missing quantities, conflicting instructions, or low-confidence interpretation in `warnings`.
-7. Preserve an explicit source difficulty only as an optional integer from 1 to 5. If estimating calories, use `estimatedCalories` only for an clearly labeled whole-recipe total; omit uncertain values rather than inventing precision. These values are estimates, not medical nutrition advice.
-8. Produce standard Markdown only for descriptions and instructions. Do not emit MDX, JSX, raw HTML, directives, scripts, remote images, or executable content. Use ordinary headings, emphasis, lists, blockquotes, HTTP/HTTPS links, and tables only when they improve clarity.
+1. Use browser/transcript capabilities already available in the user's client. Cook never fetches a recipe page or image URL.
+2. Prefer `schema.org/Recipe` JSON-LD. Otherwise use only visible content the user can legitimately access. Do not bypass login, paywalls, robots restrictions, DRM, or access controls.
+3. Use only legitimately available captions/transcripts for video. Ask the user for a transcript if none is available.
+4. Rewrite concise ingredients and steps; do not copy long passages or source images.
+5. Preserve `sourceUrl`, `sourceTitle`, `sourceAuthor`, `sourceLicense`, and `sourceAttribution` when available. A stated license is metadata, not verified proof.
+6. If an external recipe lacks reliable source/license/attribution, do not directly publish it. Create a private review draft or private recipe and include a warning.
+7. Record ambiguity, missing quantities, conflicting instructions, or low-confidence interpretation in `warnings`. Do not invent precision.
+8. Use standard Markdown only. Do not emit MDX, JSX, raw HTML, scripts, directives, remote images, or executable content.
 
-## Create the draft
+## Import a private review draft
 
-Validate the payload against `schema/import-draft-v1.schema.json`, then send JSON to:
+Validate against `schema/import-draft-v1.schema.json`, then send:
 
-```text
+```http
 POST $COOK_BASE_URL/api/import/drafts
+Authorization: Bearer $COOK_IMPORT_TOKEN
+Content-Type: application/json
 ```
 
-Authenticate with the standard HTTP Bearer scheme by reading the credential from `COOK_IMPORT_TOKEN` at request time. Do not echo the credential to the conversation or generated output. Cook Settings also provides a token-free bilingual prompt template for clients that do not support installing this skill directly.
+```json
+{
+  "schemaVersion": "1.0",
+  "sourceUrl": "https://example.com/recipes/tomato-soup",
+  "sourceTitle": "Tomato soup",
+  "sourceAuthor": "Example author",
+  "sourceLicense": "CC-BY-4.0",
+  "sourceAttribution": "Example author — Tomato soup",
+  "title": "Tomato soup",
+  "description": "A concise description.",
+  "difficulty": 2,
+  "estimatedCalories": 900,
+  "ingredients": [
+    { "name": "tomatoes", "quantityNote": "800 g" },
+    { "name": "onion", "quantityNote": "1" }
+  ],
+  "steps": [
+    "Chop the ingredients.",
+    "Simmer until tender, then blend."
+  ],
+  "warnings": ["Cooking time was inferred from the source."],
+  "confidence": 0.9
+}
+```
 
-Use `schemaVersion: "1.0"`. Do not include an owner identifier or visibility. Cook derives the owner from the token and creates only a private review draft.
+`schemaVersion`, `sourceUrl`, `title`, at least one ingredient, and at least one step are required. The source metadata, description, difficulty, whole-recipe estimated calories, warnings, and confidence are optional. Never include owner ID or visibility; Cook derives the owner and creates a private draft. Return the `reviewUrl` resolved against `COOK_BASE_URL` and tell the user that acceptance still requires browser review.
 
-On success, tell the user that the draft still requires review and provide the returned `reviewUrl` resolved against the configured `COOK_BASE_URL`. Never claim the recipe was published or finalized. Only the authenticated user can edit, accept, or discard the draft in Cook; acceptance creates a private recipe, which the user may publish separately.
+## Create or update an owned recipe
 
-If Cook returns `401`, ask the user to create or replace the appropriate token preset in Cook Settings and store it in the client's secret store. A `403` means the valid token lacks the endpoint's scope; do not broaden access without the user's explicit choice. For `400`, correct the payload rather than weakening validation. For `429`, stop retrying and report the quota or rate limit.
+Validate against `schema/ai-recipe-v1.schema.json`.
 
-## Manage owned recipes
+Create:
 
-Use management endpoints only when the token includes the required scopes. Validate create/update JSON against `schema/ai-recipe-v1.schema.json`.
+```http
+POST $COOK_BASE_URL/api/ai/recipes
+Authorization: Bearer $COOK_IMPORT_TOKEN
+Idempotency-Key: stable-source-item-revision-key
+Content-Type: application/json
+```
 
-- `GET $COOK_BASE_URL/api/ai/recipes` lists only recipes owned by the token principal.
-- `GET $COOK_BASE_URL/api/ai/recipes/{id}` returns an owned recipe and its current `version`.
-- `POST $COOK_BASE_URL/api/ai/recipes` creates a private recipe by default. Send a stable, retry-safe `Idempotency-Key`; never generate a new key merely because a response was delayed. `visibility: "public"` requires `recipes:publish`.
-- `PUT $COOK_BASE_URL/api/ai/recipes/{id}` includes `expectedVersion`. Without `recipes:publish`, a public recipe returns a pending revision that the owner must review in Cook. With `recipes:publish`, an owned private recipe may become public and an owned public recipe updates live.
-- There is no token recipe-delete endpoint. Do not attempt to simulate deletion.
+```json
+{
+  "title": "Tomato soup",
+  "description": "A concise description.",
+  "instructions": "1. Chop the ingredients.\n2. Simmer, then blend.",
+  "visibility": "private",
+  "difficulty": 2,
+  "estimatedCalories": 900,
+  "sourceUrl": "https://example.com/recipes/tomato-soup",
+  "sourceTitle": "Tomato soup",
+  "sourceAuthor": "Example author",
+  "sourceLicense": "CC-BY-4.0",
+  "sourceAttribution": "Example author — Tomato soup",
+  "ingredients": [
+    { "name": "tomatoes", "quantityNote": "800 g" },
+    { "name": "onion", "quantityNote": "1" }
+  ]
+}
+```
 
-On `409`, re-read the recipe and ask the user how to reconcile their newer edits; never use last-write-wins. On `404`, do not infer whether another account owns the ID.
+Update:
 
-For bulk work, call the per-recipe endpoints one item at a time rather than inventing a batch route. Use one stable idempotency key per creation, continue only according to the user's requested failure policy, and never silently skip an item. Finish with created, updated, skipped, and failed counts plus each recipe ID or URL and any error.
+```http
+PUT $COOK_BASE_URL/api/ai/recipes/{recipeId}
+Authorization: Bearer $COOK_IMPORT_TOKEN
+Content-Type: application/json
+```
 
-If a future user-authorized operation supplies a relative pantry expiry such as “7 days from today,” convert it to canonical `expiresOn: YYYY-MM-DD` using the user's local calendar date. Never derive date-only values from the Cook server's timezone or by adding fixed 24-hour millisecond intervals. This skill currently has no pantry scope or pantry endpoint.
+```json
+{
+  "title": "Tomato soup, revised",
+  "description": "A concise description.",
+  "instructions": "1. Chop the ingredients.\n2. Simmer, then blend.",
+  "visibility": "private",
+  "difficulty": 2,
+  "estimatedCalories": 900,
+  "sourceUrl": "https://example.com/recipes/tomato-soup",
+  "sourceTitle": "Tomato soup",
+  "sourceAuthor": "Example author",
+  "sourceLicense": "CC-BY-4.0",
+  "sourceAttribution": "Example author — Tomato soup",
+  "ingredients": [
+    { "name": "tomatoes", "quantityNote": "800 g" },
+    { "name": "onion", "quantityNote": "1" }
+  ],
+  "expectedVersion": 3
+}
+```
+
+`title` and at least one ingredient are required. `expectedVersion` is required for update and omitted for create. A stable idempotency key belongs to one source item/revision; do not generate a new key merely because a response was delayed. Without `recipes:publish`, changes to an owned public recipe create a pending owner-reviewed revision. There is no token recipe-delete endpoint.
 
 ## Cover images
 
-Never ask Cook to fetch an image URL. Before upload, ask the user to confirm that they own the local image or have permission to use it. Do not automatically copy a webpage or video thumbnail. Upload only local JPEG, PNG, or WebP bytes to `/api/ai/recipes/{id}/cover`, provide useful alt text, and include known source URL, license, and attribution. Send `If-Match: "recipe-v<version>"`.
+Upload only a local image the user owns or has explicit permission to use. A repository-level license may not cover every image. When uncertain, skip the image and record why. Never remotely fetch an image URL or automatically copy a webpage/video thumbnail.
 
-Cook rejects SVG, GIF, malformed, oversized, and decompression-risk inputs; normalizes the longest edge to 1,600px; and stores at most one cover. A private cover changes directly. Without `recipes:publish`, a public cover replacement/removal creates a pending revision for owner review; with both `recipes:images:write` and `recipes:publish`, the owned public cover changes live. Do not retry a rejected image by weakening validation or converting it with an external command.
+Cover upload is multipart, not JSON:
+
+```http
+POST $COOK_BASE_URL/api/ai/recipes/{recipeId}/cover
+Authorization: Bearer $COOK_IMPORT_TOKEN
+If-Match: "recipe-v3"
+Idempotency-Key: stable-cover-operation-key
+Content-Type: multipart/form-data
+```
+
+Fields: `image` (local JPEG/PNG/WebP bytes), `altText`, and optional `sourceUrl`, `sourceLicense`, `sourceAttribution`. Cook rejects unsupported, malformed, oversized, and decompression-risk files and normalizes accepted images. Do not retry a rejected image by weakening validation.
+
+## Deterministic bulk and error behavior
+
+- Process one recipe at a time.
+- Stop the batch on `401`, `403`, capability mismatch, `429` (report `Retry-After` when provided), or bounded repeated network/`5xx` failures.
+- For an isolated item `400`, provenance, or image failure, record it and continue. Never silently skip.
+- On `409`, reread. Never auto-overwrite, guess a merge, or use last-write-wins. Mark `needs_review` unless a true idempotent replay is positively identified.
+- On `404`, do not infer whether another account owns the ID.
+- Final report: `created`, `updated`, `skipped`, `failed`, and `needs_review` counts, plus every source item and its recipe ID/URL or non-secret error.
+
+## First-use requests
+
+- Draft preset: “Use the Cook skill to inspect token capabilities, then import this authorized recipe URL as a private review draft.”
+- Manage preset: “Use the Cook skill to inspect token capabilities, then save this authorized recipe as private; preserve provenance and skip any image whose rights are uncertain.”
+- Publish preset: “Use the Cook skill to inspect token capabilities, then save and publish this authorized recipe; if reliable source/license/attribution is missing, keep it private and flag it for review.”
