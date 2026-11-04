@@ -49,12 +49,30 @@ export function IngredientCombobox({
     staleTime: 30_000,
   })
   const queryReady = debouncedQuery === value.name.trim()
-  const items = queryReady ? suggestions.data ?? [] : []
-  const optionCount = items.length + 1
+  const rawItems = useMemo(
+    () => (queryReady ? suggestions.data ?? [] : []),
+    [queryReady, suggestions.data],
+  )
+  const exactItems = useMemo(
+    () => rawItems.filter((item) => item.reason === 'exact' || item.reason === 'alias'),
+    [rawItems],
+  )
+  const items = exactItems.length > 0 ? exactItems : rawItems
+  const uniqueExactMatch = exactItems.length === 1
+  const optionCount = items.length + (uniqueExactMatch ? 0 : 1)
   const selected = useMemo(
     () => items.find((item) => item.canonicalIngredientId === value.canonicalIngredientId),
     [items, value.canonicalIngredientId],
   )
+  useEffect(() => {
+    const exactMatch = uniqueExactMatch ? exactItems[0] : null
+    if (exactMatch && value.canonicalIngredientId !== exactMatch.canonicalIngredientId) {
+      onChange({
+        name: value.name.trim() || exactMatch.displayName,
+        canonicalIngredientId: exactMatch.canonicalIngredientId,
+      })
+    }
+  }, [exactItems, onChange, uniqueExactMatch, value.canonicalIngredientId, value.name])
   const activeStatus =
     activeIndex >= 0
       ? activeIndex < items.length
@@ -145,14 +163,16 @@ export function IngredientCombobox({
             : value.canonicalIngredientId
               ? t('ingredient.canonicalSelected')
               : items.length > 0
-                ? items.length === 1
+                ? uniqueExactMatch
+                  ? t('ingredient.oneExactMatch')
+                  : items.length === 1
                   ? t('ingredient.oneSuggestion')
                   : t('ingredient.suggestions', { count: items.length })
                 : value.name.trim()
                   ? t('ingredient.noMatches')
                   : '')}
       </div>
-      {value.canonicalIngredientId && (
+      {value.canonicalIngredientId && !uniqueExactMatch && (
         <button
           type="button"
           className="button ghost ingredient-undo"
@@ -192,23 +212,25 @@ export function IngredientCombobox({
               )}
             </button>
           ))}
-          <button
-            type="button"
-            role="option"
-            id={`${id}-option-${items.length}`}
-            aria-selected={!value.canonicalIngredientId}
-            className={items.length === activeIndex ? 'ingredient-option active' : 'ingredient-option'}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => {
-              const next = { name: value.name, canonicalIngredientId: null }
-              onChange(next)
-              onCommit?.(next)
-              setOpen(false)
-            }}
-          >
-            <strong>{t('ingredient.keep', { name: value.name })}</strong>
-            <span>{t('ingredient.keepDetail')}</span>
-          </button>
+          {!uniqueExactMatch && (
+            <button
+              type="button"
+              role="option"
+              id={`${id}-option-${items.length}`}
+              aria-selected={!value.canonicalIngredientId}
+              className={items.length === activeIndex ? 'ingredient-option active' : 'ingredient-option'}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                const next = { name: value.name, canonicalIngredientId: null }
+                onChange(next)
+                onCommit?.(next)
+                setOpen(false)
+              }}
+            >
+              <strong>{t('ingredient.keep', { name: value.name })}</strong>
+              <span>{t('ingredient.keepDetail', { name: value.name })}</span>
+            </button>
+          )}
           {suggestions.error && <p className="error">{t('ingredient.unavailable')}</p>}
         </div>
       )}

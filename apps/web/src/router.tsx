@@ -2509,64 +2509,133 @@ function ProfileSettings({ user }: { user: User }) {
 
 export const COOK_SKILL_URL =
   'https://github.com/vichare/Cook/blob/main/skills/cook-recipe-import/SKILL.md'
-export const COOK_SKILL_INSTALL_INSTRUCTIONS = `Install the official Cook recipe import skill from:
-${COOK_SKILL_URL}
+export type TokenPreset = 'import' | 'manage' | 'publish'
 
-Use your AI client's documented “install skill from GitHub URL” flow. Client commands differ, so follow that client's instructions. Configure COOK_IMPORT_TOKEN in the client's secret store or environment and COOK_BASE_URL=https://cook.vichare.net separately. Never paste the token into a prompt or chat.`
-export const COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS = `${COOK_SKILL_INSTALL_INSTRUCTIONS}
-
-This token uses Cook's management preset. The skill may read owned recipes, create or update private recipes, propose reviewed revisions for public recipes, and manage cover images. It cannot publish or delete recipes. Confirm image rights before every upload.`
-export const COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS = `${COOK_SKILL_INSTALL_INSTRUCTIONS}
-
-This high-risk token includes recipes:publish. The skill may create public recipes, publish owned private recipes, directly update owned public recipes with optimistic concurrency, and manage cover images. It still cannot delete recipes or access another account. Check the granted scopes before every operation, confirm content and image rights, process batch work one recipe at a time, and finish with created/updated/skipped/failed counts plus recipe IDs or URLs.`
-export const COOK_IMPORT_PROMPT_TEMPLATE = `English:
-Use your browser tools to extract a recipe from a webpage I am authorized to access, preferring schema.org Recipe/JSON-LD. For video, use only legitimately available captions/transcripts; if unavailable, ask me for a transcript. Do not bypass login, paywalls, robots restrictions, access controls, or DRM. Rewrite concise structured ingredients and steps, preserve source URL/title/author, and record uncertainty as warnings. Preserve a stated 1–5 difficulty; include estimatedCalories only as an explicitly estimated whole-recipe total, never per serving or medical advice. Validate against the Cook import draft schema, then create a private review draft at COOK_BASE_URL using the recipes:import credential from the COOK_IMPORT_TOKEN secret/environment variable. Never print, quote, log, download, or place that token in a URL or prompt. Do not publish or finalize the recipe; tell me to review the private draft in Cook.
-
-简体中文：
-请使用浏览器工具，从我有权访问的网页提取菜谱，优先使用 schema.org Recipe/JSON-LD。视频只能使用合法可用的字幕或 transcript；若无法取得，请要求我提供 transcript。不得绕过登录、付费墙、robots 限制、访问控制或 DRM。请将食材和步骤简洁结构化并改写，保留来源 URL、标题和作者，把不确定内容记录为 warnings。保留来源明确给出的 1–5 难度；estimatedCalories 只能表示明确标注为估算的整份总热量，不能当作每份或医疗建议。按 Cook 导入草稿 schema 验证后，使用 secret store/环境变量中的 COOK_IMPORT_TOKEN（recipes:import 权限）调用 COOK_BASE_URL，创建私密待审核草稿。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。不要发布或完成菜谱；请提醒我在 Cook 中人工审核私密草稿。`
-export const COOK_MANAGE_PROMPT_TEMPLATE = `English:
-Use your browser or transcript tools only for content I am authorized to access. Prefer schema.org Recipe/JSON-LD and legitimately available captions/transcripts. Do not bypass login, paywalls, access controls, robots restrictions, or DRM. Use COOK_BASE_URL with the COOK_IMPORT_TOKEN secret/environment variable to read my recipes and versions, create private recipes, or update my private recipes with optimistic concurrency. Updates to public recipes must create a pending revision for my review and must never publish directly. Before uploading a local JPEG, PNG, or WebP cover image, ask me to confirm that I own it or have permission, then provide accurate alt text and any source/license/attribution. Never fetch or copy a source site's image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
-
-简体中文：
-仅使用浏览器或 transcript 工具处理我有权访问的内容。优先使用 schema.org Recipe/JSON-LD 和合法可用的字幕或 transcript。不得绕过登录、付费墙、访问控制、robots 限制或 DRM。使用 COOK_BASE_URL，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN，以读取我的菜谱及版本、创建私密菜谱，或通过乐观并发更新我的私密菜谱。公开菜谱的更新必须创建待审核 revision，绝不能直接发布。上传本地 JPEG、PNG 或 WebP 封面前，先请我确认拥有或获准使用，并提供准确的替代文字及来源、许可、归属信息。绝不要自动抓取或复制来源网站图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
-export const COOK_PUBLISH_PROMPT_TEMPLATE = `English:
-Use your browser or transcript tools only for content I am authorized to access. Use COOK_BASE_URL with the COOK_IMPORT_TOKEN secret/environment variable, and check that the token has recipes:read, recipes:write, and recipes:publish before requesting public visibility; cover changes also require recipes:images:write. With recipes:publish, you may create public recipes, publish my private recipes, and directly update my public recipes, but every update must use the current recipe version and stop on 409 until you reread it. Never delete recipes, access another account, bypass validation, or publish when recipes:publish is absent. Process bulk work one recipe at a time with a distinct Idempotency-Key for each creation. Do not silently skip failures. At the end, report created, updated, skipped, and failed counts with each recipe ID or URL and error. AI output becomes public immediately and may contain errors, copyrighted material, or private information, so preserve source/license/attribution, confirm image rights before uploading local JPEG/PNG/WebP bytes, and never fetch a source image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
-
-简体中文：
-仅使用浏览器或 transcript 工具处理我有权访问的内容。使用 COOK_BASE_URL，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN；请求公开可见性前，必须确认 token 同时具有 recipes:read、recipes:write 和 recipes:publish，修改封面还需要 recipes:images:write。有 recipes:publish 时，可以创建公开菜谱、把我的私密菜谱发布为公开，并直接更新我的公开菜谱；每次更新必须使用当前菜谱 version，遇到 409 必须重新读取后再处理。绝不能删除菜谱、访问其他账号、绕过校验，或在没有 recipes:publish 时发布。批量操作应逐条处理，每个创建使用独立 Idempotency-Key；不得悄悄跳过失败项。结束时输出 created、updated、skipped、failed 数量，以及每项菜谱 ID 或 URL 和错误。AI 输出会立即公开，可能包含错误、受版权保护材料或隐私信息，因此必须保留来源、许可和归属；上传本地 JPEG/PNG/WebP 图片前确认使用权，绝不自动抓取来源图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
-
-type TokenPreset = 'import' | 'manage' | 'publish'
-
-function skillInstructionsForPreset(preset: TokenPreset) {
-  if (preset === 'publish') return COOK_PUBLISH_SKILL_INSTALL_INSTRUCTIONS
-  if (preset === 'manage') return COOK_MANAGE_SKILL_INSTALL_INSTRUCTIONS
-  return COOK_SKILL_INSTALL_INSTRUCTIONS
+export function resolveCookBaseUrl(
+  origin = typeof window === 'undefined' ? 'http://localhost:5173' : window.location.origin,
+) {
+  const parsed = new URL(origin)
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Cook must run from an HTTP or HTTPS origin')
+  }
+  return parsed.origin
 }
 
-function promptForPreset(preset: TokenPreset) {
-  if (preset === 'publish') return COOK_PUBLISH_PROMPT_TEMPLATE
-  if (preset === 'manage') return COOK_MANAGE_PROMPT_TEMPLATE
-  return COOK_IMPORT_PROMPT_TEMPLATE
+function presetScopeGuidance(preset: TokenPreset) {
+  if (preset === 'publish') {
+    return `Preset: Manage and publish recipes.
+Required scopes: recipes:read, recipes:write, recipes:images:write, recipes:publish.
+This high-risk preset may create public recipes, publish owned private recipes, and directly update owned public recipes. It cannot delete recipes or access another account.`
+  }
+  if (preset === 'manage') {
+    return `Preset: Manage private recipes and cover images.
+Required scopes: recipes:read, recipes:write, recipes:images:write.
+It may manage owned private recipes and propose reviewed revisions for public recipes. It cannot publish or delete recipes.`
+  }
+  return `Preset: Import drafts only (recommended).
+Required scope: recipes:import.
+It can only create private review drafts; it cannot read, publish, or directly update recipes.`
+}
+
+function presetScopeGuidanceZh(preset: TokenPreset) {
+  if (preset === 'publish') {
+    return `权限预设：管理并发布菜谱。
+所需 scopes：recipes:read、recipes:write、recipes:images:write、recipes:publish。
+此高风险预设可创建公开菜谱、发布自己的私密菜谱并直接更新自己的公开菜谱；不能删除菜谱或访问其他账号。`
+  }
+  if (preset === 'manage') {
+    return `权限预设：管理私密菜谱和封面。
+所需 scopes：recipes:read、recipes:write、recipes:images:write。
+可管理自己的私密菜谱，并对公开菜谱提出待审核 revision；不能发布或删除菜谱。`
+  }
+  return `权限预设：仅导入草稿（推荐）。
+所需 scope：recipes:import。
+只能创建私密待审核草稿，不能读取、发布或直接更新菜谱。`
+}
+
+export function skillInstructionsForPreset(
+  preset: TokenPreset,
+  origin = resolveCookBaseUrl(),
+) {
+  const baseUrl = resolveCookBaseUrl(origin)
+  return `English:
+Install the official Cook recipe skill from:
+${COOK_SKILL_URL}
+
+COOK_BASE_URL is the trusted Cook site that receives skill API calls. Set it to this exact value:
+COOK_BASE_URL=${baseUrl}
+
+Store the separately copied one-time token in your AI client's secret store or environment under the exact name COOK_IMPORT_TOKEN. The token is intentionally not included in these reusable instructions. Never paste it into a prompt, URL, transcript, or log.
+
+${presetScopeGuidance(preset)}
+
+Minimal first use: ask your AI client, “Use the Cook skill to import this authorized recipe URL as a private review draft.” The import endpoint for this site is ${baseUrl}/api/import/drafts. Follow your client's documented “install skill from GitHub URL” and secret-configuration flow.
+
+简体中文：
+从以下地址安装 Cook 官方菜谱 Skill：
+${COOK_SKILL_URL}
+
+COOK_BASE_URL 是 Skill 调用 API 时使用的可信 Cook 站点。请设置为以下确定值，无需自行查找或修改：
+COOK_BASE_URL=${baseUrl}
+
+请使用单独的“复制 token”按钮取得一次性 secret，并在 AI 客户端的 secret store 或环境变量中以 COOK_IMPORT_TOKEN 为名称保存。可复用说明不会包含真实 token。绝不要把 token 粘贴到 prompt、URL、transcript 或日志中。
+
+${presetScopeGuidanceZh(preset)}
+
+首次使用示例：“请使用 Cook Skill，把这个我有权访问的菜谱 URL 导入为私密待审核草稿。”此站点的导入端点是 ${baseUrl}/api/import/drafts。安装 Skill 和配置 secret 时，请使用 AI 客户端提供的官方流程。`
+}
+
+export function promptForPreset(preset: TokenPreset, origin = resolveCookBaseUrl()) {
+  const baseUrl = resolveCookBaseUrl(origin)
+  const setup = `Cook base URL / Cook 站点地址:
+COOK_BASE_URL=${baseUrl}
+Use this exact resolved value; do not ask me to discover or replace a base-URL placeholder. Read the token only from the COOK_IMPORT_TOKEN secret/environment variable. The real token is not included in this prompt.
+请直接使用以上已解析的地址，不要要求我查找或替换 base URL 占位符。只从 COOK_IMPORT_TOKEN secret/环境变量读取 token；此 prompt 不包含真实 token。
+
+`
+  if (preset === 'publish') {
+    return `${setup}English:
+Use your browser or transcript tools only for content I am authorized to access. Use ${baseUrl} with the COOK_IMPORT_TOKEN secret/environment variable, and check that the token has recipes:read, recipes:write, and recipes:publish before requesting public visibility; cover changes also require recipes:images:write. With recipes:publish, you may create public recipes, publish my private recipes, and directly update my public recipes, but every update must use the current recipe version and stop on 409 until you reread it. Never delete recipes, access another account, bypass validation, or publish when recipes:publish is absent. Process bulk work one recipe at a time with a distinct Idempotency-Key for each creation. Do not silently skip failures. At the end, report created, updated, skipped, and failed counts with each recipe ID or URL and error. AI output becomes public immediately and may contain errors, copyrighted material, or private information, so preserve source/license/attribution, confirm image rights before uploading local JPEG/PNG/WebP bytes, and never fetch a source image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
+
+简体中文：
+仅使用浏览器或 transcript 工具处理我有权访问的内容。使用 ${baseUrl}，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN；请求公开可见性前，必须确认 token 同时具有 recipes:read、recipes:write 和 recipes:publish，修改封面还需要 recipes:images:write。有 recipes:publish 时，可以创建公开菜谱、把我的私密菜谱发布为公开，并直接更新我的公开菜谱；每次更新必须使用当前菜谱 version，遇到 409 必须重新读取后再处理。绝不能删除菜谱、访问其他账号、绕过校验，或在没有 recipes:publish 时发布。批量操作应逐条处理，每个创建使用独立 Idempotency-Key；不得悄悄跳过失败项。结束时输出 created、updated、skipped、failed 数量，以及每项菜谱 ID 或 URL 和错误。AI 输出会立即公开，可能包含错误、受版权保护材料或隐私信息，因此必须保留来源、许可和归属；上传本地 JPEG/PNG/WebP 图片前确认使用权，绝不自动抓取来源图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
+  }
+  if (preset === 'manage') {
+    return `${setup}English:
+Use your browser or transcript tools only for content I am authorized to access. Prefer schema.org Recipe/JSON-LD and legitimately available captions/transcripts. Do not bypass login, paywalls, access controls, robots restrictions, or DRM. Use ${baseUrl} with the COOK_IMPORT_TOKEN secret/environment variable to read my recipes and versions, create private recipes, or update my private recipes with optimistic concurrency. Updates to public recipes must create a pending revision for my review and must never publish directly. Before uploading a local JPEG, PNG, or WebP cover image, ask me to confirm that I own it or have permission, then provide accurate alt text and any source/license/attribution. Never fetch or copy a source site's image automatically. Never print, quote, log, download, or place the token in a URL or prompt.
+
+简体中文：
+仅使用浏览器或 transcript 工具处理我有权访问的内容。优先使用 schema.org Recipe/JSON-LD 和合法可用的字幕或 transcript。不得绕过登录、付费墙、访问控制、robots 限制或 DRM。使用 ${baseUrl}，并从 secret store/环境变量读取 COOK_IMPORT_TOKEN，以读取我的菜谱及版本、创建私密菜谱，或通过乐观并发更新我的私密菜谱。公开菜谱的更新必须创建待审核 revision，绝不能直接发布。上传本地 JPEG、PNG 或 WebP 封面前，先请我确认拥有或获准使用，并提供准确的替代文字及来源、许可、归属信息。绝不要自动抓取或复制来源网站图片。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。`
+  }
+  return `${setup}English:
+Use your browser tools to extract a recipe from a webpage I am authorized to access, preferring schema.org Recipe/JSON-LD. For video, use only legitimately available captions/transcripts; if unavailable, ask me for a transcript. Do not bypass login, paywalls, robots restrictions, access controls, or DRM. Rewrite concise structured ingredients and steps, preserve source URL/title/author, and record uncertainty as warnings. Preserve a stated 1–5 difficulty; include estimatedCalories only as an explicitly estimated whole-recipe total, never per serving or medical advice. Validate against the Cook import draft schema, then create a private review draft at ${baseUrl}/api/import/drafts using the recipes:import credential from the COOK_IMPORT_TOKEN secret/environment variable. Never print, quote, log, download, or place that token in a URL or prompt. Do not publish or finalize the recipe; tell me to review the private draft in Cook.
+
+简体中文：
+请使用浏览器工具，从我有权访问的网页提取菜谱，优先使用 schema.org Recipe/JSON-LD。视频只能使用合法可用的字幕或 transcript；若无法取得，请要求我提供 transcript。不得绕过登录、付费墙、robots 限制、访问控制或 DRM。请将食材和步骤简洁结构化并改写，保留来源 URL、标题和作者，把不确定内容记录为 warnings。保留来源明确给出的 1–5 难度；estimatedCalories 只能表示明确标注为估算的整份总热量，不能当作每份或医疗建议。按 Cook 导入草稿 schema 验证后，使用 secret store/环境变量中的 COOK_IMPORT_TOKEN（recipes:import 权限）调用 ${baseUrl}/api/import/drafts，创建私密待审核草稿。绝不要打印、引用、记录、下载 token，也不要把 token 放进 URL 或 prompt。不要发布或完成菜谱；请提醒我在 Cook 中人工审核私密草稿。`
 }
 
 export function ImportTokenSettings() {
   const { formatDateTime, t } = useI18n()
   const queryClient = useQueryClient()
+  const baseUrl = useMemo(() => resolveCookBaseUrl(), [])
   const tokens = useQuery({ queryKey: ['import-tokens'], queryFn: api.importTokens })
   const [name, setName] = useState(() => t('token.defaultName'))
   const [preset, setPreset] = useState<TokenPreset>('import')
   const [createdPreset, setCreatedPreset] = useState<TokenPreset>('import')
   const [expiresInDays, setExpiresInDays] = useState<30 | 90 | null>(90)
   const [secret, setSecret] = useState<string | null>(null)
-  const [copyStatus, setCopyStatus] = useState<string | null>(null)
-  const [copyError, setCopyError] = useState<string | null>(null)
+  const copySequence = useRef(0)
+  const [copyNotice, setCopyNotice] = useState<{
+    id: number
+    kind: 'success' | 'error'
+    message: string
+  } | null>(null)
   const create = useMutation({
     mutationFn: () => api.createImportToken(name, expiresInDays, preset),
     onSuccess: async (created) => {
       setSecret(created.secret)
       setCreatedPreset(preset)
-      setCopyStatus(null)
-      setCopyError(null)
+      setCopyNotice(null)
       await queryClient.invalidateQueries({ queryKey: ['import-tokens'] })
     },
   })
@@ -2575,12 +2644,18 @@ export function ImportTokenSettings() {
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['import-tokens'] }),
   })
   function copyOutput(value: string, success: string) {
-    setCopyError(null)
     void copyText(value)
-      .then(() => setCopyStatus(success))
+      .then(() => setCopyNotice({
+        id: ++copySequence.current,
+        kind: 'success',
+        message: success,
+      }))
       .catch(() => {
-        setCopyStatus(null)
-        setCopyError(t('token.copyFailed'))
+        setCopyNotice({
+          id: ++copySequence.current,
+          kind: 'error',
+          message: t('token.copyFailed'),
+        })
       })
   }
   return (
@@ -2682,6 +2757,17 @@ export function ImportTokenSettings() {
             <p>{t('token.installSkillDetail')}</p>
             <p>{t('token.skillMainNote')}</p>
             <label>
+              {t('token.baseUrlLabel')}
+              <input readOnly value={baseUrl} />
+            </label>
+            <p>{t('token.baseUrlDetail', { baseUrl })}</p>
+            <button
+              className="button ghost"
+              onClick={() => copyOutput(baseUrl, t('token.baseUrlCopied'))}
+            >
+              {t('token.copyBaseUrl')}
+            </button>
+            <label>
               {t('token.skillUrlLabel')}
               <input readOnly value={COOK_SKILL_URL} />
             </label>
@@ -2691,7 +2777,7 @@ export function ImportTokenSettings() {
             <button
               className="button ghost"
               onClick={() => copyOutput(
-                skillInstructionsForPreset(createdPreset),
+                skillInstructionsForPreset(createdPreset, baseUrl),
                 t('token.installCopied'),
               )}
             >
@@ -2704,19 +2790,26 @@ export function ImportTokenSettings() {
             <button
               className="button ghost"
               onClick={() => copyOutput(
-                promptForPreset(createdPreset),
+                promptForPreset(createdPreset, baseUrl),
                 t('token.promptCopied'),
               )}
             >
               {t('token.copyPrompt')}
             </button>
           </section>
-          {copyStatus && <p role="status">{copyStatus}</p>}
-          {copyError && <p className="error" role="alert">{copyError}</p>}
+          {copyNotice?.kind === 'success' && (
+            <p key={copyNotice.id} role="status" aria-live="polite">
+              {copyNotice.message}
+            </p>
+          )}
+          {copyNotice?.kind === 'error' && (
+            <p key={copyNotice.id} className="error" role="alert">
+              {copyNotice.message}
+            </p>
+          )}
           <button className="button primary" onClick={() => {
             setSecret(null)
-            setCopyStatus(null)
-            setCopyError(null)
+            setCopyNotice(null)
           }}>
             {t('token.savedClose')}
           </button>

@@ -70,7 +70,7 @@ Private-management tokens can list/read owned recipes, idempotently create priva
 
 The image pipeline accepts only JPEG, PNG, and WebP bytes, rejects SVG/GIF/unsupported formats, enforces request/decoder/pixel/stored-byte limits, applies orientation, resizes to a 1,600px longest edge, flattens transparency, and re-encodes to JPEG to remove metadata. Cook never fetches remote images. The skill must ask the user to confirm image rights and must not automatically copy source-site or video images.
 
-After the one-time reveal, Settings provides a stable link to the official public skill, copyable token-free installation guidance, and a bilingual prompt template for general AI clients. The skill and prompt refer only to `COOK_IMPORT_TOKEN` and `COOK_BASE_URL`; the real secret is copied separately and is never interpolated into those outputs or stored in browser persistence.
+After the one-time reveal, Settings provides a stable link to the official public skill, the exact trusted frontend origin already assigned as `COOK_BASE_URL`, copyable token-free installation guidance with preset scopes and a minimal first-use example, and a bilingual prompt template for general AI clients. The real `COOK_IMPORT_TOKEN` secret is copied separately and is never interpolated into reusable output or stored in browser persistence.
 
 Agent Finder did not yield an adopted third-party dedicated recipe skill. Cook therefore ships its own small contract-focused skill and does not add Firecrawl or Apify as dependencies.
 

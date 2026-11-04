@@ -1374,6 +1374,14 @@ async fn ingredient_suggestions(
             })
         })
         .collect::<Vec<_>>();
+    if suggestions
+        .iter()
+        .any(|suggestion| matches!(suggestion.reason, MatchReason::Exact | MatchReason::Alias))
+    {
+        suggestions.retain(|suggestion| {
+            matches!(suggestion.reason, MatchReason::Exact | MatchReason::Alias)
+        });
+    }
     suggestions.sort_by(|left, right| {
         left.reason
             .cmp(&right.reason)
@@ -5965,6 +5973,130 @@ mod tests {
             .find(|item| item["recipe"]["title"] == "Tomato plate")
             .unwrap();
         assert_eq!(tomato["status"], "READY");
+    }
+
+    #[tokio::test]
+    async fn ingredient_suggestions_prefer_exact_matches_and_preserve_ambiguity() {
+        let (app, _, pool) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Exact owner").await;
+        let owner_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE display_name = 'Exact owner'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let pantry = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pantry")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::from(
+                        json!([
+                            {"name": "Tomato", "status": "have", "quantityNote": ""},
+                            {"name": "Tomato sauce", "status": "have", "quantityNote": ""},
+                            {"name": "Plum tomato", "status": "have", "quantityNote": ""},
+                            {"name": "Roma tomato sauce", "status": "have", "quantityNote": ""}
+                        ])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pantry.status(), StatusCode::OK);
+        let pantry = response_json(pantry).await;
+        let tomato_id = pantry
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "Tomato")
+            .unwrap()["canonicalIngredientId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plum_tomato_id = pantry
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "Plum tomato")
+            .unwrap()["canonicalIngredientId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let exact = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=%EF%BC%B4%EF%BD%8F%EF%BD%8D%EF%BD%81%EF%BD%94%EF%BD%8F")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(exact).await,
+            json!([{
+                "canonicalIngredientId": tomato_id,
+                "displayName": "Tomato",
+                "matchedText": "Tomato",
+                "reason": "exact"
+            }])
+        );
+
+        sqlx::query(
+            "INSERT INTO ingredient_aliases
+             (id, owner_id, alias_name, alias_normalized, canonical_ingredient_id, created_at)
+             VALUES (?, ?, 'Roma tomato', 'roma tomato', ?, unixepoch())",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&owner_id)
+        .bind(&plum_tomato_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let alias = app
+            .clone()
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=roma%20tomato")
+                    .header("cookie", &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let alias = response_json(alias).await;
+        assert_eq!(alias.as_array().unwrap().len(), 1);
+        assert_eq!(alias[0]["canonicalIngredientId"], plum_tomato_id);
+        assert_eq!(alias[0]["reason"], "alias");
+
+        sqlx::query(
+            "INSERT INTO ingredient_aliases
+             (id, owner_id, alias_name, alias_normalized, canonical_ingredient_id, created_at)
+             VALUES (?, ?, 'Tomato', 'tomato', ?, unixepoch())",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&owner_id)
+        .bind(&plum_tomato_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ambiguous = app
+            .oneshot(
+                Request::get("/api/ingredients/suggestions?q=tomato")
+                    .header("cookie", owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ambiguous = response_json(ambiguous).await;
+        assert_eq!(ambiguous.as_array().unwrap().len(), 2);
+        assert!(ambiguous
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["reason"] == "exact" || item["reason"] == "alias"));
     }
 
     #[tokio::test]
