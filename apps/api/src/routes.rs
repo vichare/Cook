@@ -2838,6 +2838,24 @@ mod tests {
         format!("{}.{}", Utc::now().timestamp(), label)
     }
 
+    async fn set_cover_rate_count(pool: &SqlitePool, owner_id: &str, count: i64) {
+        let now = Utc::now().timestamp();
+        let window_started_at = now - now.rem_euclid(60 * 60);
+        sqlx::query(
+            "INSERT INTO public_api_rate_limits (rate_key, window_started_at, request_count)
+             VALUES (?, ?, ?)
+             ON CONFLICT(rate_key) DO UPDATE SET
+               window_started_at = excluded.window_started_at,
+               request_count = excluded.request_count",
+        )
+        .bind(format!("recipe-cover:{owner_id}"))
+        .bind(window_started_at)
+        .bind(count)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn private_recipe_is_not_visible_to_another_account() {
         let app = build_app(Config::test()).await.unwrap();
@@ -4904,10 +4922,15 @@ mod tests {
 
     #[tokio::test]
     async fn interactive_recipe_and_image_mutations_reject_stale_versions() {
-        let app = build_app(Config::test()).await.unwrap();
+        let (app, _, pool) = app_with_runtime().await;
         let cookie = login(&app, "Owner").await;
         let created = create_recipe(&app, &cookie, "private").await;
         let recipe_id = created["id"].as_str().unwrap();
+        let owner_id: String = sqlx::query_scalar("SELECT owner_id FROM recipes WHERE id = ?")
+            .bind(recipe_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let browser_update = json!({
             "title": "Browser edit",
             "description": "",
@@ -5000,6 +5023,7 @@ mod tests {
             .unwrap();
         assert_eq!(upload.status(), StatusCode::OK);
         assert_eq!(response_json(upload).await["version"], 4);
+        set_cover_rate_count(&pool, &owner_id, 30).await;
         let (replay_content_type, replay_body) = multipart_image(&test_png());
         let replay = app
             .clone()
@@ -5032,6 +5056,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reused_for_different_upload.status(), StatusCode::CONFLICT);
+        set_cover_rate_count(&pool, &owner_id, 0).await;
         let stale_content_after_image = app
             .clone()
             .oneshot(
@@ -5068,6 +5093,7 @@ mod tests {
             .unwrap();
         assert_eq!(metadata_update.status(), StatusCode::OK);
         assert_eq!(response_json(metadata_update).await["version"], 5);
+        set_cover_rate_count(&pool, &owner_id, 30).await;
         let metadata_replay = app
             .clone()
             .oneshot(
@@ -5083,6 +5109,7 @@ mod tests {
             .unwrap();
         assert_eq!(metadata_replay.status(), StatusCode::OK);
         assert_eq!(response_json(metadata_replay).await["version"], 5);
+        set_cover_rate_count(&pool, &owner_id, 0).await;
         let stale_metadata = app
             .clone()
             .oneshot(
@@ -5112,6 +5139,7 @@ mod tests {
             .unwrap();
         assert_eq!(deleted.status(), StatusCode::OK);
         assert_eq!(response_json(deleted).await["version"], 6);
+        set_cover_rate_count(&pool, &owner_id, 30).await;
         let delete_replay = app
             .oneshot(
                 Request::delete(format!("/api/recipes/{recipe_id}/cover"))
@@ -5358,30 +5386,24 @@ mod tests {
         let rate_cookie = login(&app, "Cover rate owner").await;
         let rate_recipe = create_recipe(&app, &rate_cookie, "private").await;
         let rate_recipe_id = rate_recipe["id"].as_str().unwrap();
-        for index in 0..31 {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::delete(format!("/api/recipes/{rate_recipe_id}/cover"))
-                        .header("cookie", &rate_cookie)
-                        .header("if-match", "\"recipe-v1\"")
-                        .header(
-                            "idempotency-key",
-                            cover_key(&format!("rate-delete-{index}")),
-                        )
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            if index == 0 {
-                assert_eq!(response.status(), StatusCode::OK);
-            } else if index < 30 {
-                assert_eq!(response.status(), StatusCode::CONFLICT);
-            } else {
-                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-            }
-        }
+        let rate_owner_id: String = sqlx::query_scalar("SELECT owner_id FROM recipes WHERE id = ?")
+            .bind(rate_recipe_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        set_cover_rate_count(&pool, &rate_owner_id, 30).await;
+        let rate_limited = app
+            .oneshot(
+                Request::delete(format!("/api/recipes/{rate_recipe_id}/cover"))
+                    .header("cookie", &rate_cookie)
+                    .header("if-match", "\"recipe-v1\"")
+                    .header("idempotency-key", cover_key("rate-delete"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rate_limited.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

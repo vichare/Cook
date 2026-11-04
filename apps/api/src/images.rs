@@ -22,7 +22,7 @@ use image::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, Transaction};
 use url::Url;
 use uuid::Uuid;
 
@@ -304,7 +304,6 @@ pub(crate) async fn session_upload_image(
 ) -> AppResult<axum::Json<RecipeVersion>> {
     let now = Utc::now().timestamp();
     let idempotency_key = cover_idempotency_key(&headers, now)?;
-    enforce_cover_rate_limit(&state.pool, &user.id, now).await?;
     let expected_version = expected_recipe_version(&headers)?;
     let image = parse_image_multipart(multipart).await?;
     let fingerprint = cover_mutation_fingerprint(
@@ -347,6 +346,7 @@ pub(crate) async fn session_upload_image(
         transaction.commit().await?;
         return Ok(axum::Json(RecipeVersion { version }));
     }
+    enforce_cover_rate_limit(&mut transaction, &user.id, now).await?;
     enforce_cover_mutation_capacity(&mut transaction, &user.id, &recipe_id, now).await?;
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
@@ -374,7 +374,6 @@ pub(crate) async fn session_delete_image(
 ) -> AppResult<axum::Json<RecipeVersion>> {
     let now = Utc::now().timestamp();
     let idempotency_key = cover_idempotency_key(&headers, now)?;
-    enforce_cover_rate_limit(&state.pool, &user.id, now).await?;
     let expected_version = expected_recipe_version(&headers)?;
     let fingerprint = cover_mutation_fingerprint("delete", &[]);
     let mut transaction = state.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -392,6 +391,7 @@ pub(crate) async fn session_delete_image(
         transaction.commit().await?;
         return Ok(axum::Json(RecipeVersion { version }));
     }
+    enforce_cover_rate_limit(&mut transaction, &user.id, now).await?;
     enforce_cover_mutation_capacity(&mut transaction, &user.id, &recipe_id, now).await?;
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
@@ -420,7 +420,6 @@ pub(crate) async fn session_update_image_metadata(
 ) -> AppResult<axum::Json<RecipeVersion>> {
     let now = Utc::now().timestamp();
     let idempotency_key = cover_idempotency_key(&headers, now)?;
-    enforce_cover_rate_limit(&state.pool, &user.id, now).await?;
     let expected_version = expected_recipe_version(&headers)?;
     let metadata = validate_metadata(
         &input.alt_text,
@@ -464,6 +463,7 @@ pub(crate) async fn session_update_image_metadata(
         transaction.commit().await?;
         return Ok(axum::Json(RecipeVersion { version }));
     }
+    enforce_cover_rate_limit(&mut transaction, &user.id, now).await?;
     enforce_cover_mutation_capacity(&mut transaction, &user.id, &recipe_id, now).await?;
     let version =
         claim_owned_recipe_version(&mut transaction, &recipe_id, &user.id, expected_version)
@@ -534,7 +534,11 @@ fn cover_idempotency_key(headers: &HeaderMap, now: i64) -> AppResult<String> {
     Ok(key.to_string())
 }
 
-async fn enforce_cover_rate_limit(pool: &SqlitePool, owner_id: &str, now: i64) -> AppResult<()> {
+async fn enforce_cover_rate_limit(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner_id: &str,
+    now: i64,
+) -> AppResult<()> {
     let window_started_at = now - now.rem_euclid(COVER_RATE_WINDOW_SECONDS);
     let rate_key = format!("recipe-cover:{owner_id}");
     let request_count: i64 = sqlx::query_scalar(
@@ -551,7 +555,7 @@ async fn enforce_cover_rate_limit(pool: &SqlitePool, owner_id: &str, now: i64) -
     )
     .bind(rate_key)
     .bind(window_started_at)
-    .fetch_one(pool)
+    .fetch_one(&mut **transaction)
     .await?;
     if request_count > COVER_RATE_LIMIT {
         Err(AppError::RateLimited)

@@ -610,7 +610,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe missing or not owned }
         "409": { description: Recipe version changed }
-        "429": { description: Cover mutation rate or active replay-key capacity exceeded }
+        "429": { description: New cover mutation rate or active replay-key capacity exceeded; exact committed replays are exempt }
         "413": { description: Upload, decoded pixels, decoder allocation, or normalized bytes exceed the documented limit }
     put:
       description: Updates alt text and optional source/license/attribution for the authenticated owner's existing cover.
@@ -634,7 +634,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe or cover missing or not owned }
         "409": { description: Recipe version changed }
-        "429": { description: Cover mutation rate or active replay-key capacity exceeded }
+        "429": { description: New cover mutation rate or active replay-key capacity exceeded; exact committed replays are exempt }
     delete:
       description: Removes the authenticated owner's cover image without deleting the recipe.
       security:
@@ -651,7 +651,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Recipe missing or not owned }
         "409": { description: Recipe version changed }
-        "429": { description: Cover mutation rate or active replay-key capacity exceeded }
+        "429": { description: New cover mutation rate or active replay-key capacity exceeded; exact committed replays are exempt }
   /api/recipe-images/{id}:
     get:
       description: Returns a normalized JPEG by random image ID. Public recipe images require cache revalidation on reuse so unpublish/delete can return 404; private images require the owner session or an owner token with recipes:read and use private, no-store caching.
