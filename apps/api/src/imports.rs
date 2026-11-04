@@ -25,7 +25,9 @@ pub const SCOPE_RECIPES_PUBLISH: &str = "recipes:publish";
 const IMPORT_RATE_WINDOW_SECONDS: i64 = 60 * 60;
 const IMPORT_RATE_LIMIT: i64 = 20;
 const READ_RATE_LIMIT: i64 = 240;
-const WRITE_RATE_LIMIT: i64 = 60;
+const RECIPE_WRITE_RATE_LIMIT: i64 = 600;
+const IMAGE_WRITE_RATE_LIMIT: i64 = 300;
+const PUBLISH_RATE_LIMIT: i64 = 60;
 const CAPABILITIES_RATE_LIMIT: i64 = 120;
 const ACTIVE_DRAFT_QUOTA: i64 = 50;
 
@@ -691,7 +693,9 @@ async fn enforce_token_rate_limit(
 fn rate_limit_for_scope(scope: &str) -> i64 {
     match scope {
         SCOPE_RECIPES_READ => READ_RATE_LIMIT,
-        SCOPE_RECIPES_WRITE | SCOPE_IMAGES_WRITE | SCOPE_RECIPES_PUBLISH => WRITE_RATE_LIMIT,
+        SCOPE_RECIPES_WRITE => RECIPE_WRITE_RATE_LIMIT,
+        SCOPE_IMAGES_WRITE => IMAGE_WRITE_RATE_LIMIT,
+        SCOPE_RECIPES_PUBLISH => PUBLISH_RATE_LIMIT,
         _ => IMPORT_RATE_LIMIT,
     }
 }
@@ -995,6 +999,16 @@ fn trim_optional(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_scope_rate_limits_preserve_read_boundaries_and_allow_bulk_writes() {
+        assert_eq!(rate_limit_for_scope(SCOPE_IMPORT), 20);
+        assert_eq!(rate_limit_for_scope(SCOPE_RECIPES_READ), 240);
+        assert_eq!(rate_limit_for_scope(SCOPE_RECIPES_WRITE), 600);
+        assert_eq!(rate_limit_for_scope(SCOPE_IMAGES_WRITE), 300);
+        assert_eq!(rate_limit_for_scope(SCOPE_RECIPES_PUBLISH), 60);
+        assert_eq!(CAPABILITIES_RATE_LIMIT, 120);
+    }
 
     #[test]
     fn import_payload_rejects_non_http_urls_and_oversized_ingredients() {

@@ -14,6 +14,7 @@ Use this skill only for content the user is authorized to access. Prefer the saf
 - GitHub Copilot does not document an arbitrary custom-secret UI for skills. The user should set both environment variables before launching the app and restart it after changes so the app inherits them.
 - At task start, call `GET $COOK_BASE_URL/api/ai/capabilities` once. It returns only the token prefix, scopes, expiry, and optional preset. Check again only before a newly requested capability-sensitive phase when needed, not before every recipe.
 - `recipes:import` creates private review drafts. Management uses `recipes:read`, `recipes:write`, and `recipes:images:write`. Direct public creation/update additionally requires `recipes:publish`.
+- Per token, the fixed one-hour buckets allow 20 draft imports, 240 recipe reads, 600 recipe writes, 300 image writes, 60 publish-scope checks, and 120 capability checks. Keep batches comfortably below the relevant ceiling to leave retry headroom.
 - No token preset grants recipe deletion, pantry, shopping-list, account/profile, favorite-account, another user's recipes, or ordinary browser-session access.
 
 ## Source and provenance policy

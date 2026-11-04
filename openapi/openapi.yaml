@@ -689,7 +689,7 @@ paths:
         "404": { description: Image missing or private image not owned }
   /api/ai/capabilities:
     get:
-      description: Inspects safe metadata for any valid non-revoked, non-expired Cook AI bearer token. No business scope is required; every business endpoint still enforces its own scopes.
+      description: Inspects safe metadata for any valid non-revoked, non-expired Cook AI bearer token. No business scope is required; every business endpoint still enforces its own scopes. This capability bucket allows 120 requests per token per hour.
       security:
         - importBearer: []
       responses:
@@ -702,7 +702,7 @@ paths:
         "429": { description: Capability inspection rate limit exceeded }
   /api/ai/recipes:
     get:
-      description: Lists only recipes owned by the token principal. Requires recipes:read.
+      description: Lists only recipes owned by the token principal. Requires recipes:read, whose bucket allows 240 requests per token per hour.
       security:
         - importBearer: []
       responses:
@@ -716,7 +716,7 @@ paths:
         "401": { description: Invalid, expired, or revoked token }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
-      description: Creates a recipe for the token principal. The default visibility is private; public requires recipes:publish in addition to recipes:write. An Idempotency-Key is required, and retries with the same token/key return the original recipe.
+      description: Creates a recipe for the token principal. The default visibility is private; public requires recipes:publish in addition to recipes:write. The recipes:write bucket allows 600 requests per token per hour. An Idempotency-Key is required, and retries with the same token/key return the original recipe.
       security:
         - importBearer: []
       parameters:
@@ -752,7 +752,7 @@ paths:
     parameters:
       - $ref: "#/components/parameters/RecipeId"
     get:
-      description: Reads an owned recipe. Cross-account IDs return 404. Requires recipes:read.
+      description: Reads an owned recipe. Cross-account IDs return 404. Requires recipes:read, whose bucket allows 240 requests per token per hour.
       security:
         - importBearer: []
       responses:
@@ -761,7 +761,7 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: Recipe missing or not owned }
     put:
-      description: Optimistically updates an owned recipe. Without recipes:publish, public recipe changes create a pending owner-reviewed revision. With recipes:publish, the token may publish an owned private recipe or directly update an owned public recipe; stale versions still return 409.
+      description: Optimistically updates an owned recipe. Without recipes:publish, public recipe changes create a pending owner-reviewed revision. With recipes:publish, the token may publish an owned private recipe or directly update an owned public recipe; stale versions still return 409. The recipes:write bucket allows 600 requests per token per hour.
       security:
         - importBearer: []
       requestBody:
@@ -791,7 +791,7 @@ paths:
       - $ref: "#/components/parameters/RecipeId"
       - $ref: "#/components/parameters/RecipeVersion"
     post:
-      description: Replaces an owned recipe cover. Requires recipes:images:write. Public covers create a pending revision unless the token also has recipes:publish, in which case the live cover changes directly.
+      description: Replaces an owned recipe cover. Requires recipes:images:write, whose bucket allows 300 requests per token per hour. Public covers create a pending revision unless the token also has recipes:publish, in which case the live cover changes directly.
       security:
         - importBearer: []
       requestBody:
@@ -808,7 +808,7 @@ paths:
         "409": { description: Recipe version is stale or a pending revision already exists }
         "413": { description: Image resource limit exceeded }
     delete:
-      description: Removes an owned cover. Public cover removal creates a pending revision unless the token also has recipes:publish. Recipe deletion is not supported.
+      description: Removes an owned cover. Requires recipes:images:write, whose bucket allows 300 requests per token per hour. Public cover removal creates a pending revision unless the token also has recipes:publish. Recipe deletion is not supported.
       security:
         - importBearer: []
       responses:
