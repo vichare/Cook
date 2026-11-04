@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LocaleProvider } from './i18n'
 import {
@@ -57,6 +57,8 @@ describe('import token reveal', () => {
     writeText.mockClear()
     createImportToken.mockClear()
     aiCapabilities.mockClear()
+    importTokens.mockReset()
+    importTokens.mockResolvedValue([])
     Object.defineProperty(window, 'confirm', {
       configurable: true,
       value: vi.fn().mockReturnValue(true),
@@ -78,6 +80,8 @@ describe('import token reveal', () => {
       </LocaleProvider>,
     )
 
+    expect(screen.getByRole('heading', { name: 'AI client setup' })).toBeVisible()
+    expect(screen.getByDisplayValue(`COOK_BASE_URL=${baseUrl}`)).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
     expect(await screen.findByText(secret)).toBeVisible()
     expect(createImportToken).toHaveBeenCalledWith('My AI client', 90, 'import')
@@ -94,12 +98,12 @@ describe('import token reveal', () => {
     expect(prompt).toContain('COOK_IMPORT_TOKEN')
     expect(prompt).toContain(`${baseUrl}/api/import/drafts`)
     expect(prompt).not.toContain(secret)
-    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.4.0/skills/')
+    expect(COOK_SKILL_URL).toContain('github.com/vichare/Cook/tree/v0.4.1/skills/')
     expect(installInstructions).toContain(
-      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.0',
+      'gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.1',
     )
     expect(installInstructions).toContain(
-      'gh skill preview vichare/Cook cook-recipe-import@v0.4.0',
+      'gh skill preview vichare/Cook cook-recipe-import@v0.4.1',
     )
     expect(installInstructions).toContain('Do not copy only SKILL.md')
     expect(installInstructions).not.toContain('install skill from GitHub URL')
@@ -113,13 +117,143 @@ describe('import token reveal', () => {
       successMessage,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Copy Cook base URL' }))
-    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(baseUrl))
+    const assignment = `COOK_BASE_URL=${baseUrl}`
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(assignment))
+    const firstBaseUrlAnnouncement = screen.getByText('COOK_BASE_URL assignment copied.')
+    fireEvent.click(screen.getByRole('button', { name: 'Copy Cook base URL' }))
+    await waitFor(() => expect(
+      writeText.mock.calls.filter(([value]) => value === assignment),
+    ).toHaveLength(2))
+    expect(screen.getByText('COOK_BASE_URL assignment copied.')).not.toBe(firstBaseUrlAnnouncement)
     fireEvent.click(screen.getByRole('button', { name: 'Copy token' }))
     await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(secret))
     expect(writeText.mock.calls.filter(([value]) => value === secret)).toHaveLength(2)
     expect(screen.getByText(successMessage)).not.toBe(firstAnnouncement)
     fireEvent.click(screen.getByRole('button', { name: 'I have stored it securely' }))
     expect(screen.queryByText(secret)).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'AI client setup' })).toBeVisible()
+    expect(screen.getByDisplayValue(assignment)).toBeVisible()
+  })
+
+  it('keeps setup available on a return visit and can select an existing token preset without a secret', async () => {
+    const baseUrl = resolveCookBaseUrl()
+    importTokens.mockResolvedValueOnce([
+      {
+        id: 'existing-token',
+        name: 'Recipe manager',
+        prefix: 'cook_man',
+        scopes: ['recipes:read', 'recipes:write', 'recipes:images:write'],
+        createdAt: '2026-11-04T00:00:00Z',
+        lastUsedAt: null,
+        expiresAt: '2027-02-02T00:00:00Z',
+        revokedAt: null,
+      },
+      {
+        id: 'publish-token',
+        name: 'Recipe publisher',
+        prefix: 'cook_pub',
+        scopes: ['recipes:read', 'recipes:write', 'recipes:images:write', 'recipes:publish'],
+        createdAt: '2026-11-04T00:00:00Z',
+        lastUsedAt: null,
+        expiresAt: '2026-12-04T00:00:00Z',
+        revokedAt: null,
+      },
+      {
+        id: 'duplicate-name-token',
+        name: 'Recipe manager',
+        prefix: 'cook_man_2',
+        scopes: ['recipes:read', 'recipes:write', 'recipes:images:write'],
+        createdAt: '2026-11-04T00:00:00Z',
+        lastUsedAt: null,
+        expiresAt: '2027-02-02T00:00:00Z',
+        revokedAt: null,
+      },
+    ])
+    const { unmount } = render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <ImportTokenSettings />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+
+    expect(await screen.findAllByText('Setup preset: Manage my private recipes and cover images'))
+      .toHaveLength(2)
+    expect(screen.getByRole('button', {
+      name: 'Use Manage my private recipes and cover images setup for token Recipe manager (cook_man)',
+    })).toBeVisible()
+    expect(screen.getByRole('button', {
+      name: 'Use Manage and publish recipes setup for token Recipe publisher (cook_pub)',
+    })).toBeVisible()
+    expect(screen.getByRole('button', {
+      name: 'Use Manage my private recipes and cover images setup for token Recipe manager (cook_man_2)',
+    })).toBeVisible()
+    expect(screen.queryByText(secret)).not.toBeInTheDocument()
+    expect(screen.getByDisplayValue(`COOK_BASE_URL=${baseUrl}`)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Use Manage my private recipes and cover images setup for token Recipe manager (cook_man)',
+    }))
+    fireEvent.click(screen.getByRole('button', { name: 'Copy prompt template' }))
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(
+      promptForPreset('manage', baseUrl),
+    ))
+    expect(writeText.mock.calls.flat().join('\n')).not.toContain(secret)
+
+    unmount()
+    render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <ImportTokenSettings />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+    expect(screen.getByRole('heading', { name: 'AI client setup' })).toBeVisible()
+    expect(screen.getByDisplayValue(`COOK_BASE_URL=${baseUrl}`)).toBeVisible()
+    expect(screen.queryByText(secret)).not.toBeInTheDocument()
+  })
+
+  it('keeps setup guidance aligned with the preset submitted while creation is pending', async () => {
+    const baseUrl = resolveCookBaseUrl()
+    let resolveCreation: ((value: Awaited<ReturnType<typeof createImportToken>>) => void) | undefined
+    createImportToken.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveCreation = resolve
+    }))
+    render(
+      <LocaleProvider initialLocale="en" storage={null}>
+        <QueryClientProvider client={new QueryClient()}>
+          <ImportTokenSettings />
+        </QueryClientProvider>
+      </LocaleProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create token' }))
+    await waitFor(() => expect(createImportToken).toHaveBeenCalledWith(
+      'My AI client',
+      90,
+      'import',
+    ))
+    fireEvent.click(screen.getByRole('radio', { name: /Manage my private recipes/ }))
+    await act(async () => {
+      resolveCreation?.({
+        token: {
+          id: 'token-id',
+          name: 'My AI client',
+          prefix: 'cook_imp',
+          scopes: ['recipes:import'],
+          createdAt: '2026-11-04T00:00:00Z',
+          lastUsedAt: null,
+          expiresAt: '2027-02-02T00:00:00Z',
+          revokedAt: null,
+        },
+        secret,
+      })
+    })
+
+    expect(await screen.findByText(secret)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Copy prompt template' }))
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(
+      promptForPreset('import', baseUrl),
+    ))
   })
 
   it('uses the manage preset without embedding the one-time token in its prompt', async () => {
@@ -266,6 +400,8 @@ describe('import token reveal', () => {
       </LocaleProvider>,
     )
 
+    expect(screen.getByRole('heading', { name: 'AI 客户端设置' })).toBeVisible()
+    expect(screen.getByDisplayValue(`COOK_BASE_URL=${resolveCookBaseUrl()}`)).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: '创建 token' }))
     expect(await screen.findByText(secret)).toBeVisible()
     const copyButton = screen.getByRole('button', { name: '复制 token' })

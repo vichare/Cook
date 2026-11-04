@@ -2957,12 +2957,20 @@ function ProfileSettings({ user }: { user: User }) {
 }
 
 export const COOK_SKILL_URL =
-  'https://github.com/vichare/Cook/tree/v0.4.0/skills/cook-recipe-import'
+  'https://github.com/vichare/Cook/tree/v0.4.1/skills/cook-recipe-import'
 export const COOK_IMPORT_SCHEMA_URL =
-  'https://raw.githubusercontent.com/vichare/Cook/v0.4.0/skills/cook-recipe-import/schema/import-draft-v1.schema.json'
+  'https://raw.githubusercontent.com/vichare/Cook/v0.4.1/skills/cook-recipe-import/schema/import-draft-v1.schema.json'
 export const COOK_AI_RECIPE_SCHEMA_URL =
-  'https://raw.githubusercontent.com/vichare/Cook/v0.4.0/skills/cook-recipe-import/schema/ai-recipe-v1.schema.json'
+  'https://raw.githubusercontent.com/vichare/Cook/v0.4.1/skills/cook-recipe-import/schema/ai-recipe-v1.schema.json'
 export type TokenPreset = 'import' | 'manage' | 'publish'
+
+function tokenPresetForScopes(scopes: string[]): TokenPreset | null {
+  const key = [...scopes].sort().join(',')
+  if (key === 'recipes:import') return 'import'
+  if (key === 'recipes:images:write,recipes:read,recipes:write') return 'manage'
+  if (key === 'recipes:images:write,recipes:publish,recipes:read,recipes:write') return 'publish'
+  return null
+}
 
 export const importDraftExample = {
   schemaVersion: '1.0',
@@ -3117,9 +3125,9 @@ export function skillInstructionsForPreset(
   const baseUrl = resolveCookBaseUrl(origin)
   return `English:
 GitHub Copilot skill installation:
-1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.4.0
+1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.4.1
 2. Install for cross-session use, pinned to this release:
-   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.0
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.1
 3. Restart GitHub Copilot if needed, then verify the skill in Customize → Skills.
 
 Manual fallback: download or copy the entire skills/cook-recipe-import directory, including its schema directory, to ~/.copilot/skills/cook-recipe-import or ~/.agents/skills/cook-recipe-import. Do not copy only SKILL.md.
@@ -3138,9 +3146,9 @@ Minimal first use: “${firstTaskForPreset(preset, 'en')}” The import endpoint
 
 简体中文：
 GitHub Copilot Skill 安装：
-1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.4.0
+1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.4.1
 2. 安装到用户范围并固定到此 release：
-   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.0
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.1
 3. 必要时重启 GitHub Copilot，然后在 Customize → Skills 中确认。
 
 手动备用：下载或复制整个 skills/cook-recipe-import 目录（必须包括 schema 目录）到 ~/.copilot/skills/cook-recipe-import 或 ~/.agents/skills/cook-recipe-import。不要只复制 SKILL.md。
@@ -3210,9 +3218,10 @@ export function ImportTokenSettings() {
   const tokens = useQuery({ queryKey: ['import-tokens'], queryFn: api.importTokens })
   const [name, setName] = useState(() => t('token.defaultName'))
   const [preset, setPreset] = useState<TokenPreset>('import')
-  const [createdPreset, setCreatedPreset] = useState<TokenPreset>('import')
+  const [setupPreset, setSetupPreset] = useState<TokenPreset>('import')
   const [expiresInDays, setExpiresInDays] = useState<30 | 90 | null>(90)
   const [secret, setSecret] = useState<string | null>(null)
+  const baseUrlAssignment = `COOK_BASE_URL=${baseUrl}`
   const copySequence = useRef(0)
   const [copyNotice, setCopyNotice] = useState<{
     id: number
@@ -3226,10 +3235,14 @@ export function ImportTokenSettings() {
     },
   })
   const create = useMutation({
-    mutationFn: () => api.createImportToken(name, expiresInDays, preset),
-    onSuccess: async (created) => {
+    mutationFn: (input: {
+      name: string
+      expiresInDays: 30 | 90 | null
+      preset: TokenPreset
+    }) => api.createImportToken(input.name, input.expiresInDays, input.preset),
+    onSuccess: async (created, input) => {
       setSecret(created.secret)
-      setCreatedPreset(preset)
+      setSetupPreset(input.preset)
       setCopyNotice(null)
       connection.reset()
       await queryClient.invalidateQueries({ queryKey: ['import-tokens'] })
@@ -3263,7 +3276,7 @@ export function ImportTokenSettings() {
         onSubmit={(event) => {
           event.preventDefault()
           if (preset === 'publish' && !window.confirm(t('token.publishConfirm'))) return
-          create.mutate()
+          create.mutate({ name, expiresInDays, preset })
         }}
       >
         <label>
@@ -3278,7 +3291,10 @@ export function ImportTokenSettings() {
               name="token-preset"
               value="import"
               checked={preset === 'import'}
-              onChange={() => setPreset('import')}
+              onChange={() => {
+                setPreset('import')
+                setSetupPreset('import')
+              }}
             />
             <span>
               <strong>{t('token.presetImport')}</strong>
@@ -3291,7 +3307,10 @@ export function ImportTokenSettings() {
               name="token-preset"
               value="manage"
               checked={preset === 'manage'}
-              onChange={() => setPreset('manage')}
+              onChange={() => {
+                setPreset('manage')
+                setSetupPreset('manage')
+              }}
             />
             <span>
               <strong>{t('token.presetManage')}</strong>
@@ -3306,6 +3325,7 @@ export function ImportTokenSettings() {
               checked={preset === 'publish'}
               onChange={() => {
                 setPreset('publish')
+                setSetupPreset('publish')
                 setExpiresInDays(30)
               }}
             />
@@ -3413,94 +3433,105 @@ export function ImportTokenSettings() {
           {connection.error && (
             <p className="error" role="alert">{t('token.connectionFailed')}</p>
           )}
-          <section>
-            <h3>{t('token.installSkill')}</h3>
-            <p>{t('token.installSkillDetail')}</p>
-            <p>{t('token.skillMainNote')}</p>
-            <label>
-              {t('token.baseUrlLabel')}
-              <input readOnly value={baseUrl} />
-            </label>
-            <p>{t('token.baseUrlDetail', { baseUrl })}</p>
-            <button
-              className="button ghost"
-              onClick={() => copyOutput(baseUrl, t('token.baseUrlCopied'))}
-            >
-              {t('token.copyBaseUrl')}
-            </button>
-            <label>
-              {t('token.skillUrlLabel')}
-              <input readOnly value={COOK_SKILL_URL} />
-            </label>
-            <a className="button secondary" href={COOK_SKILL_URL} rel="noreferrer" target="_blank">
-              {t('token.reviewSkillSource')}
-            </a>
-            <button
-              className="button ghost"
-              onClick={() => copyOutput(
-                skillInstructionsForPreset(createdPreset, baseUrl),
-                t('token.installCopied'),
-              )}
-            >
-              {t('token.copyInstall')}
-            </button>
-          </section>
-          <section>
-            <h3>{t('token.firstTask')}</h3>
-            <p>{firstTaskForPreset(createdPreset, locale)}</p>
-            <button
-              type="button"
-              className="button ghost"
-              onClick={() => copyOutput(
-                firstTaskForPreset(createdPreset, locale),
-                t('token.firstTaskCopied'),
-              )}
-            >
-              {t('token.copyFirstTask')}
-            </button>
-          </section>
-          <details className="source-note">
-            <summary>{t('token.detailedRules')}</summary>
-            <p>{t('token.bulkRules')}</p>
-            <p>{t('token.imageRules')}</p>
-          </details>
-          <section>
-            <h3>{t('token.copyPrompt')}</h3>
-            <p>{t('token.promptDetail')}</p>
-            <button
-              className="button ghost"
-              onClick={() => copyOutput(
-                promptForPreset(createdPreset, baseUrl),
-                t('token.promptCopied'),
-              )}
-            >
-              {t('token.copyPrompt')}
-            </button>
-          </section>
-          {copyNotice?.kind === 'success' && (
-            <p key={copyNotice.id} role="status" aria-live="polite">
-              {copyNotice.message}
-            </p>
-          )}
-          {copyNotice?.kind === 'error' && (
-            <p key={copyNotice.id} className="error" role="alert">
-              {copyNotice.message}
-            </p>
-          )}
           <button className="button primary" onClick={() => {
             setSecret(null)
-            setCopyNotice(null)
           }}>
             {t('token.savedClose')}
           </button>
         </div>
       )}
+      <section className="source-note" aria-labelledby="token-client-setup">
+        <h3 id="token-client-setup">{t('token.clientSetup')}</h3>
+        <p>{t('token.clientSetupDetail')}</p>
+        <p>{t('token.secretSeparate')}</p>
+        <label>
+          {t('token.baseUrlLabel')}
+          <input readOnly value={baseUrlAssignment} />
+        </label>
+        <p>{t('token.baseUrlDetail', { baseUrl })}</p>
+        <button
+          type="button"
+          className="button ghost"
+          onClick={() => copyOutput(baseUrlAssignment, t('token.baseUrlCopied'))}
+        >
+          {t('token.copyBaseUrl')}
+        </button>
+        <h4>{t('token.installSkill')}</h4>
+        <p>{t('token.installSkillDetail')}</p>
+        <p>{t('token.skillMainNote')}</p>
+        <label>
+          {t('token.skillUrlLabel')}
+          <input readOnly value={COOK_SKILL_URL} />
+        </label>
+        <a className="button secondary" href={COOK_SKILL_URL} rel="noreferrer" target="_blank">
+          {t('token.reviewSkillSource')}
+        </a>
+        <button
+          type="button"
+          className="button ghost"
+          onClick={() => copyOutput(
+            skillInstructionsForPreset(setupPreset, baseUrl),
+            t('token.installCopied'),
+          )}
+        >
+          {t('token.copyInstall')}
+        </button>
+        <h4>{t('token.firstTask')}</h4>
+        <p>{firstTaskForPreset(setupPreset, locale)}</p>
+        <button
+          type="button"
+          className="button ghost"
+          onClick={() => copyOutput(
+            firstTaskForPreset(setupPreset, locale),
+            t('token.firstTaskCopied'),
+          )}
+        >
+          {t('token.copyFirstTask')}
+        </button>
+        <details>
+          <summary>{t('token.detailedRules')}</summary>
+          <p>{t('token.bulkRules')}</p>
+          <p>{t('token.imageRules')}</p>
+        </details>
+        <h4>{t('token.copyPrompt')}</h4>
+        <p>{t('token.promptDetail')}</p>
+        <button
+          type="button"
+          className="button ghost"
+          onClick={() => copyOutput(
+            promptForPreset(setupPreset, baseUrl),
+            t('token.promptCopied'),
+          )}
+        >
+          {t('token.copyPrompt')}
+        </button>
+      </section>
+      {copyNotice?.kind === 'success' && (
+        <p key={copyNotice.id} role="status" aria-live="polite">
+          {copyNotice.message}
+        </p>
+      )}
+      {copyNotice?.kind === 'error' && (
+        <p key={copyNotice.id} className="error" role="alert">
+          {copyNotice.message}
+        </p>
+      )}
       <QueryState query={tokens} empty={t('token.empty')}>
         <div className="card-list">
-          {tokens.data?.map((token) => (
-            <article className="recipe-card" key={token.id}>
+          {tokens.data?.map((token) => {
+            const tokenPreset = tokenPresetForScopes(token.scopes)
+            const tokenPresetLabel = tokenPreset === 'publish'
+              ? t('token.presetPublish')
+              : tokenPreset === 'manage'
+                ? t('token.presetManage')
+                : tokenPreset === 'import'
+                  ? t('token.presetImport')
+                  : null
+            return (
+              <article className="recipe-card" key={token.id}>
               <strong>{token.name}</strong>
               <span>{token.prefix}… · {token.scopes.join(', ')}</span>
+              {tokenPresetLabel && <span>{t('token.tokenPreset', { preset: tokenPresetLabel })}</span>}
               <span>{t('token.created', { date: formatDateTime(token.createdAt) })}</span>
               <span>
                 {token.lastUsedAt
@@ -3515,19 +3546,39 @@ export function ImportTokenSettings() {
                     })}
               </span>
               {!token.revokedAt && (
-                <button
-                  className="button ghost"
-                  onClick={() => {
-                    if (window.confirm(t('token.revokeConfirm', { name: token.name }))) {
-                      revoke.mutate(token.id)
-                    }
-                  }}
-                >
-                  {t('token.revoke')}
-                </button>
+                <>
+                  {tokenPreset && (
+                    <button
+                      type="button"
+                      className="button ghost"
+                      aria-label={t('token.useSetupPresetLabel', {
+                        name: token.name,
+                        prefix: token.prefix,
+                        preset: tokenPresetLabel ?? '',
+                      })}
+                      onClick={() => {
+                        setPreset(tokenPreset)
+                        setSetupPreset(tokenPreset)
+                      }}
+                    >
+                      {t('token.useSetupPreset')}
+                    </button>
+                  )}
+                  <button
+                    className="button ghost"
+                    onClick={() => {
+                      if (window.confirm(t('token.revokeConfirm', { name: token.name }))) {
+                        revoke.mutate(token.id)
+                      }
+                    }}
+                  >
+                    {t('token.revoke')}
+                  </button>
+                </>
               )}
             </article>
-          ))}
+            )
+          })}
         </div>
       </QueryState>
       {create.error && <ErrorText error={create.error} />}

@@ -56,13 +56,13 @@ Store the one-time token as the `COOK_IMPORT_TOKEN` environment variable, never 
 GitHub CLI 2.90+ can preview and install the full Skill, including schema assets:
 
 ```powershell
-gh skill preview vichare/Cook cook-recipe-import@v0.4.0
-gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.0
+gh skill preview vichare/Cook cook-recipe-import@v0.4.1
+gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.4.1
 ```
 
 Manual fallback: copy the entire `skills/cook-recipe-import` directory to `~/.copilot/skills/cook-recipe-import` or `~/.agents/skills/cook-recipe-import`; copying only `SKILL.md` omits required schemas. Customize > Skills manages skills after they exist in a supported location; the GitHub source link is for review, not a paste-to-install URL.
 
-Settings presents plain-language task presets, a numbered setup flow, a one-time-token connection test against `GET /api/ai/capabilities`, copyable self-contained draft/create/update examples, multipart cover guidance, authoritative schema links, first-use tasks, and progressive security/bulk rules. Reusable output includes the resolved base URL but never the secret. Recipe-level source URL/title/author/license/attribution are optional and remain distinct from cover provenance; Cook displays supplied license metadata without claiming independent verification.
+Settings presents plain-language task presets, a numbered setup flow, a one-time-token connection test against `GET /api/ai/capabilities`, copyable self-contained draft/create/update examples, multipart cover guidance, authoritative schema links, first-use tasks, and progressive security/bulk rules. The non-secret AI client setup remains available after the one-time reveal closes and copies the exact `COOK_BASE_URL=<origin>` assignment; `COOK_IMPORT_TOKEN` must be copied separately while it is visible and cannot be recovered later. Reusable output includes the resolved base URL but never the secret. Recipe-level source URL/title/author/license/attribution are optional and remain distinct from cover provenance; Cook displays supplied license metadata without claiming independent verification.
 
 ## Interface languages
 
