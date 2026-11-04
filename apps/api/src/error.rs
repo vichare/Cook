@@ -36,6 +36,10 @@ pub enum AppError {
         case_version: Option<i64>,
         appeal_version: Option<i64>,
     },
+    #[error("selected canonical ingredient is not available to this account")]
+    CanonicalIngredientsUnavailable {
+        canonical_ingredient_ids: Vec<String>,
+    },
     #[error("{0}")]
     Validation(String),
     #[error("{0}")]
@@ -67,6 +71,8 @@ struct ErrorBody {
     case_version: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     appeal_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_ingredient_ids: Option<Vec<String>>,
 }
 
 impl IntoResponse for AppError {
@@ -88,6 +94,25 @@ impl IntoResponse for AppError {
                         moderation_version,
                         case_version,
                         appeal_version,
+                        canonical_ingredient_ids: None,
+                    }),
+                )
+                    .into_response();
+            }
+            Self::CanonicalIngredientsUnavailable {
+                canonical_ingredient_ids,
+            } => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: "canonical_ingredient_unavailable",
+                        message: "selected canonical ingredient is not available to this account"
+                            .to_string(),
+                        recipe_version: None,
+                        moderation_version: None,
+                        case_version: None,
+                        appeal_version: None,
+                        canonical_ingredient_ids: Some(canonical_ingredient_ids),
                     }),
                 )
                     .into_response();
@@ -104,6 +129,7 @@ impl IntoResponse for AppError {
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::ModerationConflict { .. } => unreachable!(),
+            Self::CanonicalIngredientsUnavailable { .. } => unreachable!(),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
             Self::Configuration(_)
             | Self::Data(_)
@@ -128,6 +154,7 @@ impl IntoResponse for AppError {
                 moderation_version: None,
                 case_version: None,
                 appeal_version: None,
+                canonical_ingredient_ids: None,
             }),
         )
             .into_response()

@@ -327,6 +327,10 @@ pub struct RecommendationRequest {
     pub excluded: Vec<IngredientReference>,
     pub pantry_only: Option<bool>,
     pub ingredient_scope: Option<IngredientScope>,
+    pub include_favorite_recipes: Option<bool>,
+    pub include_own: Option<bool>,
+    pub include_favorite_accounts: Option<bool>,
+    pub include_other_public: Option<bool>,
     #[serde(default)]
     pub today: Option<String>,
 }

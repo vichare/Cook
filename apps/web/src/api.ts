@@ -48,6 +48,7 @@ export class ApiError extends Error {
     message: string,
     public readonly status: number,
     public readonly code: string,
+    public readonly canonicalIngredientIds: string[] = [],
   ) {
     super(message)
   }
@@ -63,11 +64,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: string; message?: string } | null
+    const body = (await response.json().catch(() => null)) as {
+      error?: string
+      message?: string
+      canonicalIngredientIds?: string[]
+    } | null
     throw new ApiError(
       body?.message ?? `Request failed (${response.status})`,
       response.status,
       body?.error ?? 'unknown_error',
+      body?.canonicalIngredientIds ?? [],
     )
   }
   if (response.status === 204) return undefined as T
@@ -403,11 +409,16 @@ export const api = {
     required: Array<{ name: string; canonicalIngredientId: string | null }>
     excluded: Array<{ name: string; canonicalIngredientId: string | null }>
     ingredientScope: IngredientScope
+    includeFavoriteRecipes: boolean
+    includeOwn: boolean
+    includeFavoriteAccounts: boolean
+    includeOtherPublic: boolean
     today: string
-  }) =>
+  }, signal?: AbortSignal) =>
     request<Recommendation[]>('/api/recommendations', {
       method: 'POST',
       body: JSON.stringify(value),
+      signal,
     }),
   importTokens: () => request<ImportToken[]>('/api/settings/import-tokens'),
   createImportToken: (

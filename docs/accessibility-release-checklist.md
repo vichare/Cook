@@ -35,5 +35,10 @@ The combobox uses a 150 ms client debounce. The API p95 ≤300 ms target has not
 
 - [ ] Test the user's local date boundary immediately before and after midnight in at least two materially different time zones.
 - [ ] Confirm past dates are allowed with warning, never inferred, never converted to timestamps, and never change pantry status to `out`.
+- [ ] Open a versioned recommendation deep link with keyboard and screen reader, confirm controls are announced before the single automatic request, and verify shared-link privacy guidance is understandable in English and Simplified Chinese.
+- [ ] Change ingredient, scope, and source filters at 320 CSS pixels and 200% zoom; confirm the 250 ms automatic refresh status is announced politely, focus stays put, and retained results do not cause layout loss.
+- [ ] While one recommendation request is pending, change filters again and confirm only the newest response is announced/rendered. Force a failure, confirm prior results remain, and activate Retry by keyboard.
+- [ ] Use browser Back and Forward across existing recommendation URLs; confirm controls restore without repeated history entries, focus jumps, or duplicate announcements.
+- [ ] Open a link containing a canonical ingredient visible only to another account; confirm the downgrade explanation is announced politely, the display name remains editable, and a canonical selected directly in the current UI still fails closed.
 - [ ] Confirm expired and expires-today `have` items are `VERIFY` with `ANY`, and their recipes are excluded by the `PANTRY_ONLY` hard filter.
 - [ ] Confirm ambiguous or similar suggestions never alter must-use, excluded, or pantry-only hard matching until the user explicitly selects a canonical identity.

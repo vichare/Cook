@@ -38,8 +38,14 @@ import {
   recipeSchema,
 } from './router'
 import type { RecipeForm } from './router'
+import { ApiError } from './api'
 import { LocaleProvider, useI18n, type Locale } from './i18n'
 import type { ModerationQueueItem, PantryItem, Recipe, Recommendation } from './types'
+import {
+  encodeRecommendationControls,
+  parseRecommendationControls,
+  recommendationControlsFromSettings,
+} from './recommendation-url'
 
 const storedLocale = { value: null as string | null }
 const testStorage = {
@@ -92,9 +98,11 @@ describe('moderation mutations', () => {
 const {
   deleteRecipeCover,
   deleteShoppingItem,
+  ingredientSuggestionsApi,
   addRecipeIngredientToShopping,
   purchaseShoppingItem,
   pantryApi,
+  recommendationSettings,
   recommendationsApi,
   recipesApi,
   recipeApi,
@@ -204,6 +212,13 @@ const {
       expiresOn: null, canonicalIngredientId: null, autoAddToShoppingListWhenOut: true, version: 1,
     },
   ]),
+  recommendationSettings: vi.fn().mockResolvedValue({
+    includeFavoriteRecipes: true,
+    includeOwn: true,
+    includeFavoriteAccounts: true,
+    includeOtherPublic: true,
+    verificationDays: 14,
+  }),
   recommendationsApi: vi.fn(),
   recipesApi: vi.fn(),
   addRecipeIngredientToShopping: vi.fn(),
@@ -218,6 +233,7 @@ const {
     shoppingItems: [],
     undoAvailable: false,
   }),
+  ingredientSuggestionsApi: vi.fn().mockResolvedValue([]),
   savePantry: vi.fn().mockResolvedValue([]),
 }))
 
@@ -234,6 +250,8 @@ vi.mock('./api', async () => {
       addShoppingItem: vi.fn().mockResolvedValue([]),
       updateShoppingItem: vi.fn().mockResolvedValue([]),
       deleteShoppingItem,
+      ingredientSuggestions: ingredientSuggestionsApi,
+      settings: recommendationSettings,
       recommendations: recommendationsApi,
       recipes: recipesApi,
       favorite: vi.fn().mockResolvedValue(undefined),
@@ -258,7 +276,11 @@ vi.mock('./api', async () => {
   }
 })
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  window.history.replaceState({}, '', '/')
+  ingredientSuggestionsApi.mockReset().mockResolvedValue([])
+})
 
 describe('shopping list', () => {
   it('uses the same Bought flow for automatic and manual items', async () => {
@@ -1386,7 +1408,8 @@ describe('responsive primary navigation', () => {
 })
 
 describe('recommendation shopping membership', () => {
-  function renderRecommendations(locale: Locale = 'en') {
+  function renderRecommendations(locale: Locale = 'en', path = '/recommendations') {
+    window.history.replaceState({}, '', path)
     Object.defineProperty(window, 'scrollTo', {
       configurable: true,
       value: vi.fn(),
@@ -1472,6 +1495,380 @@ describe('recommendation shopping membership', () => {
     }
   }
 
+  it('loads default controls once, writes a versioned URL, and includes visible source controls', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations()
+
+    expect(await screen.findByText('Saffron rice')).toBeVisible()
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    expect(recommendationsApi).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ingredientScope: 'ANY',
+        includeFavoriteRecipes: true,
+        includeOwn: true,
+        includeFavoriteAccounts: true,
+        includeOtherPublic: true,
+      }),
+      expect.any(AbortSignal),
+    )
+    expect(window.location.search).toContain('rv=1')
+    expect(screen.getByText(/shared link includes the ingredient filter words/i)).toBeVisible()
+  })
+
+  it('restores a deep link without losing canonical versus unresolved identity', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      preferred: [
+        { name: 'Spring onion', canonicalIngredientId: null },
+        { name: 'Spring onion', canonicalIngredientId: 'spring-onion-id' },
+      ],
+      ingredientScope: 'PANTRY_ONLY',
+    })
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+
+    renderRecommendations('en', `/recommendations?${query}`)
+
+    await screen.findByText('Saffron rice')
+    const request = recommendationsApi.mock.calls[0][0]
+    expect(request.preferred).toEqual([
+      { name: 'Spring onion', canonicalIngredientId: 'spring-onion-id' },
+      { name: 'Spring onion', canonicalIngredientId: null },
+    ])
+    expect(request.ingredientScope).toBe('PANTRY_ONLY')
+    expect(screen.getAllByText('Spring onion')).toHaveLength(2)
+  })
+
+  it('downgrades only an unavailable URL-origin canonical identity and retries by name', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Private spice', canonicalIngredientId: 'private-spice-id' }],
+    })
+    recommendationsApi.mockReset()
+      .mockRejectedValueOnce(new ApiError(
+        'selected canonical ingredient is not available to this account',
+        400,
+        'canonical_ingredient_unavailable',
+        ['private-spice-id'],
+      ))
+      .mockResolvedValueOnce([recommendation()])
+
+    renderRecommendations('en', `/recommendations?${query}`)
+
+    expect(await screen.findByText('Saffron rice')).toBeVisible()
+    expect(recommendationsApi).toHaveBeenCalledTimes(2)
+    expect(recommendationsApi.mock.calls[0][0].preferred).toEqual([
+      { name: 'Private spice', canonicalIngredientId: 'private-spice-id' },
+    ])
+    expect(recommendationsApi.mock.calls[1][0].preferred).toEqual([
+      { name: 'Private spice', canonicalIngredientId: null },
+    ])
+    expect(screen.getByText(/canonical ingredient in this shared link is not available/i)).toBeVisible()
+    expect(parseRecommendationControls(window.location.search, defaults).controls.preferred).toEqual([
+      { name: 'Private spice', canonicalIngredientId: null },
+    ])
+  })
+
+  it('preserves edits made during debounce when an older canonical request fails', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({
+      ...defaults,
+      preferred: [{ name: 'Private spice', canonicalIngredientId: 'private-spice-id' }],
+    })
+    let rejectFirst!: (error: Error) => void
+    recommendationsApi.mockReset()
+      .mockReturnValueOnce(new Promise((_, reject) => { rejectFirst = reject }))
+      .mockRejectedValueOnce(new ApiError(
+        'selected canonical ingredient is not available to this account',
+        400,
+        'canonical_ingredient_unavailable',
+        ['private-spice-id'],
+      ))
+      .mockResolvedValueOnce([recommendation()])
+    renderRecommendations('en', `/recommendations?${query}`)
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(1))
+
+    const input = screen.getByRole('combobox', { name: 'Add ingredient to Hope to use' })
+    fireEvent.change(input, { target: { value: 'Pepper' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    rejectFirst(new ApiError(
+      'selected canonical ingredient is not available to this account',
+      400,
+      'canonical_ingredient_unavailable',
+      ['private-spice-id'],
+    ))
+
+    expect(await screen.findByText('Saffron rice')).toBeVisible()
+    expect(recommendationsApi).toHaveBeenCalledTimes(3)
+    expect(recommendationsApi.mock.calls[2][0].preferred).toEqual(expect.arrayContaining([
+      { name: 'Pepper', canonicalIngredientId: null },
+      { name: 'Private spice', canonicalIngredientId: null },
+    ]))
+    expect(recommendationsApi.mock.calls[2][0].preferred).toHaveLength(2)
+    expect(parseRecommendationControls(window.location.search, defaults).controls.preferred)
+      .toEqual(expect.arrayContaining([
+        { name: 'Pepper', canonicalIngredientId: null },
+        { name: 'Private spice', canonicalIngredientId: null },
+      ]))
+  })
+
+  it('fails closed when URL canonical downgrade would merge hard-filter identities', async () => {
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const original = {
+      ...defaults,
+      required: [{ name: 'Rice', canonicalIngredientId: 'private-rice-id' }],
+      excluded: [{ name: 'Rice', canonicalIngredientId: null }],
+    }
+    recommendationsApi.mockReset().mockRejectedValue(new ApiError(
+      'selected canonical ingredient is not available to this account',
+      400,
+      'canonical_ingredient_unavailable',
+      ['private-rice-id'],
+    ))
+    renderRecommendations('en', `/recommendations?${encodeRecommendationControls(original)}`)
+
+    expect(await screen.findByText(/cannot safely downgrade this shared link/i)).toBeVisible()
+    expect(await screen.findByRole('button', { name: 'Retry recommendations' })).toBeVisible()
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    const current = parseRecommendationControls(window.location.search, defaults).controls
+    expect(current.required).toEqual(original.required)
+    expect(current.excluded).toEqual(original.excluded)
+  })
+
+  it('keeps an explicitly selected unavailable canonical identity fail-closed', async () => {
+    ingredientSuggestionsApi.mockResolvedValue([{
+      canonicalIngredientId: 'private-spice-id',
+      displayName: 'Private spice',
+      matchedText: 'Private spice',
+      reason: 'exact',
+    }])
+    recommendationsApi.mockReset()
+      .mockResolvedValueOnce([recommendation()])
+      .mockRejectedValueOnce(new ApiError(
+        'selected canonical ingredient is not available to this account',
+        400,
+        'canonical_ingredient_unavailable',
+        ['private-spice-id'],
+      ))
+    renderRecommendations()
+    await screen.findByText('Saffron rice')
+    const input = screen.getByRole('combobox', { name: 'Add ingredient to Hope to use' })
+    fireEvent.change(input, { target: { value: 'Private spice' } })
+    fireEvent.focus(input)
+    fireEvent.click(await screen.findByRole('option', {
+      name: 'Private spice, matched existing ingredient',
+    }))
+
+    expect(await screen.findByRole('button', { name: 'Retry recommendations' })).toBeVisible()
+    expect(recommendationsApi).toHaveBeenCalledTimes(2)
+    expect(parseRecommendationControls(window.location.search, recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })).controls.preferred).toEqual([
+      { name: 'Private spice', canonicalIngredientId: 'private-spice-id' },
+    ])
+  })
+
+  it('does not refresh for uncommitted combobox typing and debounces committed filters', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations()
+    await screen.findByText('Saffron rice')
+    const input = screen.getByRole('combobox', { name: 'Add ingredient to Hope to use' })
+
+    fireEvent.change(input, { target: { value: 'Rice' } })
+    await new Promise((resolve) => window.setTimeout(resolve, 350))
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+    expect(recommendationsApi.mock.calls[1][0].preferred).toEqual([
+      { name: 'Rice', canonicalIngredientId: null },
+    ])
+  })
+
+  it('restarts pending A after A to B to A within debounce without changing history', async () => {
+    let resolveFirst!: (value: Recommendation[]) => void
+    let resolveSecond!: (value: Recommendation[]) => void
+    recommendationsApi.mockReset()
+      .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
+      .mockReturnValueOnce(new Promise((resolve) => { resolveSecond = resolve }))
+    renderRecommendations()
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(1))
+    const initialUrl = window.location.href
+    const initialHistoryLength = window.history.length
+
+    fireEvent.click(screen.getByRole('radio', { name: /Pantry only/ }))
+    fireEvent.click(screen.getByRole('radio', { name: /Any ingredients/ }))
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+    expect(window.location.href).toBe(initialUrl)
+    expect(window.history.length).toBe(initialHistoryLength)
+
+    const restarted = recommendation()
+    restarted.recipe = { ...restarted.recipe, title: 'Restarted A result' }
+    resolveSecond([restarted])
+    expect(await screen.findByText('Restarted A result')).toBeVisible()
+
+    const stale = recommendation()
+    stale.recipe = { ...stale.recipe, title: 'Aborted first A result' }
+    resolveFirst([stale])
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    expect(screen.queryByText('Aborted first A result')).not.toBeInTheDocument()
+  })
+
+  it('restores successful A after A to B to A within debounce without another request', async () => {
+    const cached = recommendation()
+    cached.recipe = { ...cached.recipe, title: 'Cached A result' }
+    recommendationsApi.mockReset().mockResolvedValue([cached])
+    renderRecommendations()
+    expect(await screen.findByText('Cached A result')).toBeVisible()
+    const initialUrl = window.location.href
+    const initialHistoryLength = window.history.length
+
+    fireEvent.click(screen.getByRole('radio', { name: /Pantry only/ }))
+    fireEvent.click(screen.getByRole('radio', { name: /Any ingredients/ }))
+    await new Promise((resolve) => window.setTimeout(resolve, 350))
+
+    expect(recommendationsApi).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('Cached A result')).toBeVisible()
+    expect(screen.queryByText('Updating recommendations…')).not.toBeInTheDocument()
+    expect(window.location.href).toBe(initialUrl)
+    expect(window.history.length).toBe(initialHistoryLength)
+  })
+
+  it('ignores a late response after filters change while a request is pending', async () => {
+    let resolveFirst!: (value: Recommendation[]) => void
+    let resolveSecond!: (value: Recommendation[]) => void
+    recommendationsApi.mockReset()
+      .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
+      .mockReturnValueOnce(new Promise((resolve) => { resolveSecond = resolve }))
+    renderRecommendations()
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(screen.getByRole('radio', { name: /Pantry only/ }))
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+    const newest = recommendation()
+    newest.recipe = { ...newest.recipe, title: 'Newest filters result' }
+    resolveSecond([newest])
+    expect(await screen.findByText('Newest filters result')).toBeVisible()
+
+    const stale = recommendation()
+    stale.recipe = { ...stale.recipe, title: 'Late stale result' }
+    resolveFirst([stale])
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    expect(screen.queryByText('Late stale result')).not.toBeInTheDocument()
+    expect(screen.getByText('Newest filters result')).toBeVisible()
+  })
+
+  it('keeps the last success on failure and retries current filters', async () => {
+    const recovered = recommendation()
+    recovered.recipe = { ...recovered.recipe, title: 'Recovered result' }
+    recommendationsApi.mockReset()
+      .mockResolvedValueOnce([recommendation()])
+      .mockRejectedValueOnce(new Error('network failed'))
+      .mockResolvedValueOnce([recovered])
+    renderRecommendations()
+    expect(await screen.findByText('Saffron rice')).toBeVisible()
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /Other users’ public recipes/ }))
+    expect(await screen.findByRole('button', { name: 'Retry recommendations' })).toBeVisible()
+    expect(screen.getByText('Saffron rice')).toBeVisible()
+    expect(window.location.search).toContain('rv=1')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry recommendations' }))
+    expect(await screen.findByText('Recovered result')).toBeVisible()
+    expect(recommendationsApi.mock.calls[2][0].includeOtherPublic).toBe(false)
+  })
+
+  it('restores controls and requests on popstate without creating a state loop', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations()
+    await screen.findByText('Saffron rice')
+
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    const query = encodeRecommendationControls({ ...defaults, ingredientScope: 'PANTRY_OR_LIST' })
+    window.history.replaceState({}, '', `/recommendations?${query}`)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+
+    await waitFor(() => expect(screen.getByRole('radio', { name: /Pantry or shopping list/ })).toBeChecked())
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(2))
+    expect(recommendationsApi.mock.calls[1][0].ingredientScope).toBe('PANTRY_OR_LIST')
+  })
+
+  it('invalidates an older request synchronously when popstate restores another URL', async () => {
+    let resolveOld!: (value: Recommendation[]) => void
+    const newest = recommendation()
+    newest.recipe = { ...newest.recipe, title: 'Popstate result' }
+    recommendationsApi.mockReset()
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve }))
+      .mockResolvedValueOnce([newest])
+    renderRecommendations()
+    await waitFor(() => expect(recommendationsApi).toHaveBeenCalledTimes(1))
+
+    const defaults = recommendationControlsFromSettings({
+      includeFavoriteRecipes: true,
+      includeOwn: true,
+      includeFavoriteAccounts: true,
+      includeOtherPublic: true,
+      verificationDays: 14,
+    })
+    window.history.replaceState({}, '', `/recommendations?${encodeRecommendationControls({
+      ...defaults,
+      ingredientScope: 'PANTRY_ONLY',
+    })}`)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    expect(await screen.findByText('Popstate result')).toBeVisible()
+
+    const stale = recommendation()
+    stale.recipe = { ...stale.recipe, title: 'Old URL result' }
+    resolveOld([stale])
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    expect(screen.queryByText('Old URL result')).not.toBeInTheDocument()
+  })
+
+  it('fails safe for an unknown URL version and announces the non-blocking warning', async () => {
+    recommendationsApi.mockReset().mockResolvedValue([recommendation()])
+    renderRecommendations('en', '/recommendations?rv=99&p=bad&token=private')
+
+    expect(await screen.findByText(/invalid or unsupported/i)).toBeVisible()
+    expect(await screen.findByText('Saffron rice')).toBeVisible()
+    expect(recommendationsApi.mock.calls[0][0].preferred).toEqual([])
+    expect(window.location.search).not.toContain('token')
+  })
+
   it('renders semantic membership instead of an add action when already active', async () => {
     recommendationsApi.mockReset().mockResolvedValue([recommendation(['Saffron'])])
     renderRecommendations()
@@ -1492,11 +1889,11 @@ describe('recommendation shopping membership', () => {
     pantryOrList.focus()
     expect(pantryOrList).toHaveFocus()
     fireEvent.click(pantryOrList)
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh recommendations' }))
     await waitFor(() => {
       const request = recommendationsApi.mock.calls.at(-1)![0]
       expect(request).toEqual(expect.objectContaining({ ingredientScope: 'PANTRY_OR_LIST' }))
       expect(request).not.toHaveProperty('pantryOnly')
+      expect(window.location.search).toContain('scope=pantry-list')
     })
   })
 
@@ -1565,6 +1962,8 @@ describe('recommendation shopping membership', () => {
     expect(screen.getByRole('radio', { name: /仅限库存/ })).toBeVisible()
     expect(screen.getByRole('radio', { name: /库存或购物清单/ })).toBeVisible()
     expect(screen.getByRole('group', { name: '食材范围' })).toBeVisible()
+    expect(screen.getByRole('group', { name: '候选菜谱来源' })).toBeVisible()
+    expect(screen.getByText(/分享链接会包含食材筛选词/)).toBeVisible()
   })
 
   it('uses compact preview and ingredient groups with details collapsed by default', async () => {
@@ -2215,6 +2614,23 @@ describe('pantry confirmation', () => {
     expect(screen.getByRole('button', { name: 'Save answers' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Skip for now' }))
     expect(screen.getByRole('button', { name: 'Save answers' })).toBeDisabled()
+  })
+
+  it('notifies the recommendation workbench after saving pantry answers', async () => {
+    const onSaved = vi.fn()
+    render(
+      <Providers>
+        <PantryConfirmation
+          open
+          onOpenChange={() => undefined}
+          names={['Egg']}
+          onSaved={onSaved}
+        />
+      </Providers>,
+    )
+    fireEvent.click(screen.getByLabelText('Still have it'))
+    fireEvent.click(screen.getByRole('button', { name: 'Save answers' }))
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1))
   })
 
   describe('recipe cover fields', () => {

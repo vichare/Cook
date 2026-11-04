@@ -1758,7 +1758,17 @@ async fn get_recommendations(
         }
     }
     validate_recommendation_request(&state.pool, &user.id, &request).await?;
-    let settings = load_settings(&state.pool, &user.id).await?;
+    let mut settings = load_settings(&state.pool, &user.id).await?;
+    settings.include_favorite_recipes = request
+        .include_favorite_recipes
+        .unwrap_or(settings.include_favorite_recipes);
+    settings.include_own = request.include_own.unwrap_or(settings.include_own);
+    settings.include_favorite_accounts = request
+        .include_favorite_accounts
+        .unwrap_or(settings.include_favorite_accounts);
+    settings.include_other_public = request
+        .include_other_public
+        .unwrap_or(settings.include_other_public);
     let mut transaction = state.pool.begin().await?;
     let pantry = load_pantry_tx(&mut transaction, &user.id).await?;
     let active_shopping = shopping::active_coverage_tx(&mut transaction, &user.id).await?;
@@ -2349,6 +2359,7 @@ async fn validate_recommendation_request(
     owner_id: &str,
     request: &RecommendationRequest,
 ) -> AppResult<()> {
+    let mut unavailable = Vec::new();
     for references in [&request.preferred, &request.required, &request.excluded] {
         for reference in references.iter() {
             if let Some(canonical_ingredient_id) = reference.canonical_ingredient_id() {
@@ -2360,12 +2371,17 @@ async fn validate_recommendation_request(
                     )
                     .await?
                 {
-                    return Err(AppError::Validation(
-                        "selected canonical ingredient is not available to this account".into(),
-                    ));
+                    unavailable.push(canonical_ingredient_id.to_string());
                 }
             }
         }
+    }
+    if !unavailable.is_empty() {
+        unavailable.sort();
+        unavailable.dedup();
+        return Err(AppError::CanonicalIngredientsUnavailable {
+            canonical_ingredient_ids: unavailable,
+        });
     }
     Ok(())
 }
@@ -5084,6 +5100,108 @@ mod tests {
         .await;
         assert_eq!(recommendations.as_array().unwrap().len(), 1);
         assert_eq!(recommendations[0]["recipe"]["id"], first["id"]);
+    }
+
+    #[tokio::test]
+    async fn recommendation_source_overrides_are_request_scoped() {
+        let (app, _, _) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Owner").await;
+        let viewer_cookie = login(&app, "Viewer").await;
+        create_recipe(&app, &owner_cookie, "public").await;
+
+        let hidden = response_json(
+            app.clone()
+                .oneshot(
+                    Request::post("/api/recommendations")
+                        .header("content-type", "application/json")
+                        .header("cookie", &viewer_cookie)
+                        .body(Body::from(
+                            json!({
+                                "includeFavoriteRecipes": false,
+                                "includeOwn": false,
+                                "includeFavoriteAccounts": false,
+                                "includeOtherPublic": false
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(hidden.as_array().unwrap().is_empty());
+
+        let defaults = response_json(
+            app.oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", viewer_cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(defaults.as_array().unwrap().len(), 1);
+        assert_eq!(defaults[0]["appliedControls"]["includeOtherPublic"], true);
+    }
+
+    #[tokio::test]
+    async fn private_canonical_recommendation_filter_fails_closed_for_another_account() {
+        let (app, _, _) = app_with_runtime().await;
+        let owner_cookie = login(&app, "Owner").await;
+        let viewer_cookie = login(&app, "Viewer").await;
+        let private_recipe = create_recipe(&app, &owner_cookie, "private").await;
+        let canonical_id = private_recipe["ingredients"][0]["canonicalIngredientId"]
+            .as_str()
+            .unwrap();
+        let display_name = private_recipe["ingredients"][0]["name"].as_str().unwrap();
+
+        let unavailable = app
+            .clone()
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &viewer_cookie)
+                    .body(Body::from(
+                        json!({
+                            "preferred": [{
+                                "name": display_name,
+                                "canonicalIngredientId": canonical_id
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::BAD_REQUEST);
+        let unavailable = response_json(unavailable).await;
+        assert_eq!(unavailable["error"], "canonical_ingredient_unavailable");
+        assert_eq!(unavailable["canonicalIngredientIds"], json!([canonical_id]));
+
+        let unresolved = app
+            .oneshot(
+                Request::post("/api/recommendations")
+                    .header("content-type", "application/json")
+                    .header("cookie", viewer_cookie)
+                    .body(Body::from(
+                        json!({
+                            "preferred": [{
+                                "name": display_name,
+                                "canonicalIngredientId": null
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unresolved.status(), StatusCode::OK);
     }
 
     #[tokio::test]

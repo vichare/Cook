@@ -87,9 +87,12 @@ h2 { margin: .3rem 0 .6rem; }
 .shop { background: #f9dfca; color: #7e3c11; }
 .blocked { background: #ead9d7; color: #762f2a; }
 .filter-panel, .inline-form { padding: 1.25rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); align-items: start; gap: 1rem; margin-bottom: 1.5rem; }
+.recommendation-share-note { grid-column: 1 / -1; margin: 0; color: var(--muted); }
 .recommendation-scope { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; }
 .recommendation-scope legend, .recommendation-scope > .field-note { grid-column: 1 / -1; }
 .recommendation-scope .choice-card { min-width: 0; }
+.recommendation-sources { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .75rem; }
+.recommendation-sources legend, .recommendation-sources > .field-note { grid-column: 1 / -1; }
 .recommendation-results { display: grid; gap: 1.5rem; }
 .recommendation-intent-summary { display: flex; flex-wrap: wrap; gap: .5rem; }
 .blocked-recommendations { padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: #f7f3e8; }

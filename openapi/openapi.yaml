@@ -574,6 +574,19 @@ paths:
                 type: array
                 maxItems: 100
                 items: { $ref: "#/components/schemas/Recommendation" }
+        "400":
+          description: Invalid filters. If one or more submitted canonical IDs are not visible to the authenticated account, error is canonical_ingredient_unavailable and canonicalIngredientIds echoes only those submitted IDs so a URL client can explicitly downgrade them to the accompanying names.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, message]
+                properties:
+                  error: { type: string, enum: [validation_error, canonical_ingredient_unavailable] }
+                  message: { type: string }
+                  canonicalIngredientIds:
+                    type: array
+                    items: { type: string }
         "429": { description: Per-account/IP recommendation request limit exceeded }
   /api/settings/import-tokens:
     get:
@@ -1988,7 +2001,7 @@ components:
         verificationDays: { type: integer, minimum: 1, maximum: 90 }
     RecommendationRequest:
       type: object
-      description: ingredientScope is an intent-v2 hard filter. Recipes outside the selected scope are omitted. Deprecated pantryOnly maps true to PANTRY_ONLY and false to ANY. Supplying both fields returns 400.
+      description: ingredientScope is an intent-v2 hard filter. Recipes outside the selected scope are omitted. Optional source booleans override the account recommendation settings for this request without persisting them. Deprecated pantryOnly maps true to PANTRY_ONLY and false to ANY. Supplying both fields returns 400.
       properties:
         preferred: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
         required: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/IngredientReference" } }
@@ -1997,6 +2010,10 @@ components:
           type: string
           enum: [ANY, PANTRY_ONLY, PANTRY_OR_LIST]
           default: ANY
+        includeFavoriteRecipes: { type: boolean }
+        includeOwn: { type: boolean }
+        includeFavoriteAccounts: { type: boolean }
+        includeOtherPublic: { type: boolean }
         pantryOnly:
           type: boolean
           deprecated: true

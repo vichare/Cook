@@ -48,6 +48,7 @@ import {
 } from './ingredients'
 import { createPasskey, getPasskey } from './webauthn'
 import { useI18n, type Locale, type Translate } from './i18n'
+import { useRecommendationWorkbench } from './recommendation-workbench'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -534,26 +535,19 @@ export function HomePage() {
 export function RecommendationsPage() {
   const { formatDate, formatNumber, t } = useI18n()
   const queryClient = useQueryClient()
-  const [filters, setFilters] = useState({
-    preferred: [] as IngredientReference[],
-    required: [] as IngredientReference[],
-    excluded: [] as IngredientReference[],
-    ingredientScope: 'ANY' as IngredientScope,
-  })
-  const [submitted, setSubmitted] = useState({
-    preferred: [] as IngredientReference[],
-    required: [] as IngredientReference[],
-    excluded: [] as IngredientReference[],
-    ingredientScope: 'ANY' as IngredientScope,
-    today: localDateValue(new Date()),
-  })
-  const recommendations = useQuery({
-    queryKey: ['recommendations', submitted],
-    queryFn: () => api.recommendations(submitted),
-  })
+  const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings })
+  const {
+    activeControls,
+    controls: filters,
+    results: recommendations,
+    retry,
+    setControls: setFilters,
+    updateResults,
+    urlIssues,
+  } = useRecommendationWorkbench(settings.data)
   const shopping = useQuery({ queryKey: ['shopping-list'], queryFn: api.shoppingItems })
   const verifyNames = useMemo(
-    () => [...new Set(recommendations.data?.flatMap((item) => item.verify) ?? [])].slice(0, 5),
+    () => [...new Set(recommendations.data.flatMap((item) => item.verify))].slice(0, 5),
     [recommendations.data],
   )
   const [confirmOpen, setConfirmOpen] = useState(false)
@@ -589,6 +583,14 @@ export function RecommendationsPage() {
           }
         }),
       )
+      updateResults((current) =>
+        current.map((recommendation) => {
+          return recommendation.recipe.id !== recipeId ? recommendation : {
+            ...recommendation,
+            inShoppingList: [...new Set([...recommendation.inShoppingList, name])],
+          }
+        }),
+      )
       setShoppingNotice({ id: ++shoppingNoticeSequence.current, name })
     },
     onSettled: (_data, _error, variables) => {
@@ -597,7 +599,7 @@ export function RecommendationsPage() {
     },
   })
   const renderRecommendationCard = (result: Recommendation) => {
-    const desiredCoverage = recommendationDesiredCoverage(result, submitted.preferred.length)
+    const desiredCoverage = recommendationDesiredCoverage(result, activeControls?.preferred.length ?? 0)
     const shoppingCoverage = recommendationShoppingCoverage(result, shopping.data ?? [])
     return (
       <article className="recommendation-card" key={result.recipe.id}>
@@ -692,15 +694,49 @@ export function RecommendationsPage() {
     )
   }
 
+  if (settings.error) {
+    return (
+      <Page title={t('recommend.title')} intro={t('recommend.intro')}>
+        <StatePanel title={t('common.errorTitle')} detail={errorMessage(settings.error, t)} />
+      </Page>
+    )
+  }
+  if (!filters || !activeControls) {
+    return (
+      <Page title={t('recommend.title')} intro={t('recommend.intro')}>
+        <StatePanel title={t('common.loading')} detail={t('common.loadingDetail')} />
+      </Page>
+    )
+  }
+
+  const resultStatus = recommendations.status === 'loading'
+    ? t('recommend.loading')
+    : recommendations.status === 'success'
+      ? t('recommend.loaded', { count: formatNumber(recommendations.data.length) })
+      : recommendations.status === 'error'
+        ? t('recommend.failed')
+        : ''
+
   return (
     <Page title={t('recommend.title')} intro={t('recommend.intro')}>
+      {urlIssues.length > 0 && (
+        <div className="notice" role="status">
+          <span>{t(
+            urlIssues.includes('canonicalDowngradeConflict')
+              ? 'recommend.canonicalDowngradeConflict'
+              : urlIssues.includes('canonicalDowngraded')
+                ? 'recommend.canonicalDowngraded'
+                : 'recommend.urlWarning',
+          )}</span>
+        </div>
+      )}
       <form
         className="filter-panel"
         onSubmit={(event) => {
           event.preventDefault()
-          setSubmitted({ ...filters, today: localDateValue(new Date()) })
         }}
       >
+        <p className="recommendation-share-note">{t('recommend.shareNote')}</p>
         <IngredientFilterInput
           label={t('recommend.hopeToUse')}
           values={filters.preferred}
@@ -735,8 +771,43 @@ export function RecommendationsPage() {
             </label>
           ))}
         </fieldset>
-        <button className="button primary">{t('recommend.refresh')}</button>
+        <fieldset className="recommendation-sources">
+          <legend>{t('recommend.sourceLegend')}</legend>
+          <p className="field-note">{t('recommend.sourceHelp')}</p>
+          {([
+            ['includeFavoriteRecipes', 'sources.favoriteRecipes'],
+            ['includeOwn', 'sources.own'],
+            ['includeFavoriteAccounts', 'sources.favoriteAccounts'],
+            ['includeOtherPublic', 'sources.otherPublic'],
+          ] as const).map(([field, label]) => (
+            <label className="check-row" key={field}>
+              <input
+                type="checkbox"
+                checked={filters.sources[field]}
+                onChange={(event) => setFilters({
+                  ...filters,
+                  sources: { ...filters.sources, [field]: event.target.checked },
+                })}
+              />
+              {t(label)}
+            </label>
+          ))}
+        </fieldset>
       </form>
+      <p className="sr-only" aria-live="polite" aria-atomic="true">{resultStatus}</p>
+      {recommendations.status === 'loading' && recommendations.data.length > 0 && (
+        <div className="status-banner">
+          <span>{t('recommend.loading')}</span>
+        </div>
+      )}
+      {recommendations.status === 'error' && (
+        <div className="status-banner">
+          <span>{t('recommend.failed')}</span>
+          <button type="button" className="button secondary" onClick={retry}>
+            {t('recommend.retry')}
+          </button>
+        </div>
+      )}
       {verifyNames.length > 0 && (
         <div className="notice">
           <span>{t('recommend.checkCount', { count: formatNumber(verifyNames.length) })}</span>
@@ -745,11 +816,16 @@ export function RecommendationsPage() {
           </button>
         </div>
       )}
-      <QueryState query={recommendations} empty={t('recommend.noMatches')}>
+      {recommendations.status === 'loading' && recommendations.data.length === 0 ? (
+        <StatePanel title={t('common.loading')} detail={t('recommend.loading')} />
+      ) : recommendations.status === 'error' && recommendations.data.length === 0 ? null
+        : recommendations.status === 'success' && recommendations.data.length === 0 ? (
+          <StatePanel title={t('common.emptyTitle')} detail={t('recommend.noMatches')} />
+        ) : (
         <div className="recommendation-results">
           {(() => {
-            const results = recommendations.data ?? []
-            const hasDesiredIntent = submitted.preferred.length > 0
+            const results = recommendations.data
+            const hasDesiredIntent = activeControls.preferred.length > 0
               || results.some((result) => result.appliedControls.preferred.length > 0)
             const usesPreferred = hasDesiredIntent
               ? results.filter((result) => result.desiredMatches.length > 0)
@@ -777,14 +853,19 @@ export function RecommendationsPage() {
             )
           })()}
         </div>
-      </QueryState>
+      )}
       {shoppingNotice && (
         <p key={shoppingNotice.id} role="status" aria-live="polite">
           {t('shopping.addedMissing', { name: shoppingNotice.name })}
         </p>
       )}
       {addShopping.error && <ErrorText error={addShopping.error} />}
-      <PantryConfirmation open={confirmOpen} onOpenChange={setConfirmOpen} names={verifyNames} />
+      <PantryConfirmation
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        names={verifyNames}
+        onSaved={retry}
+      />
     </Page>
   )
 }
@@ -805,10 +886,10 @@ function IngredientFilterInput({
       name,
       canonicalIngredientId: index === 0 ? next.canonicalIngredientId : null,
     }))
-    const existing = new Set(values.map((value) => value.name.normalize('NFKC').toLocaleLowerCase()))
+    const existing = new Set(values.map(ingredientIdentity))
     onChange([
       ...values,
-      ...additions.filter((value) => !existing.has(value.name.normalize('NFKC').toLocaleLowerCase())),
+      ...additions.filter((value) => !existing.has(ingredientIdentity(value))),
     ])
     setDraft({ name: '', canonicalIngredientId: null })
   }
@@ -829,7 +910,7 @@ function IngredientFilterInput({
       {values.length > 0 && (
         <ul className="ingredient-chips" aria-label={t('recommend.filterList', { label })}>
           {values.map((value, index) => (
-            <li key={`${value.name}-${index}`}>
+            <li key={`${ingredientIdentity(value)}-${index}`}>
               <span>{value.name}</span>
               <button
                 type="button"
@@ -4828,10 +4909,12 @@ export function PantryConfirmation({
   open,
   onOpenChange,
   names,
+  onSaved,
 }: {
   open: boolean
   onOpenChange: (value: boolean) => void
   names: string[]
+  onSaved?: () => void
 }) {
   const { t } = useI18n()
   const queryClient = useQueryClient()
@@ -4848,6 +4931,7 @@ export function PantryConfirmation({
     onSuccess: async (items) => {
       queryClient.setQueryData(['pantry'], items)
       await queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+      onSaved?.()
       onOpenChange(false)
       setAnswers({})
     },
