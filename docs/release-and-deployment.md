@@ -89,6 +89,9 @@ Store off-host encrypted copies and regularly test restoration. Normalized recip
 - `test "$(curl -fsS https://cook.vichare.net/health)" = ok`
 - complete real Google and Email OTP login, passkey registration/login/revocation, and current/all-device logout
 - verify Google-first exact-email OTP linking, Gmail email-first Google convergence, non-Gmail rejection, and pre-existing split-account recovery without account merging
+- create and revoke a trusted-host account-assistant claim against a dedicated test administrator; verify content moderators remain unauthorized
+- with the test user physically present, verify fresh-Passkey/same-origin assisted issuance, one-time reveal/copy announcements, new and existing account completion, one-hour warning, ordinary recipe/pantry testing, centralized denial of Passkey/token/identity/session/admin writes, user notifications, challenge deletion on issuer revocation, and immediate assisted-session invalidation
+- verify ordinary mailbox OTP upgrades an assisted identity and only then permits the existing exact-Gmail Google linking rule
 - verify private recipe and pantry isolation with two accounts
 - open, refresh, copy, and reopen a versioned recommendation URL; verify identical filter/source request semantics, Back/Forward restoration, automatic debounce, retained results on failure, Retry, and no pantry/shopping/account/token/private-recipe data in the URL
 - move canonical and unresolved recommendation ingredients among desired, must-use, and do-not-use with keyboard and touch; verify one URL replacement/request per committed move or confirmed batch, target-chip focus, localized live announcements, explicit cross-bucket add confirmation, full-bucket and oversized-URL rollback, Back/Forward cancellation of stale dialogs, visual-viewport collision handling and reference-hidden closure at 320px/zoom, and no duplicate identity or intermediate conflicting URL

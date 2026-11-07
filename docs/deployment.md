@@ -24,16 +24,18 @@ Host capacity, Google callback registration, SMTP deliverability, and production
 
 Production releases are normally installed by the tag-driven GitHub Actions workflow rather than by building on the VM. See `release-and-deployment.md`.
 
-### Content moderator bootstrap and revocation
+### Administrative capability bootstrap and revocation
 
 Run trusted moderation commands on the host against the production `DATABASE_URL`; do not place claim codes in shell history, logs, tickets, or chat:
 
 ```sh
 docker compose -f compose.yaml run --rm cook moderation claim-code create
 docker compose -f compose.yaml run --rm cook moderation assignment revoke <assignment-uuid>
+docker compose -f compose.yaml run --rm cook account-assistance claim-code create
+docker compose -f compose.yaml run --rm cook account-assistance assignment revoke <assignment-uuid>
 ```
 
-The create command prints one random claim code once. It expires after 15 minutes and is stored only as a digest. The user must already have a Cook account and Passkey, then enter the code at `/admin/claim`. Revocation is host-only, uses the assignment UUID from the PII-free audit/administrative record, increments authorization version, and revokes all sessions for that user.
+Each create command prints one random claim code once. It expires after 15 minutes and is stored only as a digest. The user must already have a Cook account and Passkey, then enter the code at the matching claim page. Every successful account-assistant claim creates a new immutable assignment ID and alias; revoked generations are never reactivated. Revocation is host-only, uses the assignment UUID from the PII-minimized audit/administrative record, increments authorization version, revokes all sessions for that administrator, atomically deletes that generation's unconsumed OTP challenges, and makes every target assisted session issued by it fail authentication immediately.
 
 After the first successful restriction, `deploy/upgrade.sh` reads the database compatibility marker and refuses any image older than `v0.6.0`. Do not bypass this guard or restore an older application binary against a moderation-aware database. Restore the matching database backup and application release together.
 

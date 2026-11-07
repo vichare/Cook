@@ -443,7 +443,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "cook-api"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -451,9 +451,11 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cookie",
+ "hmac 0.12.1",
  "http",
  "image",
  "lettre",
+ "rand 0.8.8",
  "rust-web-auth-core",
  "rust-web-auth-email-otp",
  "rust-web-auth-google",

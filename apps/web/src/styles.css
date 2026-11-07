@@ -140,6 +140,11 @@ fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
 .hero-card form { display: grid; gap: 1rem; margin: 2rem 0 1rem; }
 .auth-method { display: grid; gap: 1rem; margin: 1.5rem 0; padding-top: 1.5rem; border-top: 1px solid var(--line); }
 .auth-actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+.assisted-session-banner { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; padding: 1rem max(1rem, calc((100vw - 1200px) / 2)); color: #2f1d00; background: #ffe3a3; border-block: 2px solid #8a5a00; }
+.assisted-session-banner a { color: inherit; font-weight: 800; }
+.assistance-code { display: block; width: fit-content; padding: .8rem 1rem; border: 2px solid var(--forest); border-radius: .75rem; background: white; font: 800 clamp(1.75rem, 8vw, 3rem)/1.1 ui-monospace, monospace; letter-spacing: .16em; overflow-wrap: anywhere; }
+.assistance-reveal { border-width: 3px; border-color: #8a5a00; }
+.assistance-confirmation { display: grid; align-content: start; gap: 1rem; }
 .security-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }
 .security-grid > div { display: grid; align-content: start; gap: .8rem; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: white; }
 .dialog-overlay { position: fixed; inset: 0; background: rgb(10 25 18 / 55%); z-index: 20; }

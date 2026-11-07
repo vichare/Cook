@@ -16,6 +16,8 @@ pub enum AppError {
     Unauthorized,
     #[error("too many login attempts")]
     RateLimited,
+    #[error("too many account assistance attempts")]
+    RateLimitedWithRetry(u64),
     #[error("authentication provider unavailable")]
     AuthUnavailable,
     #[error("resource not found")]
@@ -24,6 +26,8 @@ pub enum AppError {
     Forbidden,
     #[error("fresh Passkey verification is required")]
     AdminReauthRequired,
+    #[error("the assisted sign-in code is invalid, expired, consumed, or exhausted")]
+    AssistedOtpInvalid,
     #[error("{0}")]
     PayloadTooLarge(String),
     #[error("{0}")]
@@ -122,10 +126,30 @@ impl IntoResponse for AppError {
         let (status, error) = match self_ {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            Self::RateLimitedWithRetry(seconds) => {
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ErrorBody {
+                        error: "rate_limited",
+                        message: "too many account assistance attempts".to_string(),
+                        recipe_version: None,
+                        moderation_version: None,
+                        case_version: None,
+                        appeal_version: None,
+                        canonical_ingredient_ids: None,
+                    }),
+                )
+                    .into_response();
+                if let Ok(value) = seconds.to_string().parse() {
+                    response.headers_mut().insert("retry-after", value);
+                }
+                return response;
+            }
             Self::AuthUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "auth_unavailable"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             Self::AdminReauthRequired => (StatusCode::FORBIDDEN, "admin_passkey_reauth_required"),
+            Self::AssistedOtpInvalid => (StatusCode::UNAUTHORIZED, "assisted_otp_invalid"),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::ModerationConflict { .. } => unreachable!(),

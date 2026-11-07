@@ -89,9 +89,10 @@ pub struct CursorQuery {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Notification {
     id: String,
-    recipe_id: String,
+    recipe_id: Option<String>,
     kind: String,
     reason_code: String,
+    issuer_alias: Option<String>,
     created_at: i64,
     read_at: Option<i64>,
 }
@@ -194,6 +195,7 @@ pub(crate) async fn claim_start(
     axum::Extension(CurrentAuth(auth)): axum::Extension<CurrentAuth>,
     Json(input): Json<ClaimStartInput>,
 ) -> AppResult<impl IntoResponse> {
+    crate::account_assistance::ensure_not_assisted_session(&state, &auth).await?;
     rate_limit(&state, &format!("claim:{}", user.id), 10, 60 * 60).await?;
     let code_digest = claim_digest(&input.code)?;
     let now = Utc::now().timestamp();
@@ -250,6 +252,7 @@ pub(crate) async fn claim_finish(
     axum::Extension(CurrentAuth(auth)): axum::Extension<CurrentAuth>,
     Json(input): Json<ClaimFinishInput>,
 ) -> AppResult<impl IntoResponse> {
+    crate::account_assistance::ensure_not_assisted_session(&state, &auth).await?;
     let token = reauth_cookie(&state, &jar)?;
     let code_digest = claim_digest(&input.code)?;
     consume_attempt(
@@ -379,7 +382,8 @@ pub(crate) async fn reauth_start(
     axum::Extension(CurrentUser(user)): axum::Extension<CurrentUser>,
     axum::Extension(CurrentAuth(auth)): axum::Extension<CurrentAuth>,
 ) -> AppResult<impl IntoResponse> {
-    require_moderator(&state, &user.id).await?;
+    crate::account_assistance::ensure_not_assisted_session(&state, &auth).await?;
+    crate::account_assistance::require_any_admin(&state, &user.id).await?;
     rate_limit(&state, &format!("reauth:{}", user.id), 20, 60 * 60).await?;
     let user_id = UserId::new(user.id.clone()).map_err(|_| AppError::AuthUnavailable)?;
     let start = state
@@ -414,7 +418,8 @@ pub(crate) async fn reauth_finish(
     axum::Extension(CurrentAuth(auth)): axum::Extension<CurrentAuth>,
     Json(credential): Json<PublicKeyCredential>,
 ) -> AppResult<impl IntoResponse> {
-    require_moderator(&state, &user.id).await?;
+    crate::account_assistance::ensure_not_assisted_session(&state, &auth).await?;
+    crate::account_assistance::require_any_admin(&state, &user.id).await?;
     let token = reauth_cookie(&state, &jar)?;
     consume_attempt(
         &state,
@@ -576,10 +581,14 @@ pub(crate) async fn list_notifications(
     axum::Extension(CurrentUser(user)): axum::Extension<CurrentUser>,
 ) -> AppResult<Json<Vec<Notification>>> {
     let rows = sqlx::query(
-        "SELECT id, recipe_id, kind, reason_code, created_at, read_at
+        "SELECT id, recipe_id, kind, reason_code, NULL AS issuer_alias, created_at, read_at
          FROM owner_notifications WHERE owner_user_id = ?
+         UNION ALL
+         SELECT id, NULL AS recipe_id, kind, reason_code, issuer_alias, created_at, read_at
+         FROM account_assistance_notifications WHERE user_id = ?
          ORDER BY created_at DESC, id DESC LIMIT 100",
     )
+    .bind(&user.id)
     .bind(&user.id)
     .fetch_all(&state.pool)
     .await?;
@@ -590,6 +599,7 @@ pub(crate) async fn list_notifications(
                 recipe_id: row.get("recipe_id"),
                 kind: row.get("kind"),
                 reason_code: row.get("reason_code"),
+                issuer_alias: row.get("issuer_alias"),
                 created_at: row.get("created_at"),
                 read_at: row.get("read_at"),
             })
@@ -607,11 +617,23 @@ pub(crate) async fn read_notification(
          WHERE id = ? AND owner_user_id = ?",
     )
     .bind(Utc::now().timestamp())
-    .bind(id)
-    .bind(user.id)
+    .bind(&id)
+    .bind(&user.id)
     .execute(&state.pool)
     .await?;
     if changed.rows_affected() == 0 {
+        let changed = sqlx::query(
+            "UPDATE account_assistance_notifications SET read_at = COALESCE(read_at, ?)
+             WHERE id = ? AND user_id = ?",
+        )
+        .bind(Utc::now().timestamp())
+        .bind(&id)
+        .bind(&user.id)
+        .execute(&state.pool)
+        .await?;
+        if changed.rows_affected() != 0 {
+            return Ok(StatusCode::NO_CONTENT);
+        }
         return Err(AppError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)

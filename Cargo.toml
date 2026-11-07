@@ -16,7 +16,9 @@ chrono = { version = "0.4.39", features = ["serde"] }
 cookie = "0.18.1"
 http = "1.2.0"
 image = { version = "0.25.5", default-features = false, features = ["jpeg", "png", "webp"] }
+hmac = "0.12.1"
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "ring", "webpki-roots"] }
+rand = "0.8.5"
 rust-web-auth-core = { git = "https://github.com/vichare/rust-web-auth", rev = "b087b47a3ba6fdcc04d67931e97c3214b82e5e6d" }
 rust-web-auth-email-otp = { git = "https://github.com/vichare/rust-web-auth", rev = "b087b47a3ba6fdcc04d67931e97c3214b82e5e6d" }
 rust-web-auth-google = { git = "https://github.com/vichare/rust-web-auth", rev = "b087b47a3ba6fdcc04d67931e97c3214b82e5e6d" }

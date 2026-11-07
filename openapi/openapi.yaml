@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cook API
-  version: 0.6.0
+  version: 0.7.0
 servers:
   - url: https://cook.vichare.net
 paths:
@@ -127,7 +127,7 @@ paths:
         "503": { description: OTP persistence or mail delivery unavailable }
   /api/auth/email/verify:
     post:
-      description: Verifies and consumes a one-time challenge, then creates or resolves only the Email OTP identity and issues a Cook session.
+      description: Verifies and consumes either a normal six-digit mailbox challenge or an administrator-assisted eight-digit challenge, then creates or resolves only the Email OTP identity and issues a Cook session through the shared completion path. Assisted challenges retain admin-assisted provenance and issue a restricted one-hour session.
       requestBody:
         $ref: "#/components/requestBodies/EmailOtpVerify"
       responses:
@@ -229,7 +229,7 @@ paths:
     post:
       security:
         - sessionCookie: []
-      description: Starts passkey registration for an authenticated account with an explicitly linked email.
+      description: Starts passkey registration for a normal authenticated session whose Email OTP identity has mailbox_verified provenance. Administrator-assisted sessions and admin_assisted-only identities cannot register credentials.
       requestBody:
         required: true
         content:
@@ -248,6 +248,7 @@ paths:
               schema: { type: object, additionalProperties: true }
         "400": { description: No linked email or invalid credential name }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: Administrator-assisted sessions cannot create persistent credentials }
   /api/settings/security/passkeys/register/finish:
     post:
       security:
@@ -265,6 +266,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Passkey" }
         "401": { description: "Invalid, expired, replayed, or wrong-user ceremony" }
+        "403": { description: Administrator-assisted sessions cannot create persistent credentials }
         "409": { description: Credential ID already belongs to an account }
   /api/settings/security/passkeys/{id}:
     delete:
@@ -1056,6 +1058,43 @@ paths:
         "200": { description: Content moderator capability assigned }
         "404": { description: "Claim is unavailable, expired, or already consumed" }
         "409": { description: Capability is already assigned }
+  /api/capability-claims/account-assistant/passkey/start:
+    post:
+      description: Starts a Passkey assertion bound to the current non-assisted session and a valid one-time 15-minute account-assistant claim code. Content moderator capability does not satisfy this claim.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code]
+              properties:
+                code: { type: string, minLength: 32, maxLength: 256 }
+      responses:
+        "200": { description: WebAuthn credential request options }
+        "404": { description: Claim is unavailable }
+  /api/capability-claims/account-assistant/passkey/finish:
+    post:
+      description: Atomically verifies the Passkey, consumes the trusted-host claim code, creates a new immutable account-assistant assignment generation with a new ID and alias, advances authorization version, and refreshes only the current session. Revoked generations are never reactivated.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, credential]
+              properties:
+                code: { type: string, minLength: 32, maxLength: 256 }
+                credential: { type: object, additionalProperties: true }
+      responses:
+        "200": { description: Account assistance capability assigned }
+        "403": { description: Assisted sessions cannot claim administrative capabilities }
+        "404": { description: "Claim is unavailable, expired, or already consumed" }
+        "409": { description: Capability is already assigned }
   /api/recipes/{id}/reports:
     parameters: [{ $ref: "#/components/parameters/RecipeId" }]
     post:
@@ -1073,7 +1112,7 @@ paths:
         "429": { description: Reporter rate limit exceeded }
   /api/notifications:
     get:
-      description: Lists up to 100 current-user moderation notifications.
+      description: Lists up to 100 current-user moderation and account-assistance notifications.
       security: [{ sessionCookie: [] }]
       responses:
         "200":
@@ -1125,11 +1164,11 @@ paths:
         "409": { description: An appeal already exists for this restriction }
   /api/admin/reauth/passkey/start:
     post:
-      description: Starts a Passkey assertion for the current moderator session. Non-moderators receive 404.
+      description: Starts a Passkey assertion for a current content-moderator or account-assistant session. Users with neither capability receive 404; assisted target sessions are forbidden.
       security: [{ sessionCookie: [] }]
       responses:
         "200": { description: WebAuthn credential request options }
-        "404": { description: Moderator capability not present }
+        "404": { description: Administrative capability not present }
   /api/admin/reauth/passkey/finish:
     post:
       description: Verifies the assertion and raises only the current session's Passkey assurance for ten minutes.
@@ -1141,7 +1180,52 @@ paths:
             schema: { type: object, additionalProperties: true }
       responses:
         "204": { description: Current session assurance refreshed }
-        "404": { description: Moderator capability not present }
+        "404": { description: Administrative capability not present }
+  /api/admin/account-assistance/inspect:
+    post:
+      description: After same-origin validation and a Passkey assertion fresh within ten minutes, normalizes an email and returns only whether the account-assistance target is new or existing. Non-account-assistants receive 404.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        $ref: "#/components/requestBodies/EmailOtpRequest"
+      responses:
+        "200":
+          description: Normalized target and bounded account status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountAssistanceInspection" }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
+        "404": { description: Account assistance capability not present }
+        "429": { description: Inspection rate limit exceeded; Retry-After is returned }
+  /api/admin/account-assistance/otp:
+    post:
+      description: Issues an eight-digit CSPRNG administrator-assisted sign-in OTP. Requires active account-assistant assignment, exact same-origin request, and Passkey assurance fresh within ten minutes. The plaintext OTP is returned once, never logged, and only its keyed digest is persisted. A replacement atomically invalidates the previous assisted challenge for the normalized email.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, reasonCode]
+              properties:
+                email: { type: string, format: email }
+                reasonCode:
+                  type: string
+                  enum: [in_person_accessibility, mailbox_unavailable, device_setup]
+                note:
+                  type: string
+                  maxLength: 120
+                  description: Optional non-sensitive plain text. It is not persisted in notifications or audit.
+      responses:
+        "200":
+          description: One-time reveal response
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountAssistanceOtp" }
+        "403": { $ref: "#/components/responses/AdminReauthRequired" }
+        "404": { description: Account assistance capability not present }
+        "429": { description: Issuer, target, IP partition, or global rate limit exceeded; Retry-After is returned }
   /api/admin/moderation/queue:
     get:
       description: Keyset-paginated public-content moderation queue. Private unreviewed recipes are excluded. Non-moderators receive 404.
@@ -1398,12 +1482,15 @@ components:
               challengeId:
                 type: string
                 description: Opaque 256-bit challenge identifier; never place it or the code in URLs or logs.
-              code: { type: string, pattern: "^[0-9]{6}$" }
+              code:
+                type: string
+                pattern: "^[0-9]{6}([0-9]{2})?$"
+                description: Six digits for ordinary mailbox OTP or eight digits for administrator-assisted sign-in.
   schemas:
     User:
       type: object
       description: Private current-user DTO. It is never embedded as another recipe author's public profile.
-      required: [id, email, displayName, nickname, onboardingCompleted, locale, capabilities]
+      required: [id, email, displayName, nickname, onboardingCompleted, locale, capabilities, assistedSession, lastAssistedLoginAt]
       properties:
         id: { type: string }
         email: { type: string, format: email }
@@ -1416,8 +1503,16 @@ components:
           description: Account-level interface locale. Null is an initialization state only, not a translated anonymous value.
         capabilities:
           type: array
-          description: Product-level capabilities for the current user only. This field is never exposed in public author or recipe DTOs.
-          items: { type: string, enum: [content_moderation] }
+          description: Product-level capabilities for the current user only. This field is never exposed in public author or recipe DTOs and is always empty in every User response produced for an administrator-assisted session, including the initial OTP completion response.
+          items: { type: string, enum: [content_moderation, account_assistance] }
+        assistedSession:
+          oneOf:
+            - { $ref: "#/components/schemas/AssistedSession" }
+            - { type: "null" }
+          description: Present only for the current restricted administrator-assisted session.
+        lastAssistedLoginAt:
+          type: [integer, "null"]
+          description: Unix timestamp of the most recent consumed administrator-assisted sign-in visible to this user.
     ProfileInput:
       type: object
       additionalProperties: false
@@ -1440,6 +1535,33 @@ components:
         challengeId: { type: string }
         expiresAt: { type: string, format: date-time }
         resendAllowedAt: { type: string, format: date-time }
+    AssistedSession:
+      type: object
+      required: [issuerAlias, authenticatedAt, expiresAt]
+      properties:
+        issuerAlias: { type: string }
+        authenticatedAt: { type: integer }
+        expiresAt: { type: integer }
+    AccountAssistanceInspection:
+      type: object
+      required: [normalizedEmail, targetStatus]
+      properties:
+        normalizedEmail: { type: string, format: email }
+        targetStatus: { type: string, enum: [new, existing] }
+    AccountAssistanceOtp:
+      allOf:
+        - { $ref: "#/components/schemas/AccountAssistanceInspection" }
+        - type: object
+          required: [challengeId, code, expiresAt]
+          properties:
+            challengeId:
+              type: string
+              description: Opaque assisted challenge identifier. It is never placed in a URL.
+            code:
+              type: string
+              pattern: "^[0-9]{8}$"
+              description: One-time plaintext reveal. The database stores only a keyed digest.
+            expiresAt: { type: string, format: date-time }
     Passkey:
       type: object
       required: [id, name, createdAt, lastUsedAt]
@@ -1628,12 +1750,21 @@ components:
           description: Plain text only. It is never interpreted as Markdown or HTML.
     OwnerNotification:
       type: object
-      required: [id, recipeId, kind, reasonCode, createdAt, readAt]
+      required: [id, recipeId, kind, reasonCode, issuerAlias, createdAt, readAt]
       properties:
         id: { type: string, format: uuid }
-        recipeId: { type: string, format: uuid }
-        kind: { type: string, enum: [recipe_restricted, recipe_reinstated, appeal_upheld, content_removed] }
+        recipeId: { type: [string, "null"], format: uuid }
+        kind:
+          type: string
+          enum:
+            - recipe_restricted
+            - recipe_reinstated
+            - appeal_upheld
+            - content_removed
+            - account_assistance_issued
+            - account_assistance_consumed
         reasonCode: { type: string }
+        issuerAlias: { type: [string, "null"] }
         createdAt: { type: integer }
         readAt: { type: [integer, "null"] }
     ModerationAppeal:

@@ -1,3 +1,4 @@
+pub mod account_assistance;
 pub mod ai_recipes;
 pub mod auth;
 pub mod config;

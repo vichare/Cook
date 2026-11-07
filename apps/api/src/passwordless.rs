@@ -269,6 +269,18 @@ impl SqlitePasswordlessStore {
         .await?)
     }
 
+    pub async fn mailbox_verified_emails(&self, user_id: &str) -> AppResult<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT subject FROM auth_identities
+             WHERE issuer = ? AND user_id = ? AND verification_provenance = 'mailbox_verified'
+             ORDER BY subject",
+        )
+        .bind(EMAIL_IDENTITY_ISSUER)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn google_verified_emails(&self, user_id: &str) -> AppResult<Vec<String>> {
         Ok(sqlx::query_scalar(
             "SELECT verified_email FROM auth_identities
@@ -321,7 +333,8 @@ impl SqlitePasswordlessStore {
         let mut transaction = self.pool.begin().await?;
         if let Some(existing) = identity_user(&mut transaction, normalized_email).await? {
             sqlx::query(
-                "UPDATE auth_identities SET verified_email = ?
+                "UPDATE auth_identities
+                 SET verified_email = ?, verification_provenance = 'mailbox_verified'
                  WHERE issuer = ? AND subject = ? AND user_id = ?",
             )
             .bind(normalized_email)
@@ -350,8 +363,9 @@ impl SqlitePasswordlessStore {
         .await?;
         let inserted = sqlx::query(
             "INSERT INTO auth_identities
-             (issuer, subject, user_id, created_at, verified_email)
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(issuer, subject) DO NOTHING",
+             (issuer, subject, user_id, created_at, verified_email, verification_provenance)
+             VALUES (?, ?, ?, ?, ?, 'mailbox_verified')
+             ON CONFLICT(issuer, subject) DO NOTHING",
         )
         .bind(EMAIL_IDENTITY_ISSUER)
         .bind(normalized_email)
@@ -393,8 +407,12 @@ impl SqlitePasswordlessStore {
         }
         sqlx::query(
             "INSERT INTO auth_identities
-             (issuer, subject, user_id, created_at, verified_email)
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(issuer, subject) DO NOTHING",
+             (issuer, subject, user_id, created_at, verified_email, verification_provenance)
+             VALUES (?, ?, ?, ?, ?, 'mailbox_verified')
+             ON CONFLICT(issuer, subject) DO UPDATE SET
+               verified_email = excluded.verified_email,
+               verification_provenance = 'mailbox_verified'
+             WHERE auth_identities.user_id = excluded.user_id",
         )
         .bind(EMAIL_IDENTITY_ISSUER)
         .bind(normalized_email)
@@ -1248,6 +1266,50 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn passkey_registration_email_requires_mailbox_verified_provenance() {
+        let (pool, runtime) = runtime().await;
+        sqlx::query(
+            "INSERT INTO users (id, email, profile_email, display_name)
+             VALUES ('assisted', 'assisted@identity.invalid', 'owner@example.test', 'Owner')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verification_provenance)
+             VALUES (?, 'owner@example.test', 'assisted', 1, 'admin_assisted')",
+        )
+        .bind(EMAIL_IDENTITY_ISSUER)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(runtime
+            .store
+            .mailbox_verified_emails("assisted")
+            .await
+            .unwrap()
+            .is_empty());
+        sqlx::query(
+            "UPDATE auth_identities SET verification_provenance = 'mailbox_verified'
+             WHERE issuer = ? AND subject = 'owner@example.test'",
+        )
+        .bind(EMAIL_IDENTITY_ISSUER)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .mailbox_verified_emails("assisted")
+                .await
+                .unwrap(),
+            vec!["owner@example.test"]
+        );
     }
 
     #[tokio::test]

@@ -182,6 +182,8 @@ pub async fn upsert_development_user(pool: &SqlitePool, display_name: &str) -> A
         onboarding_completed: false,
         locale: None,
         capabilities: Vec::new(),
+        assisted_session: None,
+        last_assisted_login_at: None,
     };
     sqlx::query(
         "INSERT INTO users (id, email, profile_email, display_name) VALUES (?, ?, ?, ?)
@@ -210,7 +212,7 @@ pub async fn load_user(pool: &SqlitePool, user_id: &UserId) -> AppResult<User> {
     .await?;
     let (id, email, display_name, nickname, onboarding_completed, locale) =
         row.ok_or(AppError::Unauthorized)?;
-    let capabilities = if sqlx::query_scalar::<_, i64>(
+    let mut capabilities = if sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS(
            SELECT 1 FROM capability_assignments
            WHERE user_id = ? AND capability = 'content_moderation' AND revoked_at IS NULL
@@ -225,6 +227,19 @@ pub async fn load_user(pool: &SqlitePool, user_id: &UserId) -> AppResult<User> {
     } else {
         Vec::new()
     };
+    if sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+           SELECT 1 FROM account_assistant_assignments
+           WHERE user_id = ? AND revoked_at IS NULL
+         )",
+    )
+    .bind(&id)
+    .fetch_one(pool)
+    .await?
+        != 0
+    {
+        capabilities.push("account_assistance".into());
+    }
     Ok(User {
         id,
         email,
@@ -233,6 +248,8 @@ pub async fn load_user(pool: &SqlitePool, user_id: &UserId) -> AppResult<User> {
         onboarding_completed,
         locale,
         capabilities,
+        assisted_session: None,
+        last_assisted_login_at: None,
     })
 }
 
@@ -298,7 +315,8 @@ impl IdentityMapper for SqliteAuthStore {
         .await
         .map_err(storage_error)?;
         let email_user: Option<String> = sqlx::query_scalar(
-            "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
+            "SELECT user_id FROM auth_identities
+             WHERE issuer = ? AND subject = ? AND verification_provenance = 'mailbox_verified'",
         )
         .bind(EMAIL_IDENTITY_ISSUER)
         .bind(&normalized_email)
@@ -397,7 +415,14 @@ impl SessionStore for SqliteAuthStore {
                     s.expires_at, s.revoked_at, s.version
              FROM auth_sessions s
              JOIN users u ON u.id = s.user_id
-             WHERE s.token_digest = ? AND s.authorization_version = u.authorization_version",
+             WHERE s.token_digest = ? AND s.authorization_version = u.authorization_version
+               AND (
+                 s.auth_method != 'admin_assisted_otp'
+                 OR EXISTS (
+                   SELECT 1 FROM account_assistant_assignments a
+                   WHERE a.id = s.issuer_assignment_id AND a.revoked_at IS NULL
+                 )
+               )",
         )
         .bind(token_digest.as_slice())
         .fetch_optional(&self.pool)
@@ -415,7 +440,14 @@ impl SessionStore for SqliteAuthStore {
                     s.expires_at, s.revoked_at, s.version
              FROM auth_sessions s
              JOIN users u ON u.id = s.user_id
-             WHERE s.session_id = ? AND s.authorization_version = u.authorization_version",
+             WHERE s.session_id = ? AND s.authorization_version = u.authorization_version
+               AND (
+                 s.auth_method != 'admin_assisted_otp'
+                 OR EXISTS (
+                   SELECT 1 FROM account_assistant_assignments a
+                   WHERE a.id = s.issuer_assignment_id AND a.revoked_at IS NULL
+                 )
+               )",
         )
         .bind(session_id.to_string())
         .fetch_optional(&self.pool)
@@ -430,10 +462,16 @@ impl SessionStore for SqliteAuthStore {
         replacement: SessionRecord,
     ) -> Result<CasOutcome, StorageError> {
         let result = sqlx::query(
-            "UPDATE auth_sessions SET last_activity_at = ?, expires_at = ?, revoked_at = ?, version = ?
+            "UPDATE auth_sessions SET last_activity_at = ?,
+               expires_at = CASE
+                 WHEN auth_method = 'admin_assisted_otp'
+                 THEN MIN(?, authenticated_at + 3600)
+                 ELSE ? END,
+               revoked_at = ?, version = ?
              WHERE session_id = ? AND version = ?",
         )
         .bind(replacement.last_activity_at.timestamp())
+        .bind(replacement.expires_at.timestamp())
         .bind(replacement.expires_at.timestamp())
         .bind(replacement.revoked_at.map(|value| value.timestamp()))
         .bind(i64::try_from(replacement.version).map_err(|_| StorageError)?)
@@ -483,7 +521,8 @@ impl SqliteAuthStore {
         .await
         .map_err(storage_error)?;
         let email_user: Option<String> = sqlx::query_scalar(
-            "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = ?",
+            "SELECT user_id FROM auth_identities
+             WHERE issuer = ? AND subject = ? AND verification_provenance = 'mailbox_verified'",
         )
         .bind(EMAIL_IDENTITY_ISSUER)
         .bind(&pending.normalized_email)
@@ -529,8 +568,8 @@ impl SqliteAuthStore {
 
         sqlx::query(
             "INSERT INTO auth_identities
-             (issuer, subject, user_id, created_at, verified_email)
-             VALUES (?, ?, ?, ?, ?)
+             (issuer, subject, user_id, created_at, verified_email, verification_provenance)
+             VALUES (?, ?, ?, ?, ?, 'provider_verified')
              ON CONFLICT(issuer, subject) DO NOTHING",
         )
         .bind(&pending.identity.key.issuer)
@@ -554,7 +593,8 @@ impl SqliteAuthStore {
             return Err(StorageError);
         }
         sqlx::query(
-            "UPDATE auth_identities SET verified_email = ?
+            "UPDATE auth_identities
+             SET verified_email = ?, verification_provenance = 'provider_verified'
              WHERE issuer = ? AND subject = ? AND user_id = ?",
         )
         .bind(&pending.normalized_email)
@@ -916,6 +956,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session_owner, "email-user");
+    }
+
+    #[tokio::test]
+    async fn admin_assisted_gmail_identity_is_not_auto_linked_to_google() {
+        let store = store().await;
+        seed_email_user(&store, "assisted-user", "assisted@gmail.com").await;
+        sqlx::query(
+            "UPDATE auth_identities
+             SET verification_provenance = 'admin_assisted', verified_email = NULL
+             WHERE issuer = ? AND subject = 'assisted@gmail.com'",
+        )
+        .bind(EMAIL_IDENTITY_ISSUER)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let resolved = complete_google_identity(
+            &store,
+            VerifiedIdentity {
+                key: IdentityKey {
+                    issuer: "https://accounts.google.com".into(),
+                    subject: "assisted-google".into(),
+                },
+                verified_email: "assisted@gmail.com".into(),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(resolved.as_str(), "assisted-user");
+        let assisted_owner: String = sqlx::query_scalar(
+            "SELECT user_id FROM auth_identities WHERE issuer = ? AND subject = 'assisted@gmail.com'",
+        )
+        .bind(EMAIL_IDENTITY_ISSUER)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(assisted_owner, "assisted-user");
     }
 
     #[tokio::test]

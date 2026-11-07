@@ -8,6 +8,12 @@ export interface User {
   onboardingCompleted: boolean
   locale: 'en' | 'zh-CN' | null
   capabilities: string[]
+  assistedSession?: {
+    issuerAlias: string
+    authenticatedAt: number
+    expiresAt: number
+  } | null
+  lastAssistedLoginAt?: number | null
 }
 
 export interface AiCapabilities {
@@ -111,11 +117,29 @@ export interface Recipe {
 
 export interface OwnerNotification {
   id: string
-  recipeId: string
-  kind: 'recipe_restricted' | 'recipe_reinstated' | 'appeal_upheld'
+  recipeId: string | null
+  kind:
+    | 'recipe_restricted'
+    | 'recipe_reinstated'
+    | 'appeal_upheld'
+    | 'content_removed'
+    | 'account_assistance_issued'
+    | 'account_assistance_consumed'
   reasonCode: string
+  issuerAlias: string | null
   createdAt: number
   readAt: number | null
+}
+
+export interface AccountAssistanceInspection {
+  normalizedEmail: string
+  targetStatus: 'new' | 'existing'
+}
+
+export interface AccountAssistanceOtp extends AccountAssistanceInspection {
+  challengeId: string
+  code: string
+  expiresAt: string
 }
 
 export interface ModerationAppeal {

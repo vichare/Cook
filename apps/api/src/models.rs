@@ -11,6 +11,18 @@ pub struct User {
     pub locale: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub assisted_session: Option<AssistedSession>,
+    #[serde(default)]
+    pub last_assisted_login_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistedSession {
+    pub issuer_alias: String,
+    pub authenticated_at: i64,
+    pub expires_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

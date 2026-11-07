@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::{header::SET_COOKIE, HeaderMap, Request, StatusCode},
+    extract::{MatchedPath, Path, Query, State},
+    http::{header::SET_COOKIE, HeaderMap, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post, put},
@@ -22,7 +22,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    ai_recipes,
+    account_assistance, ai_recipes,
     auth::{load_user, upsert_development_user, GoogleCompletionError},
     config::AuthMode,
     error::{AppError, AppResult},
@@ -155,6 +155,14 @@ pub fn router(state: AppState) -> Router {
             "/api/capability-claims/content-moderator/passkey/finish",
             post(moderation::claim_finish),
         )
+        .route(
+            "/api/capability-claims/account-assistant/passkey/start",
+            post(account_assistance::claim_start),
+        )
+        .route(
+            "/api/capability-claims/account-assistant/passkey/finish",
+            post(account_assistance::claim_finish),
+        )
         .route("/api/recipes/{id}/reports", post(moderation::report_recipe))
         .route("/api/notifications", get(moderation::list_notifications))
         .route(
@@ -172,6 +180,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/reauth/passkey/finish",
             post(moderation::reauth_finish),
+        )
+        .route(
+            "/api/admin/account-assistance/inspect",
+            post(account_assistance::inspect),
+        )
+        .route(
+            "/api/admin/account-assistance/otp",
+            post(account_assistance::issue_otp),
         )
         .route("/api/admin/moderation/queue", get(moderation::queue))
         .route(
@@ -617,6 +633,11 @@ async fn email_sign_in_verify(
     headers: HeaderMap,
     Json(input): Json<EmailOtpVerifyInput>,
 ) -> AppResult<impl IntoResponse> {
+    if let Some(response) =
+        account_assistance::try_verify(&state, &headers, &input.challenge_id, &input.code).await?
+    {
+        return Ok(response.into_response());
+    }
     let verified = state
         .auth
         .passwordless
@@ -641,15 +662,17 @@ async fn email_sign_in_verify(
         .store
         .resolve_email_sign_in(&normalized)
         .await?;
-    issue_user_session(&state, user_id).await
+    Ok(issue_user_session(&state, user_id).await?.into_response())
 }
 
 async fn link_email_request(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Extension(CurrentAuth(auth)): Extension<CurrentAuth>,
     Json(input): Json<EmailOtpRequestInput>,
 ) -> AppResult<Json<EmailOtpChallengeResponse>> {
+    account_assistance::ensure_not_assisted_session(&state, &auth).await?;
     let normalized = normalize_email(&input.email).map_err(map_email_error)?;
     let google_emails = state
         .auth
@@ -686,8 +709,10 @@ async fn link_email_verify(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Extension(CurrentAuth(auth)): Extension<CurrentAuth>,
     Json(input): Json<EmailOtpVerifyInput>,
 ) -> AppResult<Json<SecuritySettings>> {
+    account_assistance::ensure_not_assisted_session(&state, &auth).await?;
     let now = Utc::now();
     let verified = state
         .auth
@@ -739,7 +764,7 @@ async fn passkey_registration_start(
         .auth
         .passwordless
         .store
-        .linked_emails(&user.id)
+        .mailbox_verified_emails(&user.id)
         .await?;
     let user_name = linked_emails.first().ok_or_else(|| {
         AppError::Validation("link an email address before adding a passkey".into())
@@ -902,8 +927,10 @@ async fn passkey_authentication_finish(
 async fn revoke_passkey(
     State(state): State<AppState>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Extension(CurrentAuth(auth)): Extension<CurrentAuth>,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
+    account_assistance::ensure_not_assisted_session(&state, &auth).await?;
     let user_id = UserId::new(user.id.clone()).map_err(|_| AppError::AuthUnavailable)?;
     let handle = state
         .auth
@@ -1109,6 +1136,58 @@ async fn issue_user_session_parts(
     Ok((headers, load_user(&state.pool, &user_id).await?))
 }
 
+pub(crate) async fn issue_assisted_user_session(
+    state: &AppState,
+    user_id: UserId,
+    assignment_id: &str,
+    assignment_alias: &str,
+    authenticated_at: i64,
+    lifetime_seconds: i64,
+) -> AppResult<(HeaderMap, Json<User>)> {
+    let completion = state
+        .auth
+        .sessions
+        .issue(user_id.clone(), Utc::now())
+        .await
+        .map_err(|_| AppError::AuthUnavailable)?;
+    let expires_at = authenticated_at + lifetime_seconds;
+    sqlx::query(
+        "UPDATE auth_sessions
+         SET auth_method = 'admin_assisted_otp', issuer_assignment_id = ?,
+             issuer_assignment_alias = ?, authenticated_at = ?, expires_at = ?
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(assignment_id)
+    .bind(assignment_alias)
+    .bind(authenticated_at)
+    .bind(expires_at)
+    .bind(completion.session_id.to_string())
+    .bind(user_id.as_str())
+    .execute(&state.pool)
+    .await?;
+    let mut headers = HeaderMap::new();
+    headers.append(
+        SET_COOKIE,
+        issued_cookie(
+            &state.auth.session_cookie,
+            &completion.cookie_value,
+            u64::try_from(lifetime_seconds).map_err(|_| AppError::AuthUnavailable)?,
+        )
+        .map_err(|_| AppError::AuthUnavailable)?,
+    );
+    let mut user = load_user(&state.pool, &user_id).await?;
+    apply_assisted_user_projection(
+        &mut user,
+        crate::models::AssistedSession {
+            issuer_alias: assignment_alias.to_string(),
+            authenticated_at,
+            expires_at,
+        },
+    );
+    user.last_assisted_login_at = Some(authenticated_at);
+    Ok((headers, Json(user)))
+}
+
 async fn load_security_settings(state: &AppState, user_id: &str) -> AppResult<SecuritySettings> {
     let linked_emails = state.auth.passwordless.store.linked_emails(user_id).await?;
     let google_emails = state
@@ -1164,7 +1243,45 @@ async fn authenticate_request(
         .await
         .map_err(|_| AppError::AuthUnavailable)?
         .ok_or(AppError::Unauthorized)?;
-    let user = load_user(&state.pool, &context.user_id).await?;
+    let mut user = load_user(&state.pool, &context.user_id).await?;
+    let session = sqlx::query(
+        "SELECT auth_method, issuer_assignment_alias, authenticated_at, expires_at
+         FROM auth_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(context.session_id.to_string())
+    .bind(context.user_id.as_str())
+    .fetch_optional(&state.pool)
+    .await?;
+    if let Some(session) = session {
+        if session.get::<String, _>("auth_method") == "admin_assisted_otp" {
+            apply_assisted_user_projection(
+                &mut user,
+                crate::models::AssistedSession {
+                    issuer_alias: session.get("issuer_assignment_alias"),
+                    authenticated_at: session.get("authenticated_at"),
+                    expires_at: session.get("expires_at"),
+                },
+            );
+        }
+    }
+    if user.assisted_session.is_some()
+        && !assisted_session_request_allowed(
+            request.method(),
+            request
+                .extensions()
+                .get::<MatchedPath>()
+                .map(MatchedPath::as_str),
+        )
+    {
+        return Err(AppError::Forbidden);
+    }
+    user.last_assisted_login_at = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM account_assistance_notifications
+         WHERE user_id = ? AND kind = 'account_assistance_consumed'",
+    )
+    .bind(context.user_id.as_str())
+    .fetch_one(&state.pool)
+    .await?;
     request.extensions_mut().insert(CurrentUser(user));
     request
         .extensions_mut()
@@ -1182,6 +1299,59 @@ async fn authenticate_request(
         );
     }
     Ok(response)
+}
+
+fn apply_assisted_user_projection(
+    user: &mut User,
+    assisted_session: crate::models::AssistedSession,
+) {
+    user.capabilities.clear();
+    user.assisted_session = Some(assisted_session);
+}
+
+fn assisted_session_request_allowed(method: &Method, matched_path: Option<&str>) -> bool {
+    if *method == Method::OPTIONS {
+        return true;
+    }
+    if matches!(*method, Method::GET | Method::HEAD) {
+        return matched_path.is_some_and(|path| {
+            path != "/api/settings/security"
+                && !path.starts_with("/api/settings/import-tokens")
+                && !path.starts_with("/api/admin/")
+        });
+    }
+    matches!(
+        (method.as_str(), matched_path),
+        ("PUT", Some("/api/settings/profile"))
+            | ("PUT", Some("/api/settings/locale"))
+            | ("POST", Some("/api/recipes"))
+            | ("PUT", Some("/api/recipes/{id}"))
+            | ("DELETE", Some("/api/recipes/{id}"))
+            | ("PUT", Some("/api/recipes/{id}/favorite"))
+            | ("DELETE", Some("/api/recipes/{id}/favorite"))
+            | ("PUT", Some("/api/authors/{handle}/favorite"))
+            | ("DELETE", Some("/api/authors/{handle}/favorite"))
+            | ("POST", Some("/api/recipes/{id}/cover"))
+            | ("PUT", Some("/api/recipes/{id}/cover"))
+            | ("DELETE", Some("/api/recipes/{id}/cover"))
+            | ("POST", Some("/api/recipe-revisions/{id}/accept"))
+            | ("DELETE", Some("/api/recipe-revisions/{id}"))
+            | ("PUT", Some("/api/pantry"))
+            | ("POST", Some("/api/shopping-list"))
+            | ("PUT", Some("/api/shopping-list/{id}"))
+            | ("DELETE", Some("/api/shopping-list/{id}"))
+            | ("POST", Some("/api/shopping-list/{id}/purchase"))
+            | ("POST", Some("/api/shopping-list/purchases/{id}/undo"))
+            | ("POST", Some("/api/recipes/{id}/shopping-list-items"))
+            | ("PUT", Some("/api/settings/recommendations"))
+            | ("POST", Some("/api/recommendations"))
+            | ("POST", Some("/api/recipes/{id}/reports"))
+            | ("PUT", Some("/api/notifications/{id}/read"))
+            | ("POST", Some("/api/recipes/{id}/appeals"))
+            | ("PUT", Some("/api/import-drafts/{id}"))
+            | ("DELETE", Some("/api/import-drafts/{id}"))
+            | ("POST", Some("/api/import-drafts/{id}/accept"))
+    )
 }
 
 async fn me(Extension(CurrentUser(user)): Extension<CurrentUser>) -> Json<User> {
@@ -1844,7 +2014,7 @@ fn seconds_until(expires_at: chrono::DateTime<Utc>) -> u64 {
     u64::try_from((expires_at - Utc::now()).num_seconds().max(0)).unwrap_or(0)
 }
 
-fn rate_limit_key(headers: &HeaderMap, key: &[u8; 32]) -> String {
+pub(crate) fn rate_limit_key(headers: &HeaderMap, key: &[u8; 32]) -> String {
     let client = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
@@ -3339,7 +3509,7 @@ mod tests {
 
     use axum::{
         body::{to_bytes, Body},
-        http::{Request, StatusCode},
+        http::{Method, Request, StatusCode},
     };
     use chrono::Utc;
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -3348,6 +3518,7 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
+    use super::assisted_session_request_allowed;
     use crate::{
         auth::{build_auth, AuthRuntime},
         build_app,
@@ -3356,6 +3527,119 @@ mod tests {
         passwordless::GOOGLE_IDENTITY_ISSUER,
         AppState,
     };
+
+    #[test]
+    fn assisted_session_write_policy_inventories_every_authenticated_write_route() {
+        let inventory = [
+            ("PUT", "/api/settings/profile", true),
+            ("PUT", "/api/settings/locale", true),
+            ("POST", "/api/auth/logout-all", false),
+            ("POST", "/api/settings/security/email/request", false),
+            ("POST", "/api/settings/security/email/verify", false),
+            (
+                "POST",
+                "/api/settings/security/passkeys/register/start",
+                false,
+            ),
+            (
+                "POST",
+                "/api/settings/security/passkeys/register/finish",
+                false,
+            ),
+            ("DELETE", "/api/settings/security/passkeys/{id}", false),
+            ("POST", "/api/recipes", true),
+            ("PUT", "/api/recipes/{id}", true),
+            ("DELETE", "/api/recipes/{id}", true),
+            ("PUT", "/api/recipes/{id}/favorite", true),
+            ("DELETE", "/api/recipes/{id}/favorite", true),
+            ("PUT", "/api/authors/{handle}/favorite", true),
+            ("DELETE", "/api/authors/{handle}/favorite", true),
+            ("POST", "/api/recipes/{id}/cover", true),
+            ("PUT", "/api/recipes/{id}/cover", true),
+            ("DELETE", "/api/recipes/{id}/cover", true),
+            ("POST", "/api/recipe-revisions/{id}/accept", true),
+            ("DELETE", "/api/recipe-revisions/{id}", true),
+            ("PUT", "/api/pantry", true),
+            ("POST", "/api/shopping-list", true),
+            ("PUT", "/api/shopping-list/{id}", true),
+            ("DELETE", "/api/shopping-list/{id}", true),
+            ("POST", "/api/shopping-list/{id}/purchase", true),
+            ("POST", "/api/shopping-list/purchases/{id}/undo", true),
+            ("POST", "/api/recipes/{id}/shopping-list-items", true),
+            ("PUT", "/api/settings/recommendations", true),
+            ("POST", "/api/recommendations", true),
+            ("POST", "/api/settings/import-tokens", false),
+            ("DELETE", "/api/settings/import-tokens/{id}", false),
+            (
+                "POST",
+                "/api/capability-claims/content-moderator/passkey/start",
+                false,
+            ),
+            (
+                "POST",
+                "/api/capability-claims/content-moderator/passkey/finish",
+                false,
+            ),
+            (
+                "POST",
+                "/api/capability-claims/account-assistant/passkey/start",
+                false,
+            ),
+            (
+                "POST",
+                "/api/capability-claims/account-assistant/passkey/finish",
+                false,
+            ),
+            ("POST", "/api/recipes/{id}/reports", true),
+            ("PUT", "/api/notifications/{id}/read", true),
+            ("POST", "/api/recipes/{id}/appeals", true),
+            ("POST", "/api/admin/reauth/passkey/start", false),
+            ("POST", "/api/admin/reauth/passkey/finish", false),
+            ("POST", "/api/admin/account-assistance/inspect", false),
+            ("POST", "/api/admin/account-assistance/otp", false),
+            ("POST", "/api/admin/moderation/recipes/{id}/review", false),
+            ("POST", "/api/admin/moderation/recipes/{id}/restrict", false),
+            (
+                "POST",
+                "/api/admin/moderation/recipes/{id}/reinstate",
+                false,
+            ),
+            ("POST", "/api/admin/moderation/appeals/{id}/resolve", false),
+            ("PUT", "/api/import-drafts/{id}", true),
+            ("DELETE", "/api/import-drafts/{id}", true),
+            ("POST", "/api/import-drafts/{id}/accept", true),
+        ];
+        for (method, path, expected) in inventory {
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            assert_eq!(
+                assisted_session_request_allowed(&method, Some(path)),
+                expected,
+                "{method} {path}"
+            );
+        }
+        assert!(assisted_session_request_allowed(
+            &Method::GET,
+            Some("/api/recipes")
+        ));
+        assert!(!assisted_session_request_allowed(
+            &Method::GET,
+            Some("/api/settings/security")
+        ));
+        assert!(!assisted_session_request_allowed(
+            &Method::GET,
+            Some("/api/settings/import-tokens")
+        ));
+        assert!(!assisted_session_request_allowed(
+            &Method::GET,
+            Some("/api/admin/moderation/queue")
+        ));
+        assert!(!assisted_session_request_allowed(
+            &Method::POST,
+            Some("/api/future-account-recovery")
+        ));
+        assert!(!assisted_session_request_allowed(&Method::POST, None));
+        assert!(!assisted_session_request_allowed(&Method::GET, None));
+    }
 
     async fn app_with_runtime() -> (axum::Router, AuthRuntime, SqlitePool) {
         let config = Config::test();

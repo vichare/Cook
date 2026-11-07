@@ -196,7 +196,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied.0, 17);
+        assert_eq!(applied.0, 18);
         pool.close().await;
 
         let reopened = connect(&url).await.unwrap();
@@ -326,6 +326,85 @@ mod tests {
         if let Some(error) = last_error {
             panic!("failed to remove test database {}: {error}", path.display());
         }
+    }
+
+    #[tokio::test]
+    async fn account_assistance_migration_upgrades_populated_v06_database() {
+        let path = std::env::temp_dir().join(format!("cook-v06-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}", path.display());
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let v06 = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version < 18)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        v06.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, profile_email, display_name)
+             VALUES ('u', 'u@test', 'u@example.test', 'U')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_identities
+             (issuer, subject, user_id, created_at, verified_email)
+             VALUES ('urn:cook:email-otp', 'u@example.test', 'u', 1, 'u@example.test')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO admin_passkey_attempts
+             (token_digest, session_id, user_id, purpose, expires_at)
+             VALUES (zeroblob(32), 'session', 'u', 'admin_reauth', 9999999999)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        MIGRATOR.run(&pool).await.unwrap();
+
+        let provenance: String = sqlx::query_scalar(
+            "SELECT verification_provenance FROM auth_identities
+             WHERE issuer = 'urn:cook:email-otp'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(provenance, "mailbox_verified");
+        let attempt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_passkey_attempts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempt_count, 1);
+        sqlx::query(
+            "INSERT INTO admin_passkey_attempts
+             (token_digest, session_id, user_id, purpose, expires_at)
+             VALUES (randomblob(32), 'session-2', 'u', 'account_assistant_claim', 9999999999)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        pool.close().await;
+        drop(pool);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use std::env;
 
 use chrono::Utc;
 use cook_api::{
-    build_app,
+    account_assistance, build_app,
     config::Config,
     db,
     error::{AppError, AppResult},
@@ -59,6 +59,26 @@ async fn run_host_command(args: &[String]) -> AppResult<()> {
             .await?;
             println!("{code}");
         }
+        [account_assistance, claim_code, create]
+            if account_assistance == "account-assistance"
+                && claim_code == "claim-code"
+                && create == "create" =>
+        {
+            let code = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+            let digest = Sha256::digest(code.as_bytes());
+            let now = Utc::now().timestamp();
+            sqlx::query(
+                "INSERT INTO account_assistant_claim_codes
+                 (id, code_digest, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(digest.as_slice())
+            .bind(now)
+            .bind(now + 15 * 60)
+            .execute(&pool)
+            .await?;
+            println!("{code}");
+        }
         [moderation, assignment, revoke, assignment_id]
             if moderation == "moderation" && assignment == "assignment" && revoke == "revoke" =>
         {
@@ -102,10 +122,22 @@ async fn run_host_command(args: &[String]) -> AppResult<()> {
             .await?;
             tx.commit().await?;
         }
+        [account_assistance, assignment, revoke, assignment_id]
+            if account_assistance == "account-assistance"
+                && assignment == "assignment"
+                && revoke == "revoke" =>
+        {
+            Uuid::parse_str(assignment_id)
+                .map_err(|_| AppError::configuration("assignment UUID is invalid"))?;
+            account_assistance::revoke_assignment(&pool, assignment_id, Utc::now().timestamp())
+                .await?;
+        }
         _ => {
             return Err(AppError::configuration(
                 "usage: cook-api moderation claim-code create | \
-                 cook-api moderation assignment revoke <assignment-uuid>",
+                 cook-api moderation assignment revoke <assignment-uuid> | \
+                 cook-api account-assistance claim-code create | \
+                 cook-api account-assistance assignment revoke <assignment-uuid>",
             ));
         }
     }

@@ -66,4 +66,13 @@ describe('i18n', () => {
       bucket: '必须使用',
     })).not.toMatch(/canonical|normalization|identity/i)
   })
+
+  it('does not tell assisted sessions to create persistent credentials', () => {
+    const english = translateMessage('en', 'assistance.sessionWarning')
+    const chinese = translateMessage('zh-CN', 'assistance.sessionWarning')
+    expect(english).toContain('ordinary email verification')
+    expect(english).not.toMatch(/register.*Passkey/i)
+    expect(chinese).toContain('普通邮箱验证')
+    expect(chinese).not.toContain('注册 Passkey')
+  })
 })

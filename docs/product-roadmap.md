@@ -130,6 +130,12 @@ The earlier blanket decision that matching provider email must never cause autom
 
 The email OTP flow returns an opaque `challengeId` from a generic start response and verifies that challenge with the emailed code. Responses and errors do not reveal whether an account exists. The UI uses `autocomplete="one-time-code"`, supports pasting the complete code, shows a resend countdown backed by server-enforced cooldowns, and works across devices.
 
+### v0.7.0 administrator-assisted sign-in
+
+**Implemented as a release candidate after v0.6.0.** A separately assigned `account_assistance` administrator can help an in-person user who cannot access their mailbox. The administrator cannot select the OTP: Cook creates an eight-digit CSPRNG code, reveals it once, stores only a keyed digest, expires it after ten minutes, and allows at most five verification failures. Issuance requires same-origin, a Passkey assertion fresh within ten minutes, fixed reason codes, and layered issuer/target/IP/global limits. Existing-account assistance is an explicitly accepted audited impersonation boundary and the confirmation UI warns that private recipes and pantry data become accessible.
+
+Assisted completion reuses the ordinary Email OTP finish and account/session creation path. New identities retain `admin_assisted` verification provenance, which does not prove mailbox control and cannot trigger Gmail email-first Google auto-linking or Passkey registration. A later ordinary Email OTP upgrades provenance. Assisted sessions use the existing Host-only cookie with a one-hour server cap, visible warning, assistant alias, and a default-deny authenticated-write policy that permits ordinary product testing but blocks credentials, tokens, recovery, session management, identity changes, capability claims, and administrative writes.
+
 Microsoft OIDC is the recommended Phase 2 provider based on current research into its global personal-account/Entra endpoints and free application registration. Apple sign-in remains optional because its developer program is paid. Direct WeChat sign-in is deferred because website-application review and eligible-entity requirements are still **unverified**. Authing and SMS login are deferred because they add third-party dependency, personal-data handling, and cost.
 
 These are product and engineering decisions, not legal advice. Any mainland-China hosting, licensing, or regulatory requirements remain **unverified** and require qualified review before deployment decisions rely on them.

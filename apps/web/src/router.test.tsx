@@ -12,6 +12,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   AccountSecuritySettings,
+  AccountAssistancePage,
   EmailOtpLogin,
   ExpirationEditor,
   GuestLanguageSelector,
@@ -100,6 +101,11 @@ const {
   deleteRecipeCover,
   deleteShoppingItem,
   ingredientSuggestionsApi,
+  startAdminReauth,
+  finishAdminReauth,
+  inspectAccountAssistance,
+  issueAccountAssistanceOtp,
+  logoutApi,
   addRecipeIngredientToShopping,
   purchaseShoppingItem,
   pantryApi,
@@ -235,7 +241,26 @@ const {
     undoAvailable: false,
   }),
   ingredientSuggestionsApi: vi.fn().mockResolvedValue([]),
+  startAdminReauth: vi.fn().mockResolvedValue({}),
+  finishAdminReauth: vi.fn().mockResolvedValue(undefined),
+  inspectAccountAssistance: vi.fn().mockResolvedValue({
+    normalizedEmail: 'elder@example.test',
+    targetStatus: 'existing',
+  }),
+  issueAccountAssistanceOtp: vi.fn().mockResolvedValue({
+    normalizedEmail: 'elder@example.test',
+    targetStatus: 'existing',
+    challengeId: 'aa_challenge',
+    code: '12345678',
+    expiresAt: '2099-01-01T00:00:00Z',
+  }),
+  logoutApi: vi.fn().mockResolvedValue(undefined),
   savePantry: vi.fn().mockResolvedValue([]),
+}))
+
+vi.mock('./webauthn', () => ({
+  createPasskey: vi.fn(),
+  getPasskey: vi.fn().mockResolvedValue({ id: 'credential' }),
 }))
 
 vi.mock('./api', async () => {
@@ -273,12 +298,18 @@ vi.mock('./api', async () => {
       startPasskeyRegistration: vi.fn(),
       finishPasskeyRegistration: vi.fn(),
       revokePasskey: vi.fn(),
+      startAdminReauth,
+      finishAdminReauth,
+      inspectAccountAssistance,
+      issueAccountAssistanceOtp,
+      logout: logoutApi,
     },
   }
 })
 
 afterEach(() => {
   cleanup()
+  sessionStorage.clear()
   window.history.replaceState({}, '', '/')
   ingredientSuggestionsApi.mockReset().mockResolvedValue([])
 })
@@ -3278,6 +3309,60 @@ describe('email OTP sign-in', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Verify and sign in' }))
     await waitFor(() => expect(verifyEmailOtp).toHaveBeenCalledWith('challenge', '123456'))
     expect(onLogin).toHaveBeenCalled()
+  })
+
+  it('resumes an assisted challenge without putting its opaque ID in the URL', async () => {
+    sessionStorage.setItem('cook-assisted-login', JSON.stringify({
+      email: 'elder@example.test',
+      challengeId: 'aa_secret-challenge',
+      expiresAt: '2099-01-01T00:00:00Z',
+    }))
+    const onLogin = vi.fn()
+    render(
+      <Providers>
+        <EmailOtpLogin onLogin={onLogin} passkeyEnabled={false} />
+      </Providers>,
+    )
+    expect(screen.getByLabelText('Email address')).toHaveValue('elder@example.test')
+    expect(screen.getByText(/eight-digit code/i)).toBeVisible()
+    const code = screen.getByLabelText('Verification code')
+    expect(code).toHaveAttribute('maxlength', '8')
+    fireEvent.change(code, { target: { value: '12 34x5678' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Verify and sign in' }))
+    await waitFor(() => {
+      expect(verifyEmailOtp).toHaveBeenCalledWith('aa_secret-challenge', '12345678')
+    })
+    expect(window.location.search).toBe('')
+    expect(sessionStorage.getItem('cook-assisted-login')).toBeNull()
+  })
+})
+
+describe('account assistance administrator UI', () => {
+  it('requires Passkey review, warns about existing-account access, and reveals only the issued code', async () => {
+    render(
+      <Providers>
+        <AccountAssistancePage />
+      </Providers>,
+    )
+    fireEvent.change(screen.getByLabelText('Email address'), {
+      target: { value: 'elder@example.test' },
+    })
+    fireEvent.change(screen.getByLabelText('Short non-sensitive note (optional)'), {
+      target: { value: '<img src=x onerror=alert(1)>' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Verify Passkey and review' }))
+    expect(await screen.findByRole('dialog', { name: 'Confirm assisted sign-in code' })).toBeVisible()
+    expect(screen.getByText('Existing account')).toBeVisible()
+    expect(screen.getByText(/private recipes and pantry data/i)).toBeVisible()
+    expect(document.querySelector('img[src="x"]')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Issue one-time code' }))
+    expect(await screen.findByLabelText('Eight-digit assisted sign-in code')).toHaveTextContent('12345678')
+    expect(screen.getByText(/shown once/i)).toBeVisible()
+    expect(issueAccountAssistanceOtp).toHaveBeenCalledWith(
+      'elder@example.test',
+      'in_person_accessibility',
+      '<img src=x onerror=alert(1)>',
+    )
   })
 })
 

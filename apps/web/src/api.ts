@@ -24,6 +24,8 @@ import type {
   ModerationCase,
   ModerationQueuePage,
   OwnerNotification,
+  AccountAssistanceInspection,
+  AccountAssistanceOtp,
   User,
 } from './types'
 
@@ -49,6 +51,7 @@ export class ApiError extends Error {
     public readonly status: number,
     public readonly code: string,
     public readonly canonicalIngredientIds: string[] = [],
+    public readonly retryAfter: number | null = null,
   ) {
     super(message)
   }
@@ -74,6 +77,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       response.status,
       body?.error ?? 'unknown_error',
       body?.canonicalIngredientIds ?? [],
+      response.headers?.get?.('retry-after')
+        ? Number(response.headers.get('retry-after'))
+        : null,
     )
   }
   if (response.status === 204) return undefined as T
@@ -260,12 +266,36 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ code, credential }),
     }),
+  startAccountAssistantClaim: (code: string) =>
+    request<unknown>('/api/capability-claims/account-assistant/passkey/start', {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    }),
+  finishAccountAssistantClaim: (code: string, credential: unknown) =>
+    request<{ capability: string }>('/api/capability-claims/account-assistant/passkey/finish', {
+      method: 'POST',
+      body: JSON.stringify({ code, credential }),
+    }),
   startAdminReauth: () =>
     request<unknown>('/api/admin/reauth/passkey/start', { method: 'POST' }),
   finishAdminReauth: (credential: unknown) =>
     request<void>('/api/admin/reauth/passkey/finish', {
       method: 'POST',
       body: JSON.stringify(credential),
+    }),
+  inspectAccountAssistance: (email: string) =>
+    request<AccountAssistanceInspection>('/api/admin/account-assistance/inspect', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  issueAccountAssistanceOtp: (
+    email: string,
+    reasonCode: string,
+    note: string,
+  ) =>
+    request<AccountAssistanceOtp>('/api/admin/account-assistance/otp', {
+      method: 'POST',
+      body: JSON.stringify({ email, reasonCode, note }),
     }),
   moderationQueue: (cursor?: string) =>
     request<ModerationQueuePage>(

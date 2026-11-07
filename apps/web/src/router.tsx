@@ -76,6 +76,35 @@ interface PendingRecommendationIngredientBatch {
   locationGeneration: number
 }
 
+const ASSISTED_LOGIN_STORAGE_KEY = 'cook-assisted-login'
+
+interface StoredAssistance {
+  email: string
+  challengeId: string
+  expiresAt: string
+}
+
+function readStoredAssistance(): StoredAssistance | null {
+  try {
+    const raw = sessionStorage.getItem(ASSISTED_LOGIN_STORAGE_KEY)
+    if (!raw) return null
+    const value = JSON.parse(raw) as Partial<StoredAssistance>
+    if (
+      typeof value.email !== 'string'
+      || typeof value.challengeId !== 'string'
+      || typeof value.expiresAt !== 'string'
+      || new Date(value.expiresAt).getTime() <= Date.now()
+    ) {
+      sessionStorage.removeItem(ASSISTED_LOGIN_STORAGE_KEY)
+      return null
+    }
+    return value as StoredAssistance
+  } catch {
+    sessionStorage.removeItem(ASSISTED_LOGIN_STORAGE_KEY)
+    return null
+  }
+}
+
 const rootRoute = createRootRouteWithContext<RouterContext>()({
   component: Root,
   notFoundComponent: NotFoundPage,
@@ -143,6 +172,16 @@ const moderatorClaimRoute = createRoute({
   path: '/admin/claim',
   component: ModeratorClaimPage,
 })
+const accountAssistantClaimRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/admin/account-assistance/claim',
+  component: AccountAssistantClaimPage,
+})
+const accountAssistanceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/admin/account-assistance',
+  component: AccountAssistancePage,
+})
 const moderationQueueRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/admin/moderation',
@@ -177,6 +216,8 @@ const routeTree = rootRoute.addChildren([
   settingsRoute,
   notificationsRoute,
   moderatorClaimRoute,
+  accountAssistantClaimRoute,
+  accountAssistanceRoute,
   moderationQueueRoute,
   moderationCaseRoute,
   importsRoute,
@@ -246,6 +287,12 @@ function Root() {
         </button>
       </header>
       <main id="main">
+        {me.data?.assistedSession && (
+          <div className="assisted-session-banner" role="status">
+            <strong>{t('assistance.sessionTitle')}</strong>
+            <span>{t('assistance.sessionWarning')}</span>
+          </div>
+        )}
         <Outlet />
       </main>
       {me.data && !me.data.onboardingCompleted && <ProfileSetup user={me.data} />}
@@ -289,6 +336,9 @@ export function PrimaryNavigation() {
         {me.data?.capabilities.includes('content_moderation') && (
           <Link to="/admin/moderation">{t('app.moderation')}</Link>
         )}
+        {me.data?.capabilities.includes('account_assistance') && (
+          <Link to="/admin/account-assistance">{t('app.accountAssistance')}</Link>
+        )}
       </nav>
       <Dialog.Root open={open} onOpenChange={setOpen}>
         <Dialog.Trigger asChild>
@@ -317,6 +367,11 @@ export function PrimaryNavigation() {
               {me.data?.capabilities.includes('content_moderation') && (
                 <Link to="/admin/moderation" onClick={() => setOpen(false)}>
                   {t('app.moderation')}
+                </Link>
+              )}
+              {me.data?.capabilities.includes('account_assistance') && (
+                <Link to="/admin/account-assistance" onClick={() => setOpen(false)}>
+                  {t('app.accountAssistance')}
                 </Link>
               )}
             </nav>
@@ -409,9 +464,19 @@ export function EmailOtpLogin({
   passkeyEnabled: boolean
 }) {
   const { formatNumber, t } = useI18n()
-  const [email, setEmail] = useState('')
+  const storedAssistance = useMemo(() => readStoredAssistance(), [])
+  const [email, setEmail] = useState(storedAssistance?.email ?? '')
   const [code, setCode] = useState('')
-  const [challenge, setChallenge] = useState<Awaited<ReturnType<typeof api.requestEmailOtp>> | null>(null)
+  const [challenge, setChallenge] = useState<Awaited<ReturnType<typeof api.requestEmailOtp>> | null>(
+    storedAssistance
+      ? {
+          challengeId: storedAssistance.challengeId,
+          expiresAt: storedAssistance.expiresAt,
+          resendAllowedAt: storedAssistance.expiresAt,
+        }
+      : null,
+  )
+  const [assisted, setAssisted] = useState(Boolean(storedAssistance))
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     if (!challenge) return
@@ -422,13 +487,17 @@ export function EmailOtpLogin({
     mutationFn: () => api.requestEmailOtp(email),
     onSuccess: (value) => {
       setChallenge(value)
+      setAssisted(false)
       setCode('')
       setNow(Date.now())
     },
   })
   const verify = useMutation({
     mutationFn: () => api.verifyEmailOtp(challenge!.challengeId, code),
-    onSuccess: onLogin,
+    onSuccess: () => {
+      sessionStorage.removeItem(ASSISTED_LOGIN_STORAGE_KEY)
+      onLogin()
+    },
   })
   const passkey = useMutation({
     mutationFn: async () => {
@@ -466,37 +535,43 @@ export function EmailOtpLogin({
         </div>
       ) : (
         <>
-          <p role="status">{t('otp.genericSent')}</p>
+          <p role="status">{t(assisted ? 'assistance.enterCode' : 'otp.genericSent')}</p>
           <label>
             {t('otp.code')}
             <input
               value={code}
-              onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
+              onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, assisted ? 8 : 6))}
               autoComplete="one-time-code"
               inputMode="numeric"
-              pattern="[0-9]{6}"
-              maxLength={6}
+              pattern={assisted ? '[0-9]{8}' : '[0-9]{6}'}
+              maxLength={assisted ? 8 : 6}
               required
             />
           </label>
           <div className="auth-actions">
             <button
               className="button primary"
-              disabled={code.length !== 6 || verify.isPending}
+              disabled={code.length !== (assisted ? 8 : 6) || verify.isPending}
               onClick={() => verify.mutate()}
             >
               {t('otp.verify')}
             </button>
-            <button
-              className="button ghost"
-              disabled={resendSeconds > 0 || request.isPending}
-              onClick={() => request.mutate()}
-            >
-              {resendSeconds > 0
-                ? t('otp.resendIn', { seconds: formatNumber(resendSeconds) })
-                : t('otp.resend')}
-            </button>
-            <button className="button ghost" onClick={() => setChallenge(null)}>
+            {!assisted && (
+              <button
+                className="button ghost"
+                disabled={resendSeconds > 0 || request.isPending}
+                onClick={() => request.mutate()}
+              >
+                {resendSeconds > 0
+                  ? t('otp.resendIn', { seconds: formatNumber(resendSeconds) })
+                  : t('otp.resend')}
+              </button>
+            )}
+            <button className="button ghost" onClick={() => {
+              sessionStorage.removeItem(ASSISTED_LOGIN_STORAGE_KEY)
+              setAssisted(false)
+              setChallenge(null)
+            }}>
               {t('otp.otherEmail')}
             </button>
           </div>
@@ -3797,6 +3872,13 @@ function SettingsPage() {
           {t('moderation.openClaim')}
         </Link>
       </section>
+      <section className="settings-section">
+        <h2>{t('assistance.claimTitle')}</h2>
+        <p>{t('assistance.claimSettingsHelp')}</p>
+        <Link className="button secondary" to="/admin/account-assistance/claim">
+          {t('assistance.openClaim')}
+        </Link>
+      </section>
     </Page>
   )
 }
@@ -3817,9 +3899,14 @@ function NotificationsPage() {
             <article className="detail-card" key={notification.id}>
               <h2>{t(`moderation.notification.${notification.kind}` as never)}</h2>
               <p>{t('moderation.reasonCode', { reason: notification.reasonCode })}</p>
-              <Link to="/recipes/$recipeId" params={{ recipeId: notification.recipeId }}>
-                {t('moderation.openRecipe')}
-              </Link>
+              {notification.issuerAlias && (
+                <p>{t('assistance.notificationIssuer', { alias: notification.issuerAlias })}</p>
+              )}
+              {notification.recipeId && (
+                <Link to="/recipes/$recipeId" params={{ recipeId: notification.recipeId }}>
+                  {t('moderation.openRecipe')}
+                </Link>
+              )}
               {!notification.readAt && (
                 <button
                   type="button"
@@ -3876,6 +3963,211 @@ function ModeratorClaimPage() {
         </button>
         {claim.error && <ErrorText error={claim.error} />}
       </form>
+    </Page>
+  )
+}
+
+function AccountAssistantClaimPage() {
+  const { t } = useI18n()
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [code, setCode] = useState('')
+  const claim = useMutation({
+    mutationFn: async () => {
+      const challenge = await api.startAccountAssistantClaim(code.trim())
+      return api.finishAccountAssistantClaim(code.trim(), await getPasskey(challenge))
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['me'] })
+      await navigate({ to: '/admin/account-assistance' })
+    },
+  })
+  return (
+    <Page title={t('assistance.claimTitle')} intro={t('assistance.claimIntro')}>
+      <form className="settings-form" onSubmit={(event) => {
+        event.preventDefault()
+        claim.mutate()
+      }}>
+        <label>
+          {t('assistance.claimCode')}
+          <input
+            value={code}
+            autoComplete="one-time-code"
+            onChange={(event) => setCode(event.target.value)}
+          />
+        </label>
+        <button className="button primary" disabled={!code.trim() || claim.isPending}>
+          {claim.isPending ? t('moderation.verifyingPasskey') : t('assistance.claimSubmit')}
+        </button>
+        {claim.error && <ErrorText error={claim.error} />}
+      </form>
+    </Page>
+  )
+}
+
+export function AccountAssistancePage() {
+  const { formatDateTime, t } = useI18n()
+  const [email, setEmail] = useState('')
+  const [reasonCode, setReasonCode] = useState('in_person_accessibility')
+  const [note, setNote] = useState('')
+  const [inspection, setInspection] = useState<Awaited<ReturnType<typeof api.inspectAccountAssistance>> | null>(null)
+  const [reveal, setReveal] = useState<Awaited<ReturnType<typeof api.issueAccountAssistanceOtp>> | null>(null)
+  const copySequence = useRef(0)
+  const [copyNotice, setCopyNotice] = useState<{ id: number; message: string; error: boolean } | null>(null)
+  const inspect = useMutation({
+    mutationFn: async () => {
+      const challenge = await api.startAdminReauth()
+      await api.finishAdminReauth(await getPasskey(challenge))
+      return api.inspectAccountAssistance(email)
+    },
+    onSuccess: setInspection,
+  })
+  const issue = useMutation({
+    mutationFn: () => api.issueAccountAssistanceOtp(
+      inspection!.normalizedEmail,
+      reasonCode,
+      note,
+    ),
+    onSuccess: (value) => {
+      setReveal(value)
+      setInspection(null)
+    },
+  })
+  const copyCode = () => {
+    if (!reveal) return
+    void copyText(reveal.code)
+      .then(() => setCopyNotice({
+        id: ++copySequence.current,
+        message: t('assistance.codeCopied'),
+        error: false,
+      }))
+      .catch(() => setCopyNotice({
+        id: ++copySequence.current,
+        message: t('token.copyFailed'),
+        error: true,
+      }))
+  }
+  const continueToLogin = () => {
+    if (!reveal) return
+    sessionStorage.setItem(ASSISTED_LOGIN_STORAGE_KEY, JSON.stringify({
+      email: reveal.normalizedEmail,
+      challengeId: reveal.challengeId,
+      expiresAt: reveal.expiresAt,
+    }))
+    void api.logout().finally(() => location.reload())
+  }
+  return (
+    <Page title={t('assistance.title')} intro={t('assistance.intro')}>
+      {reveal ? (
+        <section className="secret-once assistance-reveal">
+          <strong role="status">{t('assistance.revealOnce')}</strong>
+          <p>{t('assistance.revealTarget', { email: reveal.normalizedEmail })}</p>
+          <output className="assistance-code" aria-label={t('assistance.codeLabel')}>
+            {reveal.code}
+          </output>
+          <p>{t('assistance.expiresAt', { date: formatDateTime(reveal.expiresAt) })}</p>
+          <div className="auth-actions">
+            <button type="button" className="button primary" onClick={copyCode}>
+              {t('assistance.copyCode')}
+            </button>
+            <button type="button" className="button secondary" onClick={continueToLogin}>
+              {t('assistance.continueToLogin')}
+            </button>
+            <button type="button" className="button ghost" onClick={() => {
+              setReveal(null)
+              setCopyNotice(null)
+              setEmail('')
+              setNote('')
+            }}>
+              {t('assistance.finish')}
+            </button>
+          </div>
+          {copyNotice && (
+            <p
+              key={copyNotice.id}
+              role={copyNotice.error ? 'alert' : 'status'}
+              aria-live="polite"
+              className={copyNotice.error ? 'error' : undefined}
+            >
+              {copyNotice.message}
+            </p>
+          )}
+        </section>
+      ) : (
+        <form className="settings-form" onSubmit={(event) => {
+          event.preventDefault()
+          inspect.mutate()
+        }}>
+          <label>
+            {t('otp.email')}
+            <input
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              required
+            />
+          </label>
+          <label>
+            {t('assistance.reason')}
+            <select value={reasonCode} onChange={(event) => setReasonCode(event.target.value)}>
+              <option value="in_person_accessibility">{t('assistance.reason.in_person_accessibility')}</option>
+              <option value="mailbox_unavailable">{t('assistance.reason.mailbox_unavailable')}</option>
+              <option value="device_setup">{t('assistance.reason.device_setup')}</option>
+            </select>
+          </label>
+          <label>
+            {t('assistance.note')}
+            <input
+              value={note}
+              maxLength={120}
+              onChange={(event) => setNote(event.target.value)}
+            />
+          </label>
+          <small>{t('assistance.noteHelp')}</small>
+          <button className="button primary" disabled={!email || inspect.isPending}>
+            {inspect.isPending ? t('moderation.verifyingPasskey') : t('assistance.review')}
+          </button>
+          {inspect.error && <ErrorText error={inspect.error} />}
+        </form>
+      )}
+      <Dialog.Root open={inspection !== null} onOpenChange={(open) => {
+        if (!open && !issue.isPending) setInspection(null)
+      }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          {inspection && (
+            <Dialog.Content className="confirmation-sheet assistance-confirmation">
+              <Dialog.Title>{t('assistance.confirmTitle')}</Dialog.Title>
+              <Dialog.Description>
+                {t('assistance.confirmWarning')}
+              </Dialog.Description>
+              <p>
+                <strong>{t('assistance.targetStatusLabel')}</strong>{' '}
+                {t(`assistance.targetStatus.${inspection.targetStatus}` as never)}
+              </p>
+              <p>{inspection.normalizedEmail}</p>
+              <p className="notice" role="alert">{t('assistance.consentWarning')}</p>
+              <div className="dialog-actions">
+                <Dialog.Close asChild>
+                  <button type="button" className="button ghost" disabled={issue.isPending}>
+                    {t('common.cancel')}
+                  </button>
+                </Dialog.Close>
+                <button
+                  type="button"
+                  className="button primary"
+                  disabled={issue.isPending}
+                  onClick={() => issue.mutate()}
+                >
+                  {issue.isPending ? t('assistance.issuing') : t('assistance.confirmIssue')}
+                </button>
+              </div>
+              {issue.error && <ErrorText error={issue.error} />}
+            </Dialog.Content>
+          )}
+        </Dialog.Portal>
+      </Dialog.Root>
     </Page>
   )
 }
@@ -5756,6 +6048,8 @@ function errorMessage(error: unknown, t: Translate) {
       auth_unavailable: t('error.authUnavailable'),
       conflict: t('error.conflict'),
       forbidden: t('error.forbidden'),
+      admin_passkey_reauth_required: t('error.adminReauthRequired'),
+      assisted_otp_invalid: t('error.assistedOtpInvalid'),
       payload_too_large: t('error.payloadTooLarge'),
       validation_error: t('error.validation'),
       internal_error: t('error.internal'),
