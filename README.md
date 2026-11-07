@@ -2,7 +2,7 @@
 
 Cook is a deployable recipe and private-pantry recommendation MVP. It combines user-published recipes, per-account pantry state, configurable recommendation sources, and deterministic explanations for what can be cooked now.
 
-Cook v0.7.0 release candidate adds administrator-assisted sign-in for in-person users who cannot access their mailbox. A separately claimed account-assistant capability uses fresh Passkey step-up, same-origin issuance, an eight-digit server-generated one-time code, keyed-digest storage, layered limits, user-visible notifications, audited existing-account access, and a restricted one-hour session. Assisted identity provenance does not prove mailbox control and cannot trigger Gmail auto-linking until a later ordinary Email OTP succeeds.
+Cook v0.7.0 adds administrator-assisted sign-in for in-person users who cannot access their mailbox. A separately claimed account-assistant capability uses fresh Passkey step-up, same-origin issuance, an eight-digit server-generated one-time code, keyed-digest storage, layered limits, user-visible notifications, audited existing-account access, and a restricted one-hour session. Assisted identity provenance does not prove mailbox control and cannot trigger Gmail auto-linking until a later ordinary Email OTP succeeds.
 
 Cook v0.6.0 added post-publication content moderation without giving moderators edit access to author content. Public eligibility is author intent `public` plus platform state `clear`; restricted recipes remain editable by their owner but disappear from every other public detail, list, search, recommendation, favorite-account, ingredient, shopping, and image surface. Logged-in users can report eligible recipes, owners receive in-app restriction/appeal notifications, and a least-privilege content moderator uses Passkey step-up for sensitive case and enforcement actions.
 
@@ -62,8 +62,8 @@ Store the one-time token as the `COOK_IMPORT_TOKEN` environment variable, never 
 GitHub CLI 2.90+ can preview and install the full Skill, including schema assets:
 
 ```powershell
-gh skill preview vichare/Cook cook-recipe-import@v0.6.0
-gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.6.0
+gh skill preview vichare/Cook cook-recipe-import@v0.7.0
+gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.7.0
 ```
 
 Manual fallback: copy the entire `skills/cook-recipe-import` directory to `~/.copilot/skills/cook-recipe-import` or `~/.agents/skills/cook-recipe-import`; copying only `SKILL.md` omits required schemas. Customize > Skills manages skills after they exist in a supported location; the GitHub source link is for review, not a paste-to-install URL.

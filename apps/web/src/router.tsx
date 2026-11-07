@@ -4745,11 +4745,11 @@ function ProfileSettings({ user }: { user: User }) {
 }
 
 export const COOK_SKILL_URL =
-  'https://github.com/vichare/Cook/tree/v0.6.0/skills/cook-recipe-import'
+  'https://github.com/vichare/Cook/tree/v0.7.0/skills/cook-recipe-import'
 export const COOK_IMPORT_SCHEMA_URL =
-  'https://raw.githubusercontent.com/vichare/Cook/v0.6.0/skills/cook-recipe-import/schema/import-draft-v2.schema.json'
+  'https://raw.githubusercontent.com/vichare/Cook/v0.7.0/skills/cook-recipe-import/schema/import-draft-v2.schema.json'
 export const COOK_AI_RECIPE_SCHEMA_URL =
-  'https://raw.githubusercontent.com/vichare/Cook/v0.6.0/skills/cook-recipe-import/schema/ai-recipe-v2.schema.json'
+  'https://raw.githubusercontent.com/vichare/Cook/v0.7.0/skills/cook-recipe-import/schema/ai-recipe-v2.schema.json'
 export type TokenPreset = 'import' | 'manage' | 'publish'
 
 function tokenPresetForScopes(scopes: string[]): TokenPreset | null {
@@ -4989,9 +4989,9 @@ export function skillInstructionsForPreset(
   const baseUrl = resolveCookBaseUrl(origin)
   return `English:
 GitHub Copilot skill installation:
-1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.6.0
+1. Preview: gh skill preview vichare/Cook cook-recipe-import@v0.7.0
 2. Install for cross-session use, pinned to this release:
-   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.6.0
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.7.0
 3. Restart GitHub Copilot if needed, then verify the skill in Customize → Skills.
 
 Manual fallback: download or copy the entire skills/cook-recipe-import directory, including its schema directory, to ~/.copilot/skills/cook-recipe-import or ~/.agents/skills/cook-recipe-import. Do not copy only SKILL.md.
@@ -5010,9 +5010,9 @@ Minimal first use: “${firstTaskForPreset(preset, 'en')}” The import endpoint
 
 简体中文：
 GitHub Copilot Skill 安装：
-1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.6.0
+1. 预览：gh skill preview vichare/Cook cook-recipe-import@v0.7.0
 2. 安装到用户范围并固定到此 release：
-   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.6.0
+   gh skill install vichare/Cook cook-recipe-import --agent github-copilot --scope user --pin v0.7.0
 3. 必要时重启 GitHub Copilot，然后在 Customize → Skills 中确认。
 
 手动备用：下载或复制整个 skills/cook-recipe-import 目录（必须包括 schema 目录）到 ~/.copilot/skills/cook-recipe-import 或 ~/.agents/skills/cook-recipe-import。不要只复制 SKILL.md。
